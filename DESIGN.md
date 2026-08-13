@@ -8,14 +8,14 @@ Status: **Working draft.** `[OPEN]` = unresolved. `[ASSUMPTION]` = default to ch
 
 `mrplex` is a queryable, versioned store for Markdown documents with YAML frontmatter. Clients talk to it over two HTTP surfaces sharing one core:
 
-- **MCP** — JSON-RPC 2.0 at `POST /rpc`, plus a STDIO transport. Primary interface for LLM agents.
-- **REST + WebDAV** — resource-oriented routes (`GET /repos/{repo}/docs/{path}`, `PUT`, `DELETE`, `MOVE`, `PROPFIND`). Primary interface for humans, `curl`, editors that mount over WebDAV (including Obsidian without a plugin), and anything HTTP-ecosystem-shaped (caches, CDNs, `If-Match`).
+- **MCP** — a Model Context Protocol server: Streamable HTTP transport at `/mcp`, plus an optional STDIO transport enabled at server startup (§6.2). Primary interface for LLM agents.
+- **REST** — resource-oriented routes (`GET /repos/{repo}/docs/{path}`, `PUT`, `DELETE`, `MOVE`). Primary interface for humans, `curl`, and anything HTTP-ecosystem-shaped (caches, CDNs, `If-Match`).
 
 Also included: a first-party `mrplex` **CLI** (§7.3) — a thin client over the MCP surface with ergonomic command flags in place of JSON envelopes.
 
 Every update is an insert; nothing is overwritten; any past state is addressable.
 
-External-source bridging (git repos, GitHub) is deliberately post-v1 — see §11.
+External-source bridging (git repos, GitHub) is deliberately post-v1, as are WebDAV mounting and point-in-time (`as_of`) reads — see §11.
 
 ## 2. Non-goals (v1)
 
@@ -23,6 +23,7 @@ External-source bridging (git repos, GitHub) is deliberately post-v1 — see §1
 - Not a wiki UI.
 - Not a general document store — only Markdown-with-YAML-frontmatter.
 - Not a git mirror — no adapters, no sync. mrplex stands alone.
+- Not a mountable network filesystem — no WebDAV in v1; see §11 for why that's harder than it looks.
 
 ## 3. Data model
 
@@ -60,9 +61,10 @@ versions (
   repo_id     integer not null references repos(id),     -- denormalized; enables the live-path index
   prev_id     integer     null references versions(id),  -- null iff first version
   next_id     integer     null references versions(id),  -- null iff current
-  path        text    not null,                          -- path AT this version (may be under a system sigil, §3.5)
-  frontmatter json    not null,                          -- parsed YAML
-  body        text    not null,
+  path            text not null,                         -- path AT this version (may be under a system sigil, §3.5)
+  frontmatter_raw text not null,                         -- verbatim YAML source (may be empty); round-trips byte-exact
+  frontmatter     json not null,                         -- parsed form; a derived query index of frontmatter_raw
+  body            text not null,
   author_id   integer not null references users(id),
   created_at  timestamp not null
 )
@@ -78,6 +80,7 @@ chunks (
   version_id integer not null references versions(id),
   ix         integer not null,
   text       text not null,
+  text_hash  text not null,                                 -- sha-256 of text; embedding-reuse key (§5.3)
   embedding  vector,                                        -- pgvector / sqlite-vec
   primary key (version_id, ix)
 )
@@ -85,7 +88,7 @@ chunks (
 api_tokens (
   id           integer primary key,
   user_id      integer not null references users(id),
-  secret_hash  text    not null,                            -- argon2 or bcrypt of the token secret
+  secret_hash  text    not null,                            -- sha-256 of the token secret (§8.1); indexed for lookup
   label        text,                                        -- human-readable, e.g. "obsidian plugin"
   scopes       json    not null,                            -- see §8
   expires_at   timestamp,                                   -- null = no expiry
@@ -94,10 +97,19 @@ api_tokens (
   last_used_at timestamp
 )
 
+embedding_backlog (
+  version_id    integer primary key references versions(id),  -- pending/failed embedding work (§5.3)
+  attempts      integer not null,
+  last_error    text,
+  next_retry_at timestamp
+)
+
 -- FTS index on versions.body
 ```
 
 `prev_id` and `next_id` are inverse links on the fast-forward version chain: writing a new version `Y` with `prev_id = X` also sets `X.next_id = Y` in the same transaction. The two partial indexes are the schema-level guarantees behind §4 — no application code can bypass them.
+
+**Frontmatter is stored twice by design.** `frontmatter_raw` is the byte-verbatim YAML source — comments, key order, and formatting preserved — and is what `Accept: text/markdown` reads return, so an editor gets back exactly what it wrote. `frontmatter` is the JSON parsed from it at write time: a query index (§5), never re-serialized back to users. Writes supply **exactly one** representation — raw (server parses it; `frontmatter_invalid` on error) or structured (server serializes canonical YAML into `frontmatter_raw`) — and the other is derived.
 
 ### 3.3 Identifier discipline
 
@@ -108,17 +120,19 @@ Integer primary keys are internal — **they never cross the wire**. FKs use the
 
 Multitenancy would partition slug uniqueness later without changing the model.
 
-### 3.4 Point-in-time, history, deletion, restore
+### 3.4 History, deletion, restore
 
-State at time T: for each document, the latest version with `created_at ≤ T`. No derived "tree" table — the partial index on `(document_id) where next_id is null` makes current-version lookup a single index hit.
+No derived "tree" table — the partial index on `(document_id) where next_id is null` makes current-version lookup a single index hit, and history is walked over the `prev_id`/`next_id` chain. Point-in-time reads ("state at time T") are deferred to post-v1 — see §11.
 
 Renames stay on the same `document_id` with a new `path` (§4.1). **Deletion** and **restore** are the same primitive: a `docs.put` that moves the document to or from a system-namespace path.
 
-- **Delete** — the kernel moves the document to `<system-sigil>deleted/{original_path}@{version_id}`, where `<system-sigil>` is the first entry of the effective `system_sigils` config (§3.5) and `{version_id}` is the version being superseded. Deterministic, unique, and browsable via `include_system: true` queries.
+- **Delete** — the kernel moves the document into the system namespace, inserting the superseded version's id before the file extension: `path/to/document.md` at version `v45129` becomes `<system-sigil>deleted/path/to/document-v45129.md`. `<system-sigil>` is the first entry of the effective `system_sigils` config (§3.5). The extension is everything from the final segment's last `.`; a leading dot doesn't count, so extensionless files and dotfiles get a plain trailing suffix (`README` → `README-v45129`, `.gitignore` → `.gitignore-v45129`). Keeping the extension terminal means type detection, syntax highlighting, and globs like `**/*.md` keep working on trashed docs. Deterministic, unique (version ids are unique and the suffix is always appended), and browsable via `include_system: true` queries.
 - **Restore** — a `docs.put` back to a user-territory path with `prev_version_id` pointing at the trashed version. Same document identity; history is one continuous chain.
 - **Create-at-freed-path is not restore.** Once a document is in `:deleted/…`, its old user-territory path is free. A fresh `docs.create` at that path makes a **new document** with a new `document_id`. To continue the old identity, the caller uses `docs.put` with the trashed version's `version_id` as `prev` — the kernel already knows this is the same document from the version chain.
 
 This eliminates the tombstone concept entirely: every version has real content at a real path; "deletedness" is just "currently lives under a system sigil."
+
+**Repos and users delete the same way.** `repos.delete` is a kernel rename of the slug into the system namespace — `<system-sigil>deleted-{slug}-{suffix}`, where `{suffix}` is a short server-chosen uniquifier — the document-deletion primitive applied one level up. The old slug is freed, the documents inside are untouched, and `repos.list` hides system-namespaced repos by default (`include_system: true` opts in). Restore is `repos.rename` back to a user-territory slug. While deleted, a repo rejects document writes and answers `repo_not_found` to non-admin callers. `users.delete` is the same rename and additionally revokes all of the user's tokens; historical attribution via `author_id` is untouched — the user row never goes away. Deleting an already-deleted repo, user, or document is a **no-op**: all deletes are idempotent.
 
 ### 3.5 Paths: structure, validation, and sigils
 
@@ -136,6 +150,8 @@ EMPTY_SEGMENT    = ""     // no leading/trailing '/', no '//'
 ```
 
 A segment equal to `CURRENT_SEGMENT`, `PARENT_SEGMENT`, or `EMPTY_SEGMENT` is invalid on any write. These meanings are too canonical to override — an operator who wants `.` to mean something else than "current" would break every mental model callers bring with them.
+
+Also structural: paths and slugs are **case-sensitive** and compared byte-wise, with no Unicode normalization. Whether to offer per-repo case-folding or normalization policy (for case-insensitive clients) is future work (§11).
 
 #### 3.5.2 Configurable policy
 
@@ -164,6 +180,8 @@ Defaults follow Obsidian's cross-platform-safe rule (minus `/`). All three field
 - `hidden_sigils ∩ disallowed_chars = ∅` (users must be able to write chars they use to hide their own folders).
 - Both sigil lists are non-empty (otherwise the kernel has no canonical sigil to emit under).
 
+Path config is **setup-time configuration**, not a runtime toggle. Changing sigils over a live corpus can orphan system paths and re-expose hidden ones (§3.5.4); beyond the advisory warnings on `set_path_config` (§3.5.3), the system deliberately adds no further guard rails.
+
 #### 3.5.3 Segment validation
 
 Applied at `docs.create` and `docs.put`, per segment:
@@ -174,7 +192,7 @@ Applied at `docs.create` and `docs.put`, per segment:
 
 Failure at any step → `path_invalid`.
 
-Validation is **write-time only**. Existing versions keep whatever path they had; history, diff, and point-in-time reads work regardless of current config. Tightening config *does not* rewrite or hide existing rows — it only affects future writes. This is the same rule the system uses for slug validation on rename.
+Validation is **write-time only**. Existing versions keep whatever path they had; history and diff work regardless of current config. Tightening config *does not* rewrite or hide existing rows — it only affects future writes. This is the same rule the system uses for slug validation on rename.
 
 **Warning on tightening:** `repos.set_path_config` returns an advisory list of currently-live paths in the repo that would fail new validation. These paths remain readable but can no longer be `put` at their current path — the only way to fix them is to move them to a valid path.
 
@@ -186,9 +204,9 @@ The sigil lists are **sets for validation** — any listed sigil marks a segment
 canonicalSystemSigil(cfg) = cfg.system_sigils[0]
 canonicalHiddenSigil(cfg) = cfg.hidden_sigils[0]
 
-// deletion target:
-systemPath(cfg, "deleted", `${originalPath}@${versionId}`)
-  // = ":deleted/notes/foo.md@v_abc123"  when system_sigils[0] === ":"
+// deletion target (version id inserted before the extension, §3.4):
+systemPath(cfg, "deleted", withVersionSuffix(originalPath, versionId))
+  // = ":deleted/notes/foo-v45129.md"  when system_sigils[0] === ":"
 ```
 
 **Why multiple accepted sigils.** Steady-state deployments use exactly one system sigil and one hidden sigil. The list form exists for two use cases:
@@ -198,11 +216,11 @@ systemPath(cfg, "deleted", `${originalPath}@${versionId}`)
 
 **Semantic equivalence across accepted sigils.** For any kernel operation that looks up system state by *logical name* (e.g., a future `<system>/config/<key>`), paths under any accepted sigil are treated as the same logical location. If duplicates exist across sigils (bug, manual DB surgery, cross-tool disagreement), the kernel resolves by **newest-wins with a warning** — the most recently written version is the effective value, and a `mrplex system doctor` report surfaces the duplicates for operator cleanup.
 
-Deletion paths use `{original_path}@{version_id}` as the key, not a logical name, so duplicate-across-sigils is not a real concern for `:deleted/`.
+Deletion paths key on the original path plus the superseded version id (§3.4), not a logical name, so duplicate-across-sigils is not a real concern for `:deleted/`.
 
 #### 3.5.5 Query default exclusion
 
-Filter, text, rank, and `PROPFIND` all exclude any document whose current `path` has **any segment** whose first char is in `hidden_sigils ∪ system_sigils`. Two opt-in flags on the query spec restore visibility:
+Filter, text, and rank all exclude any document whose current `path` has **any segment** whose first char is in `hidden_sigils ∪ system_sigils`. Two opt-in flags on the query spec restore visibility:
 
 - `include_hidden: true` — surfaces paths with hidden-sigil segments.
 - `include_system: true` — surfaces paths with system-sigil segments.
@@ -231,7 +249,7 @@ That's the whole model. Merge policy is a client concern — an Obsidian plugin,
 1. `docs.put` and `docs.delete` both take `prev_version_id`. It must equal the current version. Otherwise: `stale_prev` error carrying the current version.
 2. `docs.create` takes no `prev`. If a live document already exists at the path: `create_conflict` error carrying the current version (the caller can retry as `put`).
 3. `docs.put`'s `path` argument is the **destination path**. If it equals `prev`'s path, the write is an in-place update. If it differs, the write is a move — the same document advances to the new path in one operation, carrying whatever body/frontmatter changes were sent along.
-4. `docs.delete` is kernel-side sugar for `docs.put` to `<system-sigil>deleted/{prev_path}@{prev_version_id}` with body and frontmatter unchanged. Users cannot directly write at any system-sigil path (§3.5); the kernel bypasses that check for its own deletion move. Restore is a plain `docs.put` back to a user-territory path.
+4. `docs.delete` is kernel-side sugar for `docs.put` to the §3.4 deletion path (`<system-sigil>deleted/…` with `-{prev_version_id}` inserted before the extension) with body and frontmatter unchanged. Users cannot directly write at any system-sigil path (§3.5); the kernel bypasses that check for its own deletion move. Restore is a plain `docs.put` back to a user-territory path. Deleting an already-deleted document (`prev` already under a system-sigil path) is a **no-op**: nothing is written and the current version is returned unchanged — deletion is idempotent, a natural match for HTTP `DELETE`.
 5. Writes are single-writer per repo — races resolve deterministically.
 
 ### 4.2 One verb, several intents
@@ -255,7 +273,7 @@ Auth/access-control errors are omitted here — see §8.
 
 - `stale_prev` — provided `prev_version_id` is no longer the current version of its document.
   Emitted by: `docs.put`, `docs.delete`.
-  Data: `{ current_version_id, current_path, submitted_prev_version_id }` — `current_path` lets clients see whether the document has since been moved (including moved into `:deleted/…` by another actor).
+  Data: `{ current_version_id, current_path, submitted_prev_version_id }` — `current_path` lets clients see whether the document has since been moved (including moved into `:deleted/…` by another actor). If the caller's read scope does not cover `current_path`, it is redacted (`null`) — the error still proves staleness without revealing where the document went.
 
 **Slot conflicts** — the target slot is already occupied.
 
@@ -287,9 +305,8 @@ Note: `docs.put` never emits `doc_not_found` — the document is identified by `
 
 - `slug_invalid` — fails server-level slug validation (§3.5.6): illegal characters, sigil-leading, empty, `.`/`..`, too long, etc.
 - `path_invalid` — segment fails validation (§3.5.3): illegal character, sigil-leading (user attempting to write at a system path), reserved segment (`.`, `..`), empty component, or malformed structure.
-- `frontmatter_invalid` — YAML parse error, or type violation against repo schema hints (§5.2).
+- `frontmatter_invalid` — raw frontmatter fails YAML parsing or parses to something other than a map; or a write supplies both `frontmatter` and `frontmatter_raw` (§3.2 requires exactly one).
 - `filter_invalid` — CEL parse or type error.
-- `as_of_invalid` — malformed or unparseable timestamp.
 
 ### 4.4 Authorship
 
@@ -307,18 +324,17 @@ Three composable modes: **filter** (CEL over frontmatter/path/created_at), **tex
   "filter":          "status == 'draft' && 'pricing' in list(tags)",
   "text":            "pricing OR fees",
   "rank":            "tiered SaaS pricing",
-  "as_of":           "2026-06-01",
   "limit":           20,
   "include_hidden":  false,
   "include_system":  false
 }
 ```
 
-CEL scope: `frontmatter` fields are top-level (`status`, `tags`); `path` and `created_at` also in scope. No `doc.` prefix.
+CEL scope: frontmatter fields are top-level (`status`, `tags`). **Intrinsic document properties are `$`-prefixed** — `$path`, `$created_at` — mirroring the sigil idea from §3.5: a marker character separates kernel-owned names from user territory, so intrinsics can never collide with user-defined frontmatter keys (a document with a frontmatter field literally named `path` stays queryable as bare `path`). Two differences from path sigils: the `$` marker is a **fixed grammar constant** in the §3.5.1 sense (grammar, not policy — a configurable marker would make the same filter string parse differently per repo), and it's `$` rather than `:` because `:` collides with CEL's ternary operator (`a ? b :path` is ambiguous) while `$` is unused by standard CEL — a small lexer extension, no grammar changes. A side benefit: the intrinsic namespace is forever open — new intrinsics (`$author`, `$repo`, …) can be added later without breaking any existing filter.
 
 FTS is a first-class feature — markdown is the whole product, searching its prose is table stakes. The backend is **adapter-owned**: SQLite adapters use FTS5, Postgres adapters use `tsvector`. Result sets are portable across adapters; ranking scores are not (§7.2 parity table).
 
-**Default exclusion of hidden and system paths.** By default (both flags `false`), the compiled query drops any document whose current `path` contains any segment starting with a hidden or system sigil (§3.5). This applies uniformly to `filter`, `text`, `rank`, and WebDAV `PROPFIND`. Set `include_hidden: true` to surface `.<seg>/…` paths; set `include_system: true` to surface `:<seg>/…` paths — this is how a client browses `:deleted/` to find something to restore.
+**Default exclusion of hidden and system paths.** By default (both flags `false`), the compiled query drops any document whose current `path` contains any segment starting with a hidden or system sigil (§3.5). This applies uniformly to `filter`, `text`, and `rank`. Set `include_hidden: true` to surface `.<seg>/…` paths; set `include_system: true` to surface `:<seg>/…` paths — this is how a client browses `:deleted/` to find something to restore.
 
 Compiled to SQL: for each accepted sigil `X` in the effective config, one clause `NOT (path LIKE 'X%' OR path LIKE '%/X%')`, ANDed into the query — string-matching only, no generated columns in v1. Cross-repo queries evaluate each repo's effective config independently.
 
@@ -408,15 +424,21 @@ All three implement the same contract; the kernel doesn't know which is in play.
 
 **Invocation timing.**
 
-- **On write.** After `docs.create` / `docs.put` commits the version, the server chunks the body (chunking strategy is fixed and server-side; the hook only sees chunk text, not policy), calls the hook, and writes the returned vectors into `chunks`. This runs *outside* the write transaction (see failure behavior below).
+- **On write.** After `docs.create` / `docs.put` commits the version, the server enqueues it for embedding; a background worker chunks the body (chunking strategy is fixed and server-side; the hook only sees chunk text, not policy), calls the hook, and writes the returned vectors into `chunks`. This runs *outside* the write transaction (see failure behavior below).
 - **On backfill.** A `mrplex embed backfill --repo <slug>` CLI command re-chunks and re-embeds current versions missing chunks — useful when configuring an embedding hook for the first time, or when swapping models.
 
 **Failure behavior.** Embedding failure must not fail the write. A markdown store that rejects writes because an external model is down is a bad store. Instead:
 
 - Version write commits regardless.
-- If the hook is unreachable / errors / times out, the version is enqueued in an `embedding_backlog` table (schema: `version_id`, `attempts`, `last_error`, `next_retry_at`). A background worker retries with exponential backoff.
+- If the hook is unreachable / errors / times out, the queue entry is retained in the `embedding_backlog` table (schema: `version_id`, `attempts`, `last_error`, `next_retry_at`) and retried with exponential backoff.
 - Vector search silently skips documents without chunks — they don't appear in `rank` results but *do* appear in `filter` and `text` results (their body is still indexed for FTS).
 - Operators can inspect backlog via `mrplex embed status` (`[OPEN]` exact shape).
+
+**Write amplification and dedup.** The API imposes no write-frequency policy — save cadence and debouncing belong client-side, where the editing context lives. Server-side, three mechanisms keep rapid writers from translating one-to-one into embedding load:
+
+- **Chunk dedup by content hash.** Chunks carry a `text_hash` (§3.2). Before calling the hook, the worker reuses the vector of any existing chunk with the same `(model, text_hash)` — in the common case, the previous version of the same document, where an edit touches one or two chunks and the rest are byte-identical. Only genuinely new chunk text reaches the hook.
+- **Current-only embedding.** The worker embeds a version only if it is still current at dequeue time; a version superseded while queued is skipped (the superseding write enqueued its own entry), and in-flight hook calls for superseded versions are aborted where the transport allows. A burst of saves collapses to one embedding pass over the final state.
+- **Rate limiting** is split per the contract: the worker paces dispatch; provider-specific limits, batching, and retries live inside the hook.
 
 **Model changes.** If the hook starts returning a different `model` or `dim`, the server writes a warning and stores the new-model vectors alongside the old ones (`chunks.model` column, `[OPEN]` — needs to be added to §3.2 if we go this route). Vector search filters by current model. Backfill re-embeds under the new model on demand.
 
@@ -424,29 +446,33 @@ All three implement the same contract; the kernel doesn't know which is in play.
 
 ## 6. Interfaces
 
-Two HTTP surfaces (`/rpc` for JSON-RPC, resource routes for REST/WebDAV), both thin translation layers over one shared **kernel**. Each surface lives in its own module; adding a third surface later (gRPC, GraphQL) is another translation layer, not a rewrite.
+Two HTTP surfaces (`/mcp` for MCP, resource routes for REST), both thin translation layers over one shared **kernel**. Each surface lives in its own module; adding a third surface later (gRPC, GraphQL) is another translation layer, not a rewrite.
 
 ### 6.1 Kernel
 
 The kernel is the only place the write model, concurrency rules, and error catalog exist. Surfaces validate their envelope, resolve slugs to internal ids, delegate, and translate the result.
 
 ```types
-kernel.repos.list()                                       → Repo[]
+kernel.repos.list(include_system?)                        → Repo[]
+kernel.repos.get(slug)                                    → Repo
 kernel.repos.create(slug)                                 → Repo
 kernel.repos.rename(slug, new_slug)                       → Repo
+kernel.repos.delete(slug, actor)                          → Repo   -- renames slug into the system namespace (§3.4); admin
 kernel.repos.set_path_config(slug, config | null, actor)  → { repo: Repo, warnings: PathWarning[] }   -- see §3.5; null clears the override
 
 kernel.users.list()                                       → User[]
 kernel.users.create(slug)                                 → User
 kernel.users.rename(slug, new_slug)                       → User
+kernel.users.delete(slug, actor)                          → User   -- system-namespace rename + revokes the user's tokens (§3.4); admin
 
-kernel.docs.get(repo, path, as_of?)                       → Version
+kernel.docs.get(repo, path)                               → Version   -- current version at path
+kernel.docs.get_version(repo, version_id)                 → Version   -- any version, by id
 kernel.docs.history(repo, path, limit?, before?)          → Version[]
 kernel.docs.diff(repo, path, from, to)                    → UnifiedDiff
 
 kernel.docs.create(repo, path, frontmatter?, body?, actor)               → Version
 kernel.docs.put(repo, path, prev_version_id, frontmatter?, body?, actor) → Version   -- path may differ from prev (= move); prev under a system sigil + destination in user territory (= restore)
-kernel.docs.delete(repo, path, prev_version_id, actor)                   → Version   -- sugar for docs.put to :deleted/{prev_path}@{prev_version_id}
+kernel.docs.delete(repo, path, prev_version_id, actor)                   → Version   -- sugar for docs.put to the §3.4 deletion path, e.g. :deleted/path/to/doc-v45129.md
 
 kernel.tokens.list(actor)                                 → Token[]
 kernel.tokens.create(label, scopes, expires_at?, actor)   → { token, meta }
@@ -455,69 +481,93 @@ kernel.tokens.revoke(token_id, actor)                     → Token
 kernel.query(spec, actor)                                 → Version[]
 ```
 
+Write calls accept frontmatter as either the structured form (`frontmatter`) or verbatim YAML source (`frontmatter_raw`) — exactly one per call (§3.2).
+
 `actor` is a resolved `{ user_id, scopes }`, populated by the surface after it authenticates the caller — never taken from a request body. The kernel calls `authorize(actor, action, target)` before every operation (§8).
 
-### 6.2 MCP surface (`POST /rpc`)
+### 6.2 MCP surface (`/mcp`)
 
-`[ASSUMPTION]` JSON-RPC 2.0 over HTTP; STDIO transport also supported (same method set, different envelope). Method names mirror the kernel one-to-one.
+A protocol-true **Model Context Protocol** server — not a bespoke JSON-RPC API with MCP-ish naming. It implements the MCP lifecycle (`initialize`, capability negotiation) and exposes kernel operations as **tools** via `tools/list` / `tools/call`, each with a JSON Schema input definition, so any MCP client interoperates without custom glue.
+
+**Transports:**
+
+- **Streamable HTTP** at `/mcp` — the standard remote transport. Auth is the same `Authorization: Bearer` header as the REST surface (§8).
+- **STDIO** — off by default; enabled at startup via server config or `--mcp-stdio`. There is no per-request auth channel on stdio, so the transport binds the whole session to one token supplied at launch (`--token` / `MRPLEX_TOKEN`); every call runs as that token's actor.
+
+**Tools** mirror the kernel one-to-one. Names use underscores (many MCP clients restrict tool names to `[a-zA-Z0-9_-]`):
 
 ```rpc
-mrplex.repos.list()                                             → Repo[]
-mrplex.repos.create(repo)                                       → Repo
-mrplex.repos.rename(repo, new_repo)                             → Repo
-mrplex.repos.set_path_config(repo, config | null)               → { repo: Repo, warnings: PathWarning[] }
+repos_list(include_system?)                              → Repo[]
+repos_get(repo)                                          → Repo
+repos_create(repo)                                       → Repo
+repos_rename(repo, new_repo)                             → Repo
+repos_delete(repo)                                       → Repo   // renames slug into the system namespace (§3.4)
+repos_set_path_config(repo, config | null)               → { repo: Repo, warnings: PathWarning[] }
 
-mrplex.users.list()                                             → User[]
-mrplex.users.create(user)                                       → User
-mrplex.users.rename(user, new_user)                             → User
+users_list()                                             → User[]
+users_create(user)                                       → User
+users_rename(user, new_user)                             → User
+users_delete(user)                                       → User   // system-namespace rename + token revocation (§3.4)
 
-mrplex.docs.get(repo, path, as_of?)                             → Version
-mrplex.docs.history(repo, path, limit?, before?)                → Version[]
-mrplex.docs.diff(repo, path, from, to)                          → UnifiedDiff
+docs_get(repo, path)                                     → Version
+docs_get_version(repo, version_id)                       → Version
+docs_history(repo, path, limit?, before?)                → Version[]
+docs_diff(repo, path, from, to)                          → UnifiedDiff
 
-mrplex.docs.create(repo, path, frontmatter?, body?)               → Version
-mrplex.docs.put(repo, path, prev_version_id, frontmatter?, body?) → Version   // path may differ from prev (= move); prev under system sigil + dest in user territory (= restore)
-mrplex.docs.delete(repo, path, prev_version_id)                   → Version   // sugar; kernel moves to :deleted/{prev_path}@{prev_version_id}
+docs_create(repo, path, frontmatter?, body?)               → Version
+docs_put(repo, path, prev_version_id, frontmatter?, body?) → Version   // path may differ from prev (= move); prev under system sigil + dest in user territory (= restore)
+docs_delete(repo, path, prev_version_id)                   → Version   // sugar; kernel moves to the §3.4 deletion path, e.g. :deleted/path/to/doc-v45129.md
 
-mrplex.tokens.list()                                            → Token[]
-mrplex.tokens.create(label, scopes, expires_at?)                → { token, meta }
-mrplex.tokens.revoke(token_id)                                  → Token
+tokens_list()                                            → Token[]
+tokens_create(label, scopes, expires_at?)                → { token, meta }
+tokens_revoke(token_id)                                  → Token
 
-mrplex.query(spec)                                              → Version[]
+query(spec)                                              → Version[]
 ```
 
-### 6.3 REST + WebDAV surface
+As at the kernel, `docs_create` / `docs_put` accept frontmatter as either `frontmatter` (structured) or `frontmatter_raw` (verbatim YAML) — exactly one (§3.2).
+
+**Results and errors.** Tool results carry `structuredContent` (the wire types of §6.4) plus a text rendering. Kernel errors (§4.3, §8.4) are returned **in-band** as tool errors — `isError: true` with `{ code, data }` in the content — so an agent can read `stale_prev` and retry with the attached current version. JSON-RPC protocol errors are reserved for transport/envelope problems (malformed request, unknown tool).
+
+`[OPEN]` Whether to also expose documents as MCP **resources** (`mrplex://{repo}/{path}`) for read-side ergonomics. Tools are sufficient for v1; resources are additive.
+
+### 6.3 REST surface
 
 Same operations, exposed as resources. `version_id` is the ETag; `If-Match` is the optimistic-concurrency check. HTTP caching semantics (304, ETag, `If-None-Match`) work naturally over immutable content.
 
 ```rest
-GET     /repos                                          → Repo[]
+GET     /repos?include_system=                          → Repo[]
 POST    /repos                     { slug }             → Repo
 GET     /repos/{repo}                                   → Repo
 MOVE    /repos/{repo}              Destination: /repos/{new_repo}   → Repo
+DELETE  /repos/{repo}                                   → Repo (kernel renames slug into the system namespace; §3.4)
 PUT     /repos/{repo}/config       { path_config | null }         → { repo: Repo, warnings: PathWarning[] }  -- see §3.5; null clears
 
 GET     /users                                          → User[]
 POST    /users                     { slug }             → User
 MOVE    /users/{user}              Destination: /users/{new_user}   → User
+DELETE  /users/{user}                                   → User (system-namespace rename + token revocation; §3.4)
 
-GET     /repos/{repo}/docs/{path}                       → Version
+GET     /repos/{repo}/docs/{path}                       → Version (current)
                                    Accept: application/json  → Version envelope
                                    Accept: text/markdown     → raw body (frontmatter as `---` block)
-                                   ?as_of=<timestamp>        → point-in-time read
-GET     /repos/{repo}/docs/{path}/history               → Version[]
-GET     /repos/{repo}/docs/{path}/diff?from=&to=        → UnifiedDiff
+GET     /repos/{repo}/versions/{version_id}             → Version (any version, by id)
+GET     /repos/{repo}/history/{path}?limit=&before=     → Version[]
+GET     /repos/{repo}/diff/{path}?from=&to=             → UnifiedDiff
 
 PUT     /repos/{repo}/docs/{path}                       → Version
+                                   Content-Type: application/json → { frontmatter | frontmatter_raw, body } (exactly one frontmatter form; §3.2)
+                                   Content-Type: text/markdown    → raw file; server splits the leading `---` block into frontmatter_raw + body
                                    If-None-Match: *      → create (fails if exists → 412)
                                    If-Match: <version_id> → update at this path, OR move here (fails on mismatch → 412 stale_prev)
                                    -- restore is just PUT to a user-territory path with If-Match on a :deleted/... version
-DELETE  /repos/{repo}/docs/{path}  If-Match: <version_id> → Version (kernel moves to :deleted/{path}@{version_id})
+DELETE  /repos/{repo}/docs/{path}  If-Match: <version_id> → Version (kernel moves to the §3.4 deletion path; no-op if already deleted, §4.1)
 MOVE    /repos/{repo}/docs/{path}  Destination: /repos/{repo}/docs/{new_path}
                                    If-Match: <version_id>
                                    → sugar for PUT at Destination with body/frontmatter unchanged
+                                   -- Destination must be within the same repo; cross-repo moves are rejected
 
-GET     /query?repo=&filter=&text=&rank=&as_of=&limit=&include_hidden=&include_system=      → Version[]
+GET     /query?repo=&filter=&text=&rank=&limit=&include_hidden=&include_system=      → Version[]
 POST    /query                     { QuerySpec }             → Version[]
 
 GET     /me/tokens                                           → Token[]
@@ -525,14 +575,13 @@ POST    /me/tokens                 { label, scopes, expires_at? } → { token, m
 DELETE  /me/tokens/{id}                                      → Token
 ```
 
+`/versions`, `/history`, and `/diff` are sibling roots rather than suffixes under `/docs/{path}` because document paths are multi-segment: `/docs/notes/history` must always mean the document at `notes/history`, never the history of `notes`. Sibling roots keep the route grammar unambiguous.
+
 `GET /query` and `POST /query` accept the same parameters — GET as query-string, POST as JSON body. GET is preferred for cacheability and shareability; POST is the fallback for queries whose URL-encoded form would exceed reasonable URL length (~8KB). Every `QuerySpec` field maps to a query parameter of the same name.
 
 `[OPEN]` **Query response cacheability.** GET `/query` responses should carry `ETag` (a hash of the sorted `version_id` list in the result) and `Cache-Control`, so CDNs and browser caches can revalidate with `If-None-Match` → 304. Cheap to compute; invalidates exactly when the result set would change.
 
-`[OPEN]` **Repeatable query semantics.** With `as_of` absent, `GET /query` returns "now" — same URL, different results over time, poor caching behavior. Two options: (a) require `as_of` on GET, or (b) auto-pin `as_of` to the request time and echo the resolved value in a response header (`X-As-Of: <timestamp>`) so clients can re-request the same snapshot deterministically. Leaning (b) — better ergonomics, preserves caching, no extra work for the common case.
-
-
-`If-Match` collapses the explicit `prev_version_id` parameter of `docs.put` / `docs.delete` into the standard HTTP conditional-request mechanism — same semantics, native to the protocol. `PUT` with `If-None-Match: *` is the RFC-standard "create only if absent" pattern, so we don't need a separate `docs.create` route. `MOVE` is sugar over a `PUT` at the destination path with the source's `If-Match`.
+`If-Match` collapses the explicit `prev_version_id` parameter of `docs.put` / `docs.delete` into the standard HTTP conditional-request mechanism — same semantics, native to the protocol. `PUT` with `If-None-Match: *` is the RFC-standard "create only if absent" pattern, so we don't need a separate `docs.create` route. `MOVE` is sugar over a `PUT` at the destination path with the source's `If-Match` — it borrows WebDAV's verb vocabulary purely as rename sugar; v1 implements no other WebDAV semantics (§11).
 
 **Error mapping** (kernel error → HTTP). All error responses carry the kernel error `code` and `data` in the JSON body; the HTTP status just picks the closest match.
 
@@ -542,9 +591,7 @@ DELETE  /me/tokens/{id}                                      → Token
 - `path_taken`, `slug_taken` → **409 Conflict**.
 - `repo_not_found`, `user_not_found`, `doc_not_found`, `version_not_found` → **404 Not Found**.
 - `version_not_in_document` → **422 Unprocessable Entity**.
-- `slug_invalid`, `path_invalid`, `frontmatter_invalid`, `filter_invalid`, `as_of_invalid` → **400 Bad Request**.
-
-WebDAV `PROPFIND` (for filesystem-mount clients) returns a directory listing of live paths under the given path prefix. Advanced WebDAV features (`LOCK`, `PROPPATCH`) are deferred — see §11.
+- `slug_invalid`, `path_invalid`, `frontmatter_invalid`, `filter_invalid` → **400 Bad Request**.
 
 ### 6.4 Wire types
 
@@ -569,15 +616,20 @@ PathWarning = {
 Version = {
   version_id, prev_version_id, next_version_id,  -- opaque; next_version_id = null means current
   repo, path,                                    -- slug + string
-  frontmatter, body,
+  frontmatter, frontmatter_raw, body,            -- parsed JSON + verbatim YAML source (§3.2)
   author,                                        -- User
   created_at
   -- No tombstone field. A "deleted" version is one whose path lives under a system sigil (§3.5).
 }
-Scope   = {
-  repo:   string | string[],                     -- slug, glob, or list thereof
+ScopeInput = {                                   -- accepted by tokens.create; repo patterns resolved to ids at creation (§8.2)
+  repo:   string | string[],                     -- slug, glob, "*", or list thereof
   read?:  string | string[],                     -- path glob or list thereof
   write?: string | string[]
+}
+Scope   = {                                      -- stored / returned form
+  repos:  "*" | string[],                        -- "*" = all repos (dynamic); else the bound repos' current slugs (ids internally)
+  read?:  string[],
+  write?: string[]
 }
 Token   = {
   id: string,                                    -- opaque
@@ -588,6 +640,8 @@ Token   = {
   -- plaintext secret only present on the response to tokens.create
 }
 ```
+
+All timestamps on the wire (`created_at`, `expires_at`, `last_used_at`, `before`) are ISO 8601 UTC strings.
 
 ## 7. Deployment & clients
 
@@ -648,7 +702,7 @@ StorageAdapter = {
 
   // Version chain (the hot path — must be atomic per §4)
   version_insert({
-    document_id, repo_id, prev_id, path, frontmatter, body,
+    document_id, repo_id, prev_id, path, frontmatter_raw, frontmatter, body,
     author_id, created_at
   })                                                        → version_id
   // Contract: inside one tx, insert the new version AND set prev.next_id = new.id.
@@ -657,11 +711,10 @@ StorageAdapter = {
   version_by_id(id)                                         → Version | null
   version_current(repo_id, path)                            → Version | null   // via the partial-index on (repo_id, path) where next_id is null
   version_history(document_id, limit, before?)              → Version[]
-  version_at(document_id, as_of)                            → Version | null
 
   // Query — the one place adapters may differ in perf but not in semantics
   query({
-    repo_ids, filter_ast, text?, rank?, as_of?, path_globs, limit
+    repo_ids, filter_ast, text?, rank?, path_globs, limit
   })                                                        → Version[]
   // filter_ast is CEL, compiled by the kernel; the adapter translates to its dialect.
   // path_globs come from the caller's read scope (§8.2) — enforced here, not above.
@@ -671,7 +724,7 @@ StorageAdapter = {
   fts_search(repo_ids, query)                               → { version_id, score }[]
 
   // Vector
-  chunks_upsert(version_id, chunks: { ix, text, embedding }[]) → void
+  chunks_upsert(version_id, chunks: { ix, text, text_hash, embedding }[]) → void
   vector_search(repo_ids, embedding, k)                     → { version_id, chunk_ix, score }[]
 
   // Tokens
@@ -689,8 +742,7 @@ StorageAdapter = {
 4. **CEL filter semantics.** The adapter translates the CEL AST such that a given filter over a given corpus returns the same rows on every adapter. Missing keys, null, scalar-or-list coercion (§5.2), and type-mismatch handling all follow the semantics defined in §5.
 5. **Scope-glob enforcement in `query`.** The adapter receives `path_globs` and returns only rows matching them — silently dropped, not errored (§8.2). Enforcing this in the adapter (not the kernel) lets the engine push the filter into indexes.
 6. **Result-set portability.** For FTS and vector search, the *set* of returned documents is identical across adapters for the same corpus and query; only ranking scores may differ.
-7. **Point-in-time reads.** `version_at(document_id, as_of)` returns the latest version with `created_at ≤ as_of`, or null. Same semantics on every adapter. Callers who want to distinguish "deleted at T" from "live at T" inspect the returned version's `path` (system-sigil-prefixed = deleted; §3.5).
-8. **Migrations.** `migrate()` is idempotent and forward-only. Adapters own their migration files; the kernel invokes `migrate()` on startup unless `--no-migrate` is set.
+7. **Migrations.** `migrate()` is idempotent and forward-only. Adapters own their migration files; the kernel invokes `migrate()` on startup unless `--no-migrate` is set.
 
 **What an adapter is *not* required to provide:**
 
@@ -702,14 +754,16 @@ StorageAdapter = {
 
 ### 7.3 `mrplex` CLI
 
-The CLI is a thin client over the MCP surface (§6.2) — no capabilities of its own, no direct database access when talking to a remote server. It shells out to `POST /rpc` (or the in-process kernel, if running against a local SQLite file) and pretty-prints results.
+The CLI is a thin client over the MCP surface (§6.2) — no capabilities of its own, no direct database access when talking to a remote server. It drives `tools/call` against `/mcp` (or the in-process kernel, if running against a local SQLite file) and pretty-prints results.
 
-Commands mirror MCP method names in a `noun verb` shape:
+Commands mirror MCP tool names in a `noun verb` shape:
 
 ```rpc
-mrplex repos list
+mrplex repos list [--include-system]
+mrplex repos get <slug>
 mrplex repos create <slug>
 mrplex repos rename <slug> <new-slug>
+mrplex repos delete <slug>                                        # system-namespace rename (§3.4); restore via `repos rename`
 mrplex repos set-path-config <slug> [--from-file FILE | -] | --clear
                                                                   # FILE is JSON with any subset of { disallowed_chars, system_sigils, hidden_sigils }
                                                                   # --clear removes the override, reverts to server config
@@ -717,8 +771,10 @@ mrplex repos set-path-config <slug> [--from-file FILE | -] | --clear
 mrplex users list
 mrplex users create <slug>
 mrplex users rename <slug> <new-slug>
+mrplex users delete <slug>                                        # system-namespace rename + revokes their tokens (§3.4)
 
-mrplex docs get <repo> <path> [--as-of <ts>]
+mrplex docs get <repo> <path>
+mrplex docs get-version <repo> <version-id>
 mrplex docs history <repo> <path> [--limit N] [--before <ts>]
 mrplex docs diff <repo> <path> --from <v> --to <v>
 
@@ -729,7 +785,7 @@ mrplex docs put <repo> <path> --prev <version-id> [--from-file FILE | -]
 mrplex docs delete <repo> <path> --prev <version-id>
 mrplex docs mv <repo> <from-path> <to-path> --prev <version-id>   # sugar: put to <to-path> with unchanged content
 
-mrplex query --repo <slug> [--filter EXPR] [--text Q] [--rank Q] [--as-of TS] [--limit N]
+mrplex query --repo <slug> [--filter EXPR] [--text Q] [--rank Q] [--limit N]
 
 mrplex tokens list
 mrplex tokens create --label LABEL --scope <slug>:read=<glob>,write=<glob> [--admin] [--expires TS]
@@ -745,7 +801,7 @@ mrplex tokens revoke <token-id>
 **Input conventions:**
 
 - `--from-file FILE` reads a Markdown document (frontmatter + body) from a file; `--from-file -` reads from stdin.
-- The CLI parses the file into `{ frontmatter, body }` before submission; the RPC layer never sees the raw file.
+- The CLI splits the file into the raw frontmatter block and the body and submits `{ frontmatter_raw, body }` verbatim — parsing happens server-side (§3.2), so what you wrote is exactly what's stored.
 
 **Output conventions:**
 
@@ -761,11 +817,13 @@ Everything the CLI does is achievable with `curl` against the MCP or REST surfac
 
 ### 8.1 Model
 
-Opaque bearer tokens with per-token capability scopes. Each token belongs to one user; a user may hold many tokens (one per client — CLI, Obsidian plugin, agent — each revocable individually). Tokens are stored hashed (argon2 or bcrypt); only the hash is persisted, the plaintext is shown once at issuance.
+Opaque bearer tokens with per-token capability scopes. Each token belongs to one user; a user may hold many tokens (one per client — CLI, Obsidian plugin, agent — each revocable individually). Tokens are stored hashed with plain **SHA-256**; only the hash is persisted, the plaintext is shown once at issuance.
+
+Why SHA-256 and not a slow salted KDF (argon2/bcrypt): the secret is a high-entropy random value the server generates, not a human-chosen password, so brute-force hardening adds nothing — and salted hashes are non-deterministic, which would make lookup-by-hash impossible (no stable value to index; every auth would have to scan and verify all tokens). `sha256(secret)` is deterministic: auth is a single indexed equality against `api_tokens.secret_hash`.
 
 Every request presents `Authorization: Bearer <token>`. The auth middleware:
 
-1. Looks up the token by hash. If missing / revoked / expired → **`unauthorized`**.
+1. Computes `sha256(secret)` and looks up the token by that hash. If missing / revoked / expired → **`unauthorized`**.
 2. Loads `{ user_id, scopes }` and attaches them as the resolved `actor` (§6.1).
 3. Delegates to the kernel operation, which runs an `authorize(actor, action, target)` check. On insufficient scope → **`forbidden`**.
 
@@ -776,34 +834,40 @@ Two independent axes: **server-level power** (a single boolean) and **data acces
 ```types
 StringOrList = string | string[]
 
-Scope = {
-  repo:   StringOrList,       // repo slug, glob, or list thereof
+ScopeInput = {                // accepted by tokens.create
+  repo:   StringOrList,       // repo slug, glob, or "*"; resolved to repo ids at creation (below)
   read?:  StringOrList,       // path literal, glob, or list thereof
   write?: StringOrList
 }
 
 Token = {
   admin:  boolean,            // server-level: repos.create/rename, users.*, others' tokens
-  scopes: Scope[]
+  scopes: Scope[]             // stored form: bound repo ids + path globs (§6.4)
 }
 ```
 
 Every field is polymorphic scalar-or-list, matching the §5.2 convention. At the auth boundary each field is normalized to a list (scalar → `[scalar]`, missing → `[]`) before matching.
 
+**Repo binding is by id, resolved at token creation.** `tokens.create` evaluates each `repo` pattern against the repos that exist at that moment and stores the matched **internal repo ids**, not the slugs. The literal `"*"` is the one exception — it is stored as a dynamic all-repos wildcard and covers repos created later. Consequences:
+
+- **Renames don't break tokens.** A token granted on `notes` keeps working when the repo is renamed to `notes-archive` — and a new repo that later claims the freed slug `notes` does *not* inherit the old token's access.
+- **Non-`*` patterns are snapshots.** A `team-*` grant covers the team repos that existed at issuance; a repo created afterwards requires re-issuing the token (or using `"*"`).
+- `tokens.list` renders bound repos by their **current slugs**.
+
 **Actions:**
 
-- **`read`** — `docs.get`, `docs.history`, `docs.diff`, `query`, `repos.describe`, and the corresponding REST/WebDAV GET routes. Path must match a `read` glob for the target repo.
+- **`read`** — `docs.get`, `docs.get_version`, `docs.history`, `docs.diff`, `query`, `repos.get`, and the corresponding REST GET routes. Path must match a `read` glob for the target repo.
 - **`write`** — `docs.create`, `docs.put`, `docs.delete`. Path must match a `write` glob. **Does not imply `read`** — a token that wants both lists both.
-- **`admin: true`** — `repos.create` / `repos.rename`, all `users.*`, and management of tokens other than the caller's own. Not scoped to a repo (there is no repo yet for `repos.create`, and `users.*` isn't repo-shaped).
+- **`admin: true`** — `repos.create` / `repos.rename` / `repos.delete` / `repos.set_path_config`, all `users.*` (including `users.delete`), and management of tokens other than the caller's own. Not scoped to a repo (there is no repo yet for `repos.create`, and `users.*` isn't repo-shaped). Repo config and deletion are admin-gated rather than write-scoped because they affect every writer of the repo, not just the caller's paths. `[OPEN]` A per-repo `manage` action for delegating repo administration (config, delete) without full server admin, if the need emerges.
 
 **Glob semantics:** gitignore-style. `**` matches any subtree, `*` matches within a path segment, `!pattern` negates. Literals are just globs with no metacharacters.
 
-- Repo globs match against the repo slug. Since slugs contain no `/`, `*` is the canonical wildcard at the repo level; reserve `**` for paths.
+- Repo patterns are evaluated once, at token creation (above), against repo slugs. Since slugs contain no `/`, `*` is the canonical wildcard at the repo level; reserve `**` for paths.
 - Path globs match against **the path at the version being accessed** — so `read: "drafts/**"` still reads historical states of a doc that has since been renamed out of `drafts/`.
 - A `docs.put` whose `path` differs from `prev`'s path (a move) requires **both** paths to match `write` — moving into or out of scope is a write on both endpoints.
 - **System-namespace carve-out.** No user scope can grant `write` at a system-sigil path (§3.5), so the "both endpoints" rule would forbid every deletion (destination is `:deleted/…`) and every restore (source is `:deleted/…`). Instead: for any move where **one** endpoint is under a system sigil, scope is checked only on the **user-territory** endpoint. Users get scope-checked on what they can see and reason about; the system-namespace endpoint is kernel-controlled.
 - `query` appends the token's `read` globs as an implicit path filter. Results outside scope are silently dropped, not 403'd — queries return what the caller is allowed to see, not what exists.
-- `repos.list` returns only repos whose slug matches at least one `repo` pattern across the token's scopes.
+- `repos.list` returns only repos bound by at least one of the token's scopes (all repos, for a `"*"` scope).
 
 **Examples:**
 
@@ -822,8 +886,11 @@ Every field is polymorphic scalar-or-list, matching the §5.2 convention. At the
 }]}
 
 // Read across a repo family, write to inbox in any of them
+// (resolved at issuance: covers the team-* repos existing at that moment)
 { "admin": false, "scopes": [{ "repo": "team-*", "read": "**", "write": "inbox/**" }] }
 ```
+
+The `repo` values above are creation-time inputs (`ScopeInput`); each resolves to concrete repo ids on issuance, except the dynamic `"*"`.
 
 Multiple scope entries stack — union semantics. A token can be broadly `read` on one repo family and narrowly `write` on a single repo by listing two entries.
 
@@ -849,7 +916,7 @@ DELETE /me/tokens/{id}                                      → Token
 
 Server-side, `api_tokens` (§3.2) holds `secret_hash` (never the plaintext), `label`, `scopes`, `expires_at`, `revoked_at`, `last_used_at`.
 
-Bootstrap: server creation seeds a `system` user and issues one root token (`{ repo: "*", actions: ["admin"] }`) printed to the operator once at first launch. Everything else can be created from there.
+Bootstrap: server creation seeds a `system` user and issues one root token (`{ admin: true, scopes: [{ repo: "*", read: "**", write: "**" }] }`, per §8.2) printed to the operator once at first launch. Everything else can be created from there.
 
 ### 8.4 Auth error codes
 
@@ -869,12 +936,12 @@ Both errors expose only the code; they do not leak whether a resource exists (i.
 
 Log of shape-defining decisions and their rationale. Newer decisions supersede older ones; the current shape is what's in the body of this doc.
 
-- **Deletion is a move to a system-namespace path, not a tombstone (§3.4, §3.5).** The kernel moves the doc to `<system-sigil>deleted/{original_path}@{version_id}`. Restore is a plain `docs.put` back to user territory. No `tombstone` column, no `resurrect` flag, no `already_tombstoned` / `resurrect_not_opted_in` errors.
+- **Deletion is a move to a system-namespace path, not a tombstone (§3.4, §3.5).** The kernel moves the doc to `<system-sigil>deleted/…` with the superseded version id inserted before the file extension: `path/to/document.md` → `:deleted/path/to/document-v45129.md`. Restore is a plain `docs.put` back to user territory. No `tombstone` column, no `resurrect` flag, no `already_tombstoned` / `resurrect_not_opted_in` errors.
 - **Configurable path policy in three tiers (§3.5).** Hardcoded defaults → server config → per-repo override (replace-not-merge). `disallowed_chars`, `system_sigils`, `hidden_sigils` — lists for input, first entry canonical on emission. Server-level policy also gates slug validation for repos and users.
 - **Structural path elements (`/`, `.`, `..`, empty segment) are non-configurable code constants (§3.5.1).**
-- **Query defaults exclude hidden and system paths (§5.1).** `include_hidden` and `include_system` flags opt back in. Applies to `filter`, `text`, `rank`, and `PROPFIND`.
+- **Query defaults exclude hidden and system paths (§5.1).** `include_hidden` and `include_system` flags opt back in. Applies to `filter`, `text`, and `rank`.
 - **Server never merges.** Merge policy is a client concern. Kernel enforces `prev_version_id` == current; conflicts return `stale_prev` with the current version attached (§4).
-- **Multi-token auth with capability scopes (§8).** Per-user tokens, argon2/bcrypt hashed, `admin: true` boolean for server-level power, per-repo `read` / `write` path globs (scalar-or-list, gitignore semantics). System-namespace endpoints on kernel-driven moves (delete/restore) are exempt from the "both endpoints match write" rule — scope is checked only on the user-territory endpoint.
+- **Multi-token auth with capability scopes (§8).** Per-user tokens, SHA-256-hashed secrets, `admin: true` boolean for server-level power, per-repo `read` / `write` path globs (scalar-or-list, gitignore semantics). System-namespace endpoints on kernel-driven moves (delete/restore) are exempt from the "both endpoints match write" rule — scope is checked only on the user-territory endpoint.
 - **`author_id` non-nullable.** Every version has an actor. A reserved `system` user can be introduced later if automated writes need attribution, but the schema doesn't allow author-less versions.
 - **Rename folded into `docs.put`.** `prev_version_id` already identifies the source location; the `path` argument is the destination. Same path = update, different path = move (§4.2). A rename-only verb can be added later if the ergonomics warrant it.
 - **Concurrent create on a freed path: `create_conflict`.** The second caller sees the first caller's live document at the path and must retry as `put` (or a distinct create at a different path). No special-case for deletion races.
@@ -882,15 +949,29 @@ Log of shape-defining decisions and their rationale. Newer decisions supersede o
 - **Embedding via user-defined hook (§5.3).** Server does not embed. Operator wires in an HTTP endpoint, subprocess, or in-process plugin implementing the batch `embed(chunks)` contract.
 - **Implementation language: TypeScript (Node).** Portability and ecosystem fit for a thin storage wrapper + CEL-to-SQL compiler (§7.1).
 - **Git/GitHub bridging deferred to post-v1 (§11).** mrplex stands alone in v1; adapters and sync policy come later.
+- **Token secrets hashed with plain SHA-256 (§8.1).** The secret is high-entropy and server-generated; a slow salted KDF adds nothing and would break indexed lookup-by-hash. Supersedes the earlier argon2/bcrypt choice.
+- **Scopes bind repo ids, resolved at token creation (§8.2).** Renaming a repo no longer breaks its tokens, and a freed slug can't leak old grants to a new repo. Non-`*` patterns are creation-time snapshots; `"*"` stays dynamic.
+- **MCP surface is protocol-true MCP (§6.2).** Streamable HTTP at `/mcp`; kernel ops exposed as tools with JSON Schema; kernel errors returned in-band as tool errors. STDIO transport is opt-in at startup and bound to a single launch-time token. Supersedes the earlier bespoke `POST /rpc` JSON-RPC shape.
+- **History, diff, and version reads use sibling REST roots (§6.3).** `/versions/{version_id}`, `/history/{path}`, `/diff/{path}` — suffix routes under a multi-segment `{path}` would be ambiguous with real document paths.
+- **Point-in-time (`as_of`) reads deferred to post-v1 (§11).** Correct answers are expensive (path→document resolution at T, historical FTS/rank semantics); better shaped as an explicit time-machine/export feature than a casual query parameter.
+- **WebDAV deferred to post-v1 (§11).** Naive mount clients can't carry `prev_version_id`; supporting them well requires a compatibility layer that must not leak into the core write model.
+- **Embedding load is damped server-side; write cadence is not (§5.3).** Debounce/sync policy is a client concern. The server dedups chunks by content hash, embeds only still-current versions, and rate-limits in the worker.
+- **Frontmatter stored twice: raw source + parsed JSON (§3.2).** `frontmatter_raw` is byte-verbatim source of truth and round-trips exactly; `frontmatter` is a derived query index. Writes supply exactly one form; the other is derived.
+- **Intrinsic CEL properties are `$`-prefixed (§5.1).** `$path`, `$created_at` — a fixed grammar constant, immune to frontmatter key collisions; `$` chosen over `:` to avoid the ternary operator, and fixed rather than configurable so a filter string parses identically everywhere.
+- **All deletes are idempotent (§3.4, §4.1).** Deleting an already-deleted document, repo, or user is a no-op.
+- **Repo and user deletion are system-namespace slug renames (§3.4).** The document-deletion primitive applied to slugs; admin-gated; frees the slug; user deletion also revokes tokens; `author_id` attribution is never disturbed.
+- **Paths and slugs are case-sensitive, byte-compared, unnormalized (§3.5.1).** Case-folding / Unicode-normalization policy deferred (§11).
+- **`stale_prev` redacts `current_path` when it's outside the caller's read scope (§4.3).**
+- **Path config is setup-time configuration (§3.5.2).** Advisory warnings on `set_path_config` are the only guard rail; sigil changes over a live corpus are deliberately not further protected.
 
-Remaining `[OPEN]` markers throughout the doc are narrower questions (query cacheability, `as_of` on GET, expression-index tuning, model-versioned chunks, etc.) that don't gate the v1 shape.
+Remaining `[OPEN]` markers throughout the doc are narrower questions (query cacheability, expression-index tuning, model-versioned chunks, etc.) that don't gate the v1 shape.
 
 ## 10. Milestones
 
 - **M0 — Kernel + skeleton.** Schema, SQLite storage, kernel reads (`repos.list`, `users.list`, `docs.get`, `docs.history`), `mrplex` CLI reading directly from the kernel (§7.3). Slug/id split enforced.
-- **M1 — Writes + auth.** Full kernel write surface (`docs.create` / `docs.put` / `docs.delete`, plus `repos.create` / `users.create` and the `.rename` methods) with `prev_version_id` enforcement. `docs.put` handles both in-place update and move. Bearer-token auth (§8): `api_tokens` table, capability scopes, `authorize()` on every kernel op, `tokens.*` RPCs, bootstrap root token. CLI gains write commands and `tokens.*`.
+- **M1 — Writes + auth.** Full kernel write surface (`docs.create` / `docs.put` / `docs.delete`, plus `repos.create` / `users.create` and the `.rename` / `.delete` methods) with `prev_version_id` enforcement. `docs.put` handles both in-place update and move. Bearer-token auth (§8): `api_tokens` table, capability scopes, `authorize()` on every kernel op, `tokens.*` RPCs, bootstrap root token. CLI gains write commands and `tokens.*`.
 - **M2 — Query.** CEL filter + FTS; `kernel.query` end-to-end; CLI `query` command.
-- **M3 — HTTP surfaces.** JSON-RPC at `POST /rpc` (+ STDIO transport for MCP); REST + WebDAV subset (`GET` / `PUT` / `DELETE` / `MOVE` / `PROPFIND`, `If-Match` / `If-None-Match`, content negotiation). CLI gains `--server` flag to target a remote instance over MCP.
+- **M3 — HTTP surfaces.** MCP server at `/mcp` (Streamable HTTP; optional STDIO transport, startup-gated); REST surface (`GET` / `PUT` / `DELETE` / `MOVE`, `If-Match` / `If-None-Match`, content negotiation, `/versions` / `/history` / `/diff` routes). CLI gains `--server` flag to target a remote instance over MCP.
 - **M4 — Semantic.** Chunking + embeddings + vector search.
 - **M5 — Postgres backend.**
 
@@ -899,4 +980,6 @@ Remaining `[OPEN]` markers throughout the doc are narrower questions (query cach
 - **Git bridging.** Attach a **source** (adapter + policy) to a repo: pull (`git → mrplex`), push (`mrplex → git` via `staged` / `autocommit` / `autopr`), or bidirectional. Loop avoidance via commit trailer. mrplex's fast-forward-only write model carries over — a git ingest that advances the head just marks in-flight mrplex writes stale, same mechanism.
 - **Merge helpers.** A read-only `docs.merge_preview` and a client-side merge library that implements common patterns (refetch-and-retry, three-way block merge, callout fallback). A cached parsed block tree on `versions` would support this cheaply.
 - **Grouped writes.** A `changesets` entity for atomic multi-document writes, if a use case emerges.
-- **WebDAV extensions.** `LOCK` / `UNLOCK` (for editors that hold long-form locks), `PROPPATCH` (custom properties as first-class writes), collection-level `COPY`. v1 ships only the read/write/move subset needed for filesystem mounting.
+- **Case and Unicode path policy.** v1 is byte-exact (§3.5.1). A per-repo option for case-insensitive path uniqueness and Unicode normalization (NFC) would serve case-insensitive filesystems and clients that emit NFD (macOS); it needs a normalized shadow column with its own unique partial index, so it's a deliberate schema decision, not a toggle.
+- **WebDAV / filesystem mounting.** Deferred because the write model and naive mounts are fundamentally at odds: OS mount clients (Finder, Windows Explorer) issue unconditional `PUT`s with no `If-Match`, so there is nowhere to carry `prev_version_id` — honoring them as-is means last-writer-wins, which the kernel refuses by design. They also require Class-2 `LOCK`/`UNLOCK` before permitting read-write mounts, expect `MKCOL` and empty-directory semantics a path-implicit store doesn't have, need hidden-sigil paths visible (an editor's own config directories, e.g. `.obsidian/`), and generate junk writes (`.DS_Store`, autosave storms) that would become permanent versions. Doing this well means a DAV-specific compatibility layer — server-held per-session ETag tracking, a lock table, write coalescing — designed so its relaxed semantics cannot leak into the core API.
+- **Point-in-time reads (`as_of`) / time machine.** Answering "what was live at path P at time T" requires per-document latest-version-≤-T resolution over full history (a path may have hosted different documents over time), plus a defined story for historical FTS and vector search — too expensive and too subtle to hang off a casual query parameter. Better shaped as an explicit rewind/export feature (materialize a repo's state at T into a new repo, or stream it out) with its own index support, e.g. `versions(repo_id, path, created_at)`.
