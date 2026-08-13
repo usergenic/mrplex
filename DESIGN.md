@@ -23,7 +23,7 @@ External-source bridging (git repos, GitHub) is deliberately post-v1, as are Web
 - Not a wiki UI.
 - Not a general document store — only Markdown-with-YAML-frontmatter.
 - Not a git mirror — no adapters, no sync. mrplex stands alone.
-- Not a mountable network filesystem — no WebDAV in v1; see §11 for why that's harder than it looks.
+- Not a mountable network filesystem — no WebDAV in v1; the gateway design is specified for later in §11.1.
 
 ## 3. Data model
 
@@ -160,11 +160,11 @@ Three fields, layered across three tiers:
 ```yaml
 path:
   disallowed_chars: ["\\", "<", ">", ":", "|", "?", "\""]   # forbidden anywhere in a user-written segment
-  system_sigils:    [":"]                                     # leading chars marking kernel-owned segments
-  hidden_sigils:    ["."]                                     # leading chars marking user-hidden segments
+  system_sigils:    [":"]                                     # leading prefixes marking kernel-owned segments
+  hidden_sigils:    ["."]                                     # leading prefixes marking user-hidden segments
 ```
 
-Defaults follow Obsidian's cross-platform-safe rule (minus `/`). All three fields are lists of single characters.
+Defaults follow Obsidian's cross-platform-safe rule (minus `/`). `disallowed_chars` is a list of single characters (each is forbidden anywhere in a segment). The sigil lists are lists of non-empty **strings** — leading prefixes, typically one character (`:`, `.`) but legally longer (`__sys_`, `~$`).
 
 **Tier layering:**
 
@@ -174,10 +174,10 @@ Defaults follow Obsidian's cross-platform-safe rule (minus `/`). All three field
 
 **Startup invariants** (server refuses to start otherwise):
 
-- Each list contains only single characters.
-- `PATH_SEPARATOR` appears in no list.
-- `system_sigils ∩ hidden_sigils = ∅`.
-- `hidden_sigils ∩ disallowed_chars = ∅` (users must be able to write chars they use to hide their own folders).
+- Every `disallowed_chars` entry is a single character; every sigil is a non-empty string.
+- `PATH_SEPARATOR` appears in no entry of any list.
+- **No sigil is a prefix of any other sigil, across the union of both lists.** With multi-character sigils, plain set-disjointness isn't enough — system `":"` alongside hidden `":h"` would classify segment `:hfoo` both ways. Forbidding prefix relations makes segment classification unambiguous (and subsumes the old `system ∩ hidden = ∅` rule, since equality is a prefix relation).
+- No hidden sigil contains a character from `disallowed_chars` (users must be able to write the prefixes they use to hide their own folders). System sigils may — users never write those.
 - Both sigil lists are non-empty (otherwise the kernel has no canonical sigil to emit under).
 
 Path config is **setup-time configuration**, not a runtime toggle. Changing sigils over a live corpus can orphan system paths and re-expose hidden ones (§3.5.4); beyond the advisory warnings on `set_path_config` (§3.5.3), the system deliberately adds no further guard rails.
@@ -187,7 +187,7 @@ Path config is **setup-time configuration**, not a runtime toggle. Changing sigi
 Applied at `docs.create` and `docs.put`, per segment:
 
 1. Segment is not `EMPTY_SEGMENT`, `CURRENT_SEGMENT`, or `PARENT_SEGMENT`.
-2. Segment's first char is not in the effective `system_sigils` (would collide with kernel-emitted paths).
+2. Segment does not start with any effective system sigil (would collide with kernel-emitted paths).
 3. No character in the segment is in the effective `disallowed_chars`.
 
 Failure at any step → `path_invalid`.
@@ -220,7 +220,7 @@ Deletion paths key on the original path plus the superseded version id (§3.4), 
 
 #### 3.5.5 Query default exclusion
 
-Filter, text, and rank all exclude any document whose current `path` has **any segment** whose first char is in `hidden_sigils ∪ system_sigils`. Two opt-in flags on the query spec restore visibility:
+Filter, text, and rank all exclude any document whose current `path` has **any segment** starting with a sigil in `hidden_sigils ∪ system_sigils`. Two opt-in flags on the query spec restore visibility:
 
 - `include_hidden: true` — surfaces paths with hidden-sigil segments.
 - `include_system: true` — surfaces paths with system-sigil segments.
@@ -232,7 +232,7 @@ Compiled to SQL as one `NOT (path LIKE 'X%' OR path LIKE '%/X%')` clause per con
 Repo and user slugs are validated against **server-level** path config (per-repo config does not apply — the slug is validated before any repo has a chance to override, and users are global). Rules:
 
 - No character in `PATH_SEPARATOR`, `disallowed_chars`.
-- First character is not in `system_sigils` or `hidden_sigils`.
+- Does not start with any sigil in `system_sigils` or `hidden_sigils`.
 - Slug is not `CURRENT_SEGMENT`, `PARENT_SEGMENT`, or `EMPTY_SEGMENT`.
 - Additional slug-hygiene rules (max length, no leading/trailing whitespace) apply on top.
 
@@ -341,7 +341,7 @@ Compiled to SQL: for each accepted sigil `X` in the effective config, one clause
 **Perf shape of sigil exclusion.** The concern: as trash accumulates, every default query pays a filter cost against `:deleted/` rows. In practice this is smaller than it looks:
 
 - **Bounded by the live-set index.** All queries run on top of the partial index `versions(repo_id, path) where next_id is null`. Its size is the count of *currently-live* documents (including trashed-current ones), not total version history. Trash growth is linear in delete count, not in edit count or total content size.
-- **`LIKE 'X%'` is index-friendly with a rewrite.** At query-compile time, `path LIKE ':%'` becomes a range predicate `path >= ':' AND path < ';'` — a B-tree range scan on both PG and SQLite, no collation or pragma dependencies. The compiler is expected to do this rewrite for the leading-sigil check; the `%/:%` middle-of-path variant still needs `LIKE`, but that form is rare in practice (users don't write paths with `:` mid-segment because `:` is in `disallowed_chars`).
+- **`LIKE 'X%'` is index-friendly with a rewrite.** At query-compile time, `path LIKE ':%'` becomes a range predicate `path >= ':' AND path < ';'` — a B-tree range scan on both PG and SQLite, no collation or pragma dependencies. The rewrite generalizes to multi-character sigils (§3.5.2): prefix `P` → `path >= P AND path < next(P)`, where `next` increments `P`'s last byte. The compiler is expected to do this rewrite for the leading-sigil check; the `%/:%` middle-of-path variant still needs `LIKE`, but that form is rare in practice (users don't write paths with `:` mid-segment because `:` is in `disallowed_chars`).
 - **No boolean row-time columns.** We considered `hidden` / `system` boolean columns computed at insert. Rejected: those flags are a decision about *how the caller wants to view rows* (which depends on the querying repo's current config), not a property of the row itself. A repo that swaps `hidden_sigils` from `["."]` to `[".", "_"]` should immediately treat existing `_foo/…` paths as hidden without a data rewrite. Query-time decision, not row-time.
 
 `[OPEN]` **Materialized prefix index** for very large corpora — e.g., `CREATE INDEX ON versions ((substr(path, 1, 1))) WHERE next_id IS NULL` (PG) or a generated column with an index (SQLite). Adds one prefix column that's cheap to maintain (per-row-write, constant work) and answers sigil membership directly. Deferred until benchmarks demand it, because it introduces a migration on config change (the set of "prefix chars that matter" is derived from config).
@@ -647,11 +647,15 @@ All timestamps on the wire (`created_at`, `expires_at`, `last_used_at`, `before`
 
 ### 7.1 Deployment shapes
 
-- **Local, embedded** — single binary, SQLite file, no daemon. Ideal for personal notebooks and CLI-only workflows.
-- **Local, containerized** — binary + `docker compose up` for Postgres + pgvector. First-class path, not "production only" — a user who wants to run the server flavor on their laptop should have no more friction than the SQLite path.
-- **Self-hosted server** — same binary + managed Postgres + pgvector, HTTP(S) surfaces.
+A deployment shape is an answer to three questions: **where the database lives**, **what runs the HTTP surfaces**, and **what runs the embedding worker** (§5.3). The kernel/surface/worker split keeps those answers independent — long-lived hosts run all three in one process; ephemeral hosts split the worker out.
 
-The binary takes `--database sqlite:./mrplex.db` or `--database postgres://…` (also via `MRPLEX_DATABASE` env). No other config surgery to switch.
+- **Local, embedded** — single binary, SQLite file, no daemon. The CLI talks to the kernel in-process; `mrplex serve` starts the HTTP surfaces on localhost when an editor or agent needs them. Ideal for personal notebooks and CLI-only workflows.
+- **Local, containerized** — binary + `docker compose up` for Postgres + pgvector. First-class path, not "production only" — a user who wants to run the server flavor on their laptop should have no more friction than the SQLite path.
+- **Typical cloud** — the same container on any long-lived container host (a VPS, Fly.io, Cloud Run, Railway, …) pointed at managed Postgres + pgvector; TLS terminates at the platform edge (§8.5). Everything runs in the one process, worker included. Multiple instances are safe for the surfaces — concurrency is enforced at the storage layer (§3.2, §4), not in process memory — but run a single embedding worker, or make backlog dequeue atomic (`SELECT … FOR UPDATE SKIP LOCKED`), before scaling out.
+- **Supabase** — Postgres + pgvector is the platform's native database, so the Postgres adapter (M5) maps on directly. The surfaces deploy as Edge Functions (Deno; the TS kernel runs as-is). The one structural difference: edge functions are request-scoped, so there is no home for a resident embedding worker — the backlog is drained by scheduled invocations instead (`pg_cron` + `pg_net`, or Supabase scheduled functions). The SQLite flavor is not applicable (no persistent local filesystem), and platform limits (memory, per-request CPU, bundle size) should be checked at implementation time — the kernel's thin-CRUD profile fits comfortably.
+- **zo.computer (personal server)** — a persistent single-user server with a real filesystem and long-lived processes: exactly the environment the embedded flavor was designed for. `mrplex serve --database sqlite:~/mrplex/mrplex.db` as a Zo service, database on the persistent disk, HTTP surfaces exposed at the service's public URL so remote MCP agents and the CLI can reach it from anywhere. The embedding hook (§5.3) points wherever is convenient — a sidecar process on the same box or a hosted embedding API. This is the reference "personal notebook with agents" deployment.
+
+The binary takes `--database sqlite:./mrplex.db` or `--database postgres://…` (also via `MRPLEX_DATABASE` env). No other config surgery to switch shapes.
 
 **Implementation language: TypeScript (Node).** mrplex is a thin wrapper around a storage engine plus a CEL-to-SQL compiler and a couple of HTTP surfaces — none of it CPU-bound. TypeScript is chosen for portability (Node runs everywhere the SQLite/PG drivers do), ergonomic distribution (single `npm` install for the CLI, containerized for the server), and a mature ecosystem for the pieces we need (`better-sqlite3` / `pg`, `cel-js` or a hand-rolled parser, and JSON-RPC / HTTP libs).
 
@@ -759,6 +763,9 @@ The CLI is a thin client over the MCP surface (§6.2) — no capabilities of its
 Commands mirror MCP tool names in a `noun verb` shape:
 
 ```rpc
+mrplex serve [--database URL] [--port N]                          # the one non-client command: runs the server
+                                                                  # (HTTP surfaces + embedding worker; §7.1)
+
 mrplex repos list [--include-system]
 mrplex repos get <slug>
 mrplex repos create <slug>
@@ -954,7 +961,7 @@ Log of shape-defining decisions and their rationale. Newer decisions supersede o
 - **MCP surface is protocol-true MCP (§6.2).** Streamable HTTP at `/mcp`; kernel ops exposed as tools with JSON Schema; kernel errors returned in-band as tool errors. STDIO transport is opt-in at startup and bound to a single launch-time token. Supersedes the earlier bespoke `POST /rpc` JSON-RPC shape.
 - **History, diff, and version reads use sibling REST roots (§6.3).** `/versions/{version_id}`, `/history/{path}`, `/diff/{path}` — suffix routes under a multi-segment `{path}` would be ambiguous with real document paths.
 - **Point-in-time (`as_of`) reads deferred to post-v1 (§11).** Correct answers are expensive (path→document resolution at T, historical FTS/rank semantics); better shaped as an explicit time-machine/export feature than a casual query parameter.
-- **WebDAV deferred to post-v1 (§11).** Naive mount clients can't carry `prev_version_id`; supporting them well requires a compatibility layer that must not leak into the core write model.
+- **WebDAV deferred to post-v1, gateway fully specified (§11.1).** Naive mount clients can't carry `prev_version_id`; the answer is a gateway that is a stateful *client* of the kernel — lock-table / read-map / fetch-and-retry tiers resolve `prev`, and no relaxed semantic touches the kernel.
 - **Embedding load is damped server-side; write cadence is not (§5.3).** Debounce/sync policy is a client concern. The server dedups chunks by content hash, embeds only still-current versions, and rate-limits in the worker.
 - **Frontmatter stored twice: raw source + parsed JSON (§3.2).** `frontmatter_raw` is byte-verbatim source of truth and round-trips exactly; `frontmatter` is a derived query index. Writes supply exactly one form; the other is derived.
 - **Intrinsic CEL properties are `$`-prefixed (§5.1).** `$path`, `$created_at` — a fixed grammar constant, immune to frontmatter key collisions; `$` chosen over `:` to avoid the ternary operator, and fixed rather than configurable so a filter string parses identically everywhere.
@@ -981,5 +988,55 @@ Remaining `[OPEN]` markers throughout the doc are narrower questions (query cach
 - **Merge helpers.** A read-only `docs.merge_preview` and a client-side merge library that implements common patterns (refetch-and-retry, three-way block merge, callout fallback). A cached parsed block tree on `versions` would support this cheaply.
 - **Grouped writes.** A `changesets` entity for atomic multi-document writes, if a use case emerges.
 - **Case and Unicode path policy.** v1 is byte-exact (§3.5.1). A per-repo option for case-insensitive path uniqueness and Unicode normalization (NFC) would serve case-insensitive filesystems and clients that emit NFD (macOS); it needs a normalized shadow column with its own unique partial index, so it's a deliberate schema decision, not a toggle.
-- **WebDAV / filesystem mounting.** Deferred because the write model and naive mounts are fundamentally at odds: OS mount clients (Finder, Windows Explorer) issue unconditional `PUT`s with no `If-Match`, so there is nowhere to carry `prev_version_id` — honoring them as-is means last-writer-wins, which the kernel refuses by design. They also require Class-2 `LOCK`/`UNLOCK` before permitting read-write mounts, expect `MKCOL` and empty-directory semantics a path-implicit store doesn't have, need hidden-sigil paths visible (an editor's own config directories, e.g. `.obsidian/`), and generate junk writes (`.DS_Store`, autosave storms) that would become permanent versions. Doing this well means a DAV-specific compatibility layer — server-held per-session ETag tracking, a lock table, write coalescing — designed so its relaxed semantics cannot leak into the core API.
+- **WebDAV / filesystem mounting.** Deferred from v1, but fully specified — see §11.1. Kept spec-complete so the gateway module can be built without revisiting the architecture.
 - **Point-in-time reads (`as_of`) / time machine.** Answering "what was live at path P at time T" requires per-document latest-version-≤-T resolution over full history (a path may have hosted different documents over time), plus a defined story for historical FTS and vector search — too expensive and too subtle to hang off a casual query parameter. Better shaped as an explicit rewind/export feature (materialize a repo's state at T into a new repo, or stream it out) with its own index support, e.g. `versions(repo_id, path, created_at)`.
+
+### 11.1 WebDAV gateway — implementation spec
+
+Deferred from v1 because naive mount clients (Finder, Windows Explorer) issue unconditional `PUT`s with no `If-Match` — there is nowhere in their protocol usage to carry `prev_version_id`. But the design contains its own answer: §4 says merge policy is a client concern, and the gateway is exactly that — **a stateful client of the kernel**. This section is the spec to build the module from.
+
+#### What the gateway is
+
+A third HTTP surface, peer to REST (§6.3) and MCP (§6.2): a route module at `/dav/{repo}/{path}` in the same server process, sharing the kernel instance, auth machinery, and config. It touches **only the public kernel contract** — which also means it can optionally run out-of-process as a standalone proxy speaking REST to a remote mrplex (the "stateful client" framing taken literally). In-process is the default: one binary, no extra hop.
+
+The client half ships with every OS — that is the point of choosing WebDAV over a custom sync protocol. Mounting spawns the OS's own WebDAV client (macOS `webdavfs`, Windows WebClient service, Linux davfs2/gvfs), which translates filesystem syscalls into HTTP verbs: `readdir` → `PROPFIND Depth: 1`, open-for-read → `GET`, save → `LOCK`/`PUT`/`UNLOCK`. mrplex ships no client-side software.
+
+**Boundary invariant:** gateway state never appears in the kernel schema, and the kernel never grows a DAV-shaped code path. Every relaxed semantic below is a gateway policy expressed through ordinary kernel calls.
+
+#### Verb mapping
+
+| DAV request | Gateway behavior | Kernel call |
+|---|---|---|
+| `OPTIONS` | Advertise `DAV: 1, 2` (Class 2 = locking; Finder/Windows refuse read-write mounts without it). | — |
+| `PROPFIND` (Depth 0/1) | Prefix listing over live paths; directories are implicit. `getetag` = `version_id`, `getlastmodified` = `created_at`, `getcontentlength` = byte length of `frontmatter_raw` + `---` delimiters + `body` (correct only because §3.2 round-trips byte-exact — DAV clients cross-check size and ETag and desync otherwise). Phantom collections appear as empty dirs. `Depth: infinity` → 403. | `query` (path prefix) |
+| `GET` | Serialize the doc byte-exact; ETag = `version_id`. Record `(credential, path) → version_id` in the read-map. | `docs.get` |
+| `PUT` | Resolve `prev` per the three tiers below; lenient frontmatter pre-parse. No live doc at the path → create. | `docs.put` / `docs.create` |
+| `DELETE` | Straight delegation; already idempotent (§4.1). | `docs.delete` |
+| `MOVE` | Same-repo only; `prev` per tiers; content unchanged. | `docs.put` (dest path) |
+| `COPY` | New document identity at the destination. | `docs.create` |
+| `MKCOL` | Add a phantom collection. | — |
+| `LOCK` / `UNLOCK` | Gateway lock table (below); lock refresh supported. | `docs.get` at lock time |
+| `PROPPATCH` | Accept and discard (207 success); dead properties are not persisted. | — |
+
+#### Resolving `prev` — three tiers, by how much the client tells you
+
+1. **Locked writes (best path).** `LOCK` records the current `version_id` and issues a lock token; every `PUT` under that token uses the recorded version (or the last write inside the lock) as `prev`. A racing API writer surfaces as `stale_prev` → 412 — a true conflict signal. Finder/Windows require Class 2 to mount read-write, so the clients most in need of hand-holding are forced onto the best-behaved path.
+2. **Session read-tracking.** DAV clients `GET` before `PUT` (open → edit → save); the read-map supplies the version last served *to that credential* as `prev` — the `If-Match` discipline reconstructed server-side.
+3. **Cold unconditional `PUT`.** Fetch current, use it as `prev`, retry on `stale_prev` (bounded loop). This is last-writer-wins — as an explicit, documented merge policy running *through* the concurrency primitive, not around it. Every clobber is still a full version in the chain; the append-only history is what makes last-writer-wins tolerable on a filesystem surface.
+
+#### Gateway-owned state
+
+- **Lock table** — `{ repo, path, version_id, lock_token, owner, timeout, expires_at }`. In-memory with TTL is acceptable: DAV locks expire by spec, and losing the table on restart merely degrades clients to tiers 2–3.
+- **Session read-map** — keyed by auth token; value `path → version_id`; TTL-bounded. Honest framing: DAV is stateless HTTP, so this is a heuristic cache, not ground truth — locks are the reliable mechanism; this tier improves the common unlocked case.
+- **Phantom collections** — persisted set of `(repo, prefix)` created by `MKCOL` and not yet containing a live document; listed as empty dirs by `PROPFIND`; evaporate once a real doc exists beneath them. Persisted (unlike locks) so empty folders survive a restart.
+
+#### Policies
+
+- **Auth.** DAV clients speak Basic, not Bearer: the password field carries the mrplex token; the gateway resolves it to an actor exactly as the other surfaces do (§8). The username is ignored.
+- **Sigil visibility.** The DAV view sets `include_hidden: true` unconditionally — a filesystem shows dotfiles to programs (`.obsidian/` must be visible). System namespace stays hidden, or is exposed read-only as a `:deleted/` folder — OS-style trash for free.
+- **Junk writes.** Configurable ignore-list (`.DS_Store`, `._*`, `Thumbs.db`): accept and discard with a success status so clients don't retry. Autosave storms become ordinary versions; the embedding damper (§5.3) absorbs the cost.
+- **Lenient frontmatter.** A filesystem must accept any bytes, and a malformed leading `---` block is exactly what a half-typed edit looks like mid-save. The gateway pre-parses: if the block is unparseable, it submits the whole file as body with empty frontmatter, re-splitting on the next valid save. No kernel change — the leniency is a gateway submission policy; API/REST clients keep strict validation.
+
+#### Reference save flow
+
+⌘S on the mounted volume → `LOCK` (gateway records current `version_id`, issues token) → `PUT` with token + raw file bytes (Basic → actor; pre-parse the `---` block; `kernel.docs.put(repo, path, prev_version_id, frontmatter_raw, body, actor)`) → gateway advances the lock record, answers 204 with the new ETag → `UNLOCK`. The kernel saw a completely ordinary optimistic write.
