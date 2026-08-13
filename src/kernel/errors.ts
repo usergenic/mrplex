@@ -33,11 +33,9 @@ export class KernelError<D = Record<string, unknown>> extends Error {
   }
 }
 
-export const repoNotFound = (slug: string) =>
-  new KernelError("repo_not_found", { slug });
+export const repoNotFound = (slug: string) => new KernelError("repo_not_found", { slug });
 
-export const userNotFound = (slug: string) =>
-  new KernelError("user_not_found", { slug });
+export const userNotFound = (slug: string) => new KernelError("user_not_found", { slug });
 
 export const docNotFound = (repo: string, path: string) =>
   new KernelError("doc_not_found", { repo, path });

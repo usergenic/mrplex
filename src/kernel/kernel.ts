@@ -9,12 +9,7 @@
 
 import type { Storage, VersionRow } from "../storage/types.js";
 import { type Action, type Actor, type Target, authorize } from "./actor.js";
-import {
-  KernelError,
-  docNotFound,
-  repoNotFound,
-  versionNotFound,
-} from "./errors.js";
+import { KernelError, docNotFound, repoNotFound, versionNotFound } from "./errors.js";
 import { decodeVersionId, encodeVersionId } from "./version-id.js";
 import type { Repo, User, Version } from "./wire.js";
 
@@ -73,7 +68,11 @@ export function createKernel(storage: Storage): Kernel {
     };
   }
 
-  function resolveRepo(actor: Actor, slug: string, action: Action): {
+  function resolveRepo(
+    actor: Actor,
+    slug: string,
+    action: Action,
+  ): {
     id: number;
     slug: string;
     path_config: string | null;

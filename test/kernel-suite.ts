@@ -16,8 +16,7 @@ export type AdapterFactory = {
   open: () => Storage;
 };
 
-const T = (sec: number): string =>
-  new Date(Date.UTC(2026, 7, 13, 0, 0, sec)).toISOString();
+const T = (sec: number): string => new Date(Date.UTC(2026, 7, 13, 0, 0, sec)).toISOString();
 
 export function runKernelSuite(factory: AdapterFactory): void {
   describe(`kernel [${factory.name}]`, () => {
@@ -122,10 +121,7 @@ export function runKernelSuite(factory: AdapterFactory): void {
 
     describe("users.list", () => {
       it("returns all users, ordered by slug", () => {
-        expect(kernel.users.list(SYSTEM_ACTOR)).toEqual([
-          { user: "alice" },
-          { user: "bob" },
-        ]);
+        expect(kernel.users.list(SYSTEM_ACTOR)).toEqual([{ user: "alice" }, { user: "bob" }]);
       });
     });
 

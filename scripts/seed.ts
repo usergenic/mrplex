@@ -39,9 +39,7 @@ function assertEmpty(storage: Storage): void {
   const users = storage.users_list();
   const repos = storage.repos_list();
   if (users.length > 0 || repos.length > 0) {
-    throw new Error(
-      "seed: database is not empty — refusing to run. Delete the file and retry.",
-    );
+    throw new Error("seed: database is not empty — refusing to run. Delete the file and retry.");
   }
 }
 

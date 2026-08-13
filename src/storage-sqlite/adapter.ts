@@ -101,23 +101,25 @@ class SqliteStorage implements Storage {
 
   users_create(input: { slug: string; created_at: string }): UserRow {
     const row = this.db
-      .prepare(
-        "insert into users(slug, created_at) values (?, ?) returning id, slug, created_at",
-      )
+      .prepare("insert into users(slug, created_at) values (?, ?) returning id, slug, created_at")
       .get(input.slug, input.created_at) as UserRow;
     return row;
   }
 
   users_by_slug(slug: string): UserRow | null {
-    return (this.db
-      .prepare("select id, slug, created_at from users where slug = ?")
-      .get(slug) as UserRow | undefined) ?? null;
+    return (
+      (this.db.prepare("select id, slug, created_at from users where slug = ?").get(slug) as
+        | UserRow
+        | undefined) ?? null
+    );
   }
 
   users_by_id(id: number): UserRow | null {
-    return (this.db
-      .prepare("select id, slug, created_at from users where id = ?")
-      .get(id) as UserRow | undefined) ?? null;
+    return (
+      (this.db.prepare("select id, slug, created_at from users where id = ?").get(id) as
+        | UserRow
+        | undefined) ?? null
+    );
   }
 
   repos_list(): RepoRow[] {
@@ -136,15 +138,19 @@ class SqliteStorage implements Storage {
   }
 
   repos_by_slug(slug: string): RepoRow | null {
-    return (this.db
-      .prepare("select id, slug, path_config, created_at from repos where slug = ?")
-      .get(slug) as RepoRow | undefined) ?? null;
+    return (
+      (this.db
+        .prepare("select id, slug, path_config, created_at from repos where slug = ?")
+        .get(slug) as RepoRow | undefined) ?? null
+    );
   }
 
   repos_by_id(id: number): RepoRow | null {
-    return (this.db
-      .prepare("select id, slug, path_config, created_at from repos where id = ?")
-      .get(id) as RepoRow | undefined) ?? null;
+    return (
+      (this.db
+        .prepare("select id, slug, path_config, created_at from repos where id = ?")
+        .get(id) as RepoRow | undefined) ?? null
+    );
   }
 
   documents_create(repo_id: number): DocumentRow {
