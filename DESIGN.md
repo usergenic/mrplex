@@ -31,7 +31,7 @@ External-source bridging (git repos, GitHub) is deliberately post-v1, as are Web
 
 - **Repo** — a container. Namespaces document paths and scopes queries. Also carries an optional path-config override (§3.5).
 - **Document** — an identity for a Markdown file. Persists across renames and delete/restore cycles.
-- **Version** — an immutable snapshot of a document: path, frontmatter, body, author, timestamp, and links to the previous and next versions (`next_id` null = current). Every write inserts one.
+- **Version** — an immutable snapshot of a document: path, frontmatter (raw + parsed, §3.2), body, author, timestamp, and links to the previous and next versions (`next_id` null = current). Every write inserts one.
 - **Deletion** — not a distinct row type. A delete is a `docs.put` that moves the document to a **system-namespace** path under `<system-sigil>deleted/` (§3.5). Restore is a `docs.put` that moves it back out. Same document identity throughout; history is continuous.
 
 ### 3.2 Schema
@@ -80,7 +80,8 @@ chunks (
   version_id integer not null references versions(id),
   ix         integer not null,
   text       text not null,
-  text_hash  text not null,                                 -- sha-256 of text; embedding-reuse key (§5.3)
+  text_hash  text not null,                                 -- sha-256 of text; with model, the embedding-reuse key (§5.3)
+  model      text not null,                                 -- embedding model that produced the vector (§5.3)
   embedding  vector,                                        -- pgvector / sqlite-vec
   primary key (version_id, ix)
 )
@@ -191,6 +192,8 @@ Applied at `docs.create` and `docs.put`, per segment:
 3. No character in the segment is in the effective `disallowed_chars`.
 
 Failure at any step → `path_invalid`.
+
+`[OPEN]` Resource caps: maximum segment/path length and maximum document size — likely server config with generous defaults. Note the deletion suffix (§3.4) lengthens paths, so the user-facing path maximum sits slightly below the hard cap.
 
 Validation is **write-time only**. Existing versions keep whatever path they had; history and diff work regardless of current config. Tightening config *does not* rewrite or hide existing rows — it only affects future writes. This is the same rule the system uses for slug validation on rename.
 
@@ -314,7 +317,7 @@ Derived from the authenticated caller's token → user mapping. Never trusted fr
 
 ## 5. Query
 
-Three composable modes: **filter** (CEL over frontmatter/path/created_at), **text** (FTS over body), **rank** (semantic over embeddings).
+Three composable modes: **filter** (CEL over frontmatter fields and `$`-intrinsics), **text** (FTS over body), **rank** (semantic over embeddings). When more than one is present they intersect; ordering follows §5.1.
 
 ### 5.1 Query spec
 
@@ -330,9 +333,15 @@ Three composable modes: **filter** (CEL over frontmatter/path/created_at), **tex
 }
 ```
 
-CEL scope: frontmatter fields are top-level (`status`, `tags`). **Intrinsic document properties are `$`-prefixed** — `$path`, `$created_at` — mirroring the sigil idea from §3.5: a marker character separates kernel-owned names from user territory, so intrinsics can never collide with user-defined frontmatter keys (a document with a frontmatter field literally named `path` stays queryable as bare `path`). Two differences from path sigils: the `$` marker is a **fixed grammar constant** in the §3.5.1 sense (grammar, not policy — a configurable marker would make the same filter string parse differently per repo), and it's `$` rather than `:` because `:` collides with CEL's ternary operator (`a ? b :path` is ambiguous) while `$` is unused by standard CEL — a small lexer extension, no grammar changes. A side benefit: the intrinsic namespace is forever open — new intrinsics (`$author`, `$repo`, …) can be added later without breaking any existing filter.
+`repo` follows the scalar-or-list convention (§5.2): a slug, a glob, or a list thereof, matched against the caller's bound repos; omitted = every repo the caller's scopes cover (§8.2). Cross-repo queries evaluate each repo's effective path config independently (§3.5.5).
+
+CEL scope: frontmatter fields are top-level (`status`, `tags`). **Intrinsic document properties are `$`-prefixed** — `$path`, `$created_at` — mirroring the sigil idea from §3.5: a marker character separates kernel-owned names from user territory, so intrinsics can never collide with user-defined frontmatter keys (a document with a frontmatter field literally named `path` stays queryable as bare `path`). Two differences from path sigils: the `$` marker is a **fixed grammar constant** in the §3.5.1 sense (grammar, not policy — a configurable marker would make the same filter string parse differently per repo), and it's `$` rather than `:` because `:` collides with CEL's ternary operator (`a ? b :path` is ambiguous) while `$` is unused by standard CEL — a small lexer extension, no grammar changes (applied as a minimal patch to the vendored `cel-go` lexer; §7.1). A side benefit: the intrinsic namespace is forever open — new intrinsics (`$author`, `$repo`, …) can be added later without breaking any existing filter.
 
 FTS is a first-class feature — markdown is the whole product, searching its prose is table stakes. The backend is **adapter-owned**: SQLite adapters use FTS5, Postgres adapters use `tsvector`. Result sets are portable across adapters; ranking scores are not (§7.2 parity table).
+
+**Search indexes cover current versions only.** Indexing a new version evicts the document's previous entry from the FTS index, and `rank` returns hits from current versions only (historical chunk rows persist for dedup, §5.3, but aren't searched). This is consistent with `as_of` being deferred — historical search belongs to the time-machine feature (§11).
+
+**Result ordering:** rank score when `rank` is present, else FTS score when `text` is present, else `$created_at` descending. `[OPEN]` Cursor pagination (follow `docs.history`'s `before` pattern); v1 is `limit`-only.
 
 **Default exclusion of hidden and system paths.** By default (both flags `false`), the compiled query drops any document whose current `path` contains any segment starting with a hidden or system sigil (§3.5). This applies uniformly to `filter`, `text`, and `rank`. Set `include_hidden: true` to surface `.<seg>/…` paths; set `include_system: true` to surface `:<seg>/…` paths — this is how a client browses `:deleted/` to find something to restore.
 
@@ -440,7 +449,7 @@ All three implement the same contract; the kernel doesn't know which is in play.
 - **Current-only embedding.** The worker embeds a version only if it is still current at dequeue time; a version superseded while queued is skipped (the superseding write enqueued its own entry), and in-flight hook calls for superseded versions are aborted where the transport allows. A burst of saves collapses to one embedding pass over the final state.
 - **Rate limiting** is split per the contract: the worker paces dispatch; provider-specific limits, batching, and retries live inside the hook.
 
-**Model changes.** If the hook starts returning a different `model` or `dim`, the server writes a warning and stores the new-model vectors alongside the old ones (`chunks.model` column, `[OPEN]` — needs to be added to §3.2 if we go this route). Vector search filters by current model. Backfill re-embeds under the new model on demand.
+**Model changes.** If the hook starts returning a different `model` or `dim`, the server writes a warning and stores the new-model vectors alongside the old ones (the `chunks.model` column, §3.2 — the same column that keys dedup above). Vector search filters by current model. Backfill re-embeds under the new model on demand.
 
 `[OPEN]` Whether to ship a default "no-op" hook (returns zero vectors, `dim = 1`) so the server starts cleanly without any embedding configuration, at the cost of hiding misconfiguration. Leaning yes for dev, warn loudly.
 
@@ -657,7 +666,9 @@ A deployment shape is an answer to three questions: **where the database lives**
 
 The binary takes `--database sqlite:./mrplex.db` or `--database postgres://…` (also via `MRPLEX_DATABASE` env). No other config surgery to switch shapes.
 
-**Implementation language: TypeScript (Node).** mrplex is a thin wrapper around a storage engine plus a CEL-to-SQL compiler and a couple of HTTP surfaces — none of it CPU-bound. TypeScript is chosen for portability (Node runs everywhere the SQLite/PG drivers do), ergonomic distribution (single `npm` install for the CLI, containerized for the server), and a mature ecosystem for the pieces we need (`better-sqlite3` / `pg`, `cel-js` or a hand-rolled parser, and JSON-RPC / HTTP libs).
+**Implementation language: TypeScript (Node).** mrplex is a thin wrapper around a storage engine plus a CEL-to-SQL compiler and a couple of HTTP surfaces — none of it CPU-bound. TypeScript is chosen for portability (Node runs everywhere the SQLite/PG drivers do), ergonomic distribution (single `npm` install for the CLI, containerized for the server), and a mature ecosystem for the pieces we need (`better-sqlite3` / `pg`, JSON-RPC / HTTP libs).
+
+**CEL engine: `cel-go` compiled to WASM.** The reference CEL implementation is `cel-go`; its parser and typechecker compile to a WebAssembly module loaded by the TS kernel. This buys spec-exact CEL semantics — including the corner cases (null vs missing, type-mismatch behavior, macro expansion) that the §7.2 parity guarantees lean on — instead of reimplementing them in a TS parser and chasing divergence forever. The division of labor respects WASM's constraint (no I/O in the sandbox): the WASM module is pure compute — parse, typecheck, return the AST; the TS side owns AST→SQL translation per dialect and everything that touches the database. The `$` intrinsic marker (§5.1) is admitted by a minimal patch to the vendored `cel-go` lexer (we build the WASM artifact ourselves, so the patch is contained and versioned with the repo); everything downstream of the lexer is stock. This also runs unchanged on the Supabase edge runtime (§7.1), which executes WASM natively.
 
 ### 7.2 Storage adapters
 
@@ -723,13 +734,13 @@ StorageAdapter = {
   // filter_ast is CEL, compiled by the kernel; the adapter translates to its dialect.
   // path_globs come from the caller's read scope (§8.2) — enforced here, not above.
 
-  // Full-text
+  // Full-text (current versions only — indexing a version evicts the document's previous entry)
   fts_index(version_id, body)                               → void
   fts_search(repo_ids, query)                               → { version_id, score }[]
 
   // Vector
-  chunks_upsert(version_id, chunks: { ix, text, text_hash, embedding }[]) → void
-  vector_search(repo_ids, embedding, k)                     → { version_id, chunk_ix, score }[]
+  chunks_upsert(version_id, chunks: { ix, text, text_hash, model, embedding }[]) → void
+  vector_search(repo_ids, embedding, k)                     → { version_id, chunk_ix, score }[]   // hits from current versions only
 
   // Tokens
   tokens_list(user_id) / tokens_by_hash(hash) /
@@ -792,7 +803,11 @@ mrplex docs put <repo> <path> --prev <version-id> [--from-file FILE | -]
 mrplex docs delete <repo> <path> --prev <version-id>
 mrplex docs mv <repo> <from-path> <to-path> --prev <version-id>   # sugar: put to <to-path> with unchanged content
 
-mrplex query --repo <slug> [--filter EXPR] [--text Q] [--rank Q] [--limit N]
+mrplex query [--repo <slug-or-glob>] [--filter EXPR] [--text Q] [--rank Q] [--limit N]
+                                                                  # --repo omitted = every repo in the token's scope (§5.1)
+
+mrplex embed backfill --repo <slug>                               # re-chunk + re-embed current versions missing chunks (§5.3)
+mrplex embed status                                               # inspect the embedding backlog
 
 mrplex tokens list
 mrplex tokens create --label LABEL --scope <slug>:read=<glob>,write=<glob> [--admin] [--expires TS]
@@ -901,7 +916,7 @@ The `repo` values above are creation-time inputs (`ScopeInput`); each resolves t
 
 Multiple scope entries stack — union semantics. A token can be broadly `read` on one repo family and narrowly `write` on a single repo by listing two entries.
 
-**Self-token management** is a property of the token model, not a scope grant: any authenticated user can `list` and `revoke` their own tokens and `create` new ones whose `admin` bit and `scopes` are a subset of the parent token's. Managing *other* users' tokens requires `admin: true`.
+**Self-token management** is a property of the token model, not a scope grant: any authenticated user can `list` and `revoke` their own tokens and `create` new ones whose `admin` bit and `scopes` are a subset of the parent token's. "Subset" is deliberately conservative and **decidable**: the child's bound repo ids must be a subset of the parent's, and every child path glob must appear **verbatim** in the parent's corresponding list. Semantic glob subsumption (is `drafts/a*` ⊆ `drafts/**`? — undecidable in general once negation enters) is not attempted; `[OPEN]` relax to structural subsumption later if verbatim proves too strict. Managing *other* users' tokens requires `admin: true`.
 
 Bootstrap root token: `{ admin: true, scopes: [{ repo: "*", read: "**", write: "**" }] }`.
 
@@ -970,14 +985,17 @@ Log of shape-defining decisions and their rationale. Newer decisions supersede o
 - **Paths and slugs are case-sensitive, byte-compared, unnormalized (§3.5.1).** Case-folding / Unicode-normalization policy deferred (§11).
 - **`stale_prev` redacts `current_path` when it's outside the caller's read scope (§4.3).**
 - **Path config is setup-time configuration (§3.5.2).** Advisory warnings on `set_path_config` are the only guard rail; sigil changes over a live corpus are deliberately not further protected.
+- **Search indexes cover current versions only (§5.1).** FTS eviction on write; `rank` over current chunks. Historical search rides with the deferred time machine (§11).
+- **Graph features deferred, designed as a derived index (§11.2).** Links extract into a rebuildable table binding to `document_id`, so backlinks and traversal survive renames; nothing in the v1 schema blocks retrofitting via backfill.
+- **CEL engine is `cel-go` compiled to WASM (§7.1).** Spec-exact semantics underwrite the adapter parity guarantees; the WASM module is pure parse/typecheck compute, TS owns AST→SQL and all I/O. The `$` intrinsic marker is a minimal, versioned patch to the vendored lexer. Supersedes "`cel-js` or a hand-rolled parser."
 
-Remaining `[OPEN]` markers throughout the doc are narrower questions (query cacheability, expression-index tuning, model-versioned chunks, etc.) that don't gate the v1 shape.
+Remaining `[OPEN]` markers throughout the doc are narrower questions (query cacheability, expression-index tuning, pagination cursors, resource caps, etc.) that don't gate the v1 shape.
 
 ## 10. Milestones
 
 - **M0 — Kernel + skeleton.** Schema, SQLite storage, kernel reads (`repos.list`, `users.list`, `docs.get`, `docs.history`), `mrplex` CLI reading directly from the kernel (§7.3). Slug/id split enforced.
 - **M1 — Writes + auth.** Full kernel write surface (`docs.create` / `docs.put` / `docs.delete`, plus `repos.create` / `users.create` and the `.rename` / `.delete` methods) with `prev_version_id` enforcement. `docs.put` handles both in-place update and move. Bearer-token auth (§8): `api_tokens` table, capability scopes, `authorize()` on every kernel op, `tokens.*` RPCs, bootstrap root token. CLI gains write commands and `tokens.*`.
-- **M2 — Query.** CEL filter + FTS; `kernel.query` end-to-end; CLI `query` command.
+- **M2 — Query.** CEL filter (`cel-go` via WASM, §7.1) + FTS; `kernel.query` end-to-end; CLI `query` command.
 - **M3 — HTTP surfaces.** MCP server at `/mcp` (Streamable HTTP; optional STDIO transport, startup-gated); REST surface (`GET` / `PUT` / `DELETE` / `MOVE`, `If-Match` / `If-None-Match`, content negotiation, `/versions` / `/history` / `/diff` routes). CLI gains `--server` flag to target a remote instance over MCP.
 - **M4 — Semantic.** Chunking + embeddings + vector search.
 - **M5 — Postgres backend.**
@@ -990,6 +1008,9 @@ Remaining `[OPEN]` markers throughout the doc are narrower questions (query cach
 - **Case and Unicode path policy.** v1 is byte-exact (§3.5.1). A per-repo option for case-insensitive path uniqueness and Unicode normalization (NFC) would serve case-insensitive filesystems and clients that emit NFD (macOS); it needs a normalized shadow column with its own unique partial index, so it's a deliberate schema decision, not a toggle.
 - **WebDAV / filesystem mounting.** Deferred from v1, but fully specified — see §11.1. Kept spec-complete so the gateway module can be built without revisiting the architecture.
 - **Point-in-time reads (`as_of`) / time machine.** Answering "what was live at path P at time T" requires per-document latest-version-≤-T resolution over full history (a path may have hosted different documents over time), plus a defined story for historical FTS and vector search — too expensive and too subtle to hang off a casual query parameter. Better shaped as an explicit rewind/export feature (materialize a repo's state at T into a new repo, or stream it out) with its own index support, e.g. `versions(repo_id, path, created_at)`.
+- **Frontmatter & body update queries.** Bulk transformations driven by a query: "set `status: archived` on everything matching F," or structural body edits ("replace the section under the `## Status` heading"). The write model already accommodates this as N independent optimistic writes — each application is an ordinary versioned `docs.put` with a `prev` check, so a concurrent edit fails that one document instead of corrupting anything, and every change is attributed and reversible. The open questions are surface (does the server run the loop as a batch op with per-doc results, or does the CLI?) and atomicity (all-or-nothing needs the `changesets` entity above). Frontmatter-side updates need only a patch language over the parsed JSON (and a defined merge into `frontmatter_raw` that preserves untouched lines); body-side updates additionally need the block tree below to address targets structurally rather than by byte offset.
+- **Structured body queries (block tree).** A cached parse of each version's body into a block tree — headings, sections, paragraphs, list/task items, code fences — stored as a derived artifact like chunks. Already motivated twice elsewhere: merge helpers (above) want it for three-way block merge, and link anchors (§11.2) want heading identity. With it, filters can address structure: "docs with an unchecked task item," "docs with an `## Decisions` section," via `$`-namespace intrinsics (e.g. `$headings`, `$tasks` — same collision-free convention as §5.1). One cached artifact feeds three features (merge, structure queries, body patches); build it when the first of the three lands.
+- **Links, backlinks, and graph queries.** Fully sketched in §11.2 — a derived link index that binds to document *identity*, glob-argument CEL intrinsics for single-hop queries, recursive-CTE traversal for multi-hop.
 
 ### 11.1 WebDAV gateway — implementation spec
 
@@ -1040,3 +1061,67 @@ The client half ships with every OS — that is the point of choosing WebDAV ove
 #### Reference save flow
 
 ⌘S on the mounted volume → `LOCK` (gateway records current `version_id`, issues token) → `PUT` with token + raw file bytes (Basic → actor; pre-parse the `---` block; `kernel.docs.put(repo, path, prev_version_id, frontmatter_raw, body, actor)`) → gateway advances the lock record, answers 204 with the new ETag → `UNLOCK`. The kernel saw a completely ordinary optimistic write.
+
+### 11.2 Links, backlinks, and graph queries — design sketch
+
+A markdown corpus is a graph, and mrplex should know it. The architecture follows chunks and FTS exactly: **links are a derived index over versions** — extracted by the same post-write worker, rebuildable from scratch, never source of truth. That is also why deferring is safe: nothing in the v1 schema blocks this; a backfill pass builds the index for an existing corpus the same way `embed backfill` does.
+
+#### Extraction
+
+On write, the worker parses the new version for two kinds of edge. Extraction is deterministic and server-side, like chunking (§5.3) — no hook; the syntaxes below are the contract:
+
+- **Body links** — CommonMark links/images and wiki-style `[[page]]` links. Relative targets normalize against the doc's own path; anchors (`#heading`) are preserved on the raw target.
+- **Frontmatter references** — values of per-repo declared fields (`link_config: { fields: ["parent", "related"] }`), each a document path, scalar-or-list per the §5.2 convention.
+
+```sql
+links (
+  src_version_id     integer not null references versions(id),
+  ord                integer not null,                 -- position within the doc
+  kind               text not null,                    -- 'body' | 'frontmatter'
+  field              text,                             -- frontmatter field name when kind = 'frontmatter'
+  target_raw         text not null,                    -- exactly what was written, normalized to repo-absolute; anchor preserved
+  target_document_id integer references documents(id), -- resolved at extraction; null = dangling
+  primary key (src_version_id, ord)
+)
+```
+
+Links are repo-local in this sketch; cross-repo references are `[OPEN]`.
+
+#### Identity resolution is the load-bearing decision
+
+At extraction, the normalized target path is resolved against the live path set; on success the link binds to the target's **`document_id`** — the identity, not the path. Consequences:
+
+- **Backlinks and traversal survive renames with zero rewriting.** A move doesn't change `document_id`, so every inbound edge stays resolved. Only the link *text* goes stale.
+- **Dangling links are first-class rows** — `target_document_id` null, `target_raw` kept. When a document later appears at the named path (create, move, or restore), a re-resolution pass binds them — matching what a reader clicking the link would experience.
+
+#### Link rewriting is cosmetic, not structural — and opt-in
+
+Because the graph is identity-bound, moving a page breaks nothing structurally; rewriting repairs stale *text*. The kernel never rewrites other documents implicitly — one move producing N surprise writes to other docs would violate both least-surprise and the single-write model. Instead:
+
+- A staleness query (`links.stale`) lists live docs whose written link text no longer matches the resolved target's current path.
+- `mrplex links repair` walks that list and rewrites each doc as an ordinary optimistic `docs.put` under the caller's token — `prev` checks apply, conflicts are reported and skipped, and every repair is a normal authored version in the chain.
+- `[OPEN]` an opt-in per-repo `auto_repair` policy driving the same loop from the server-side worker after each move. Either way the mechanism is identical; the question is only who pulls the trigger.
+
+#### Backlinks and associative queries in CEL
+
+Graph predicates join the intrinsic `$` namespace (§5.1) as functions, compiled to SQL joins against the link index. Two tiers:
+
+**Tier 1 — single-hop, glob arguments.** Each compiles to one `EXISTS` join against `links`; ships first:
+
+```cel
+$links_to("projects/**")              -- outbound link to a doc currently under projects/
+$linked_from("moc/**")                -- backlinks: some doc under moc/ links here
+!$linked_from("**")                   -- orphan pages
+$ref("parent", "projects/**")         -- frontmatter-field-specific edge
+```
+
+**Tier 2 — bounded traversal and sub-predicates** (`[OPEN]` syntax; feasibility is settled):
+
+```cel
+$reachable_from("moc/index.md", 3)               -- within 3 hops of the index
+$backlinks().exists(d, d.status == "draft")      -- predicate over the linking docs
+```
+
+Multi-hop compiles to a recursive CTE — supported by both Postgres and SQLite, so the §7.2 parity guarantees hold; depth is capped and cycles terminate via the CTE's visited set. Sub-predicates compile to nested `EXISTS`. The committed part is the schema shape, not the syntax: identity-resolved links make every one of these a join, not a parse.
+
+**Scope interaction:** traversal respects the caller's read scope the same way `query` does (§8.2) — a hop whose target falls outside the read globs is silently dropped, so the visible graph is exactly the readable graph.
