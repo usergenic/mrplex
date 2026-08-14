@@ -117,6 +117,18 @@ export type KernelConfig = {
    * Caller is responsible for validating via validateConfig() before passing.
    */
   serverPathConfig?: PathConfig;
+  /**
+   * M4 write-time hook: called with the new version's storage id after
+   * every committed create / put / delete. Used by the embedding worker
+   * to enqueue for chunking (§5.3, m4-plan §5 decision 5 — enqueue is
+   * unconditional whether or not a hook is configured).
+   *
+   * The kernel invokes this in the same synchronous scope after
+   * version_insert commits; a throw here bubbles to the caller and the
+   * whole write is treated as failed. In practice the worker's
+   * backlog_enqueue is one cheap UPSERT and doesn't throw.
+   */
+  onVersionCommitted?: (version_id: number) => void;
 };
 
 export function createKernel(config: KernelConfig | Storage): Kernel {
@@ -127,6 +139,7 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
       : { storage: config as Storage };
   const storage = cfg.storage;
   const serverPathConfig = cfg.serverPathConfig ?? HARDCODED_DEFAULTS;
+  const onVersionCommitted = cfg.onVersionCommitted;
 
   // Author lookup — cheap and hot, so cache within a kernel instance.
   const userCache = new Map<number, User>();
@@ -419,7 +432,7 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
         validatePath(path, repoEffectiveConfig(repo));
         const canon = canonicalizeFrontmatter(input);
 
-        return storage.tx(() => {
+        const { version, insertedId } = storage.tx(() => {
           const existing = storage.version_current(repo.id, path);
           if (existing) {
             throw new KernelError("create_conflict", {
@@ -440,8 +453,10 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
             author_id: actor.user_id,
             created_at: new Date().toISOString(),
           });
-          return toVersionWire(inserted, repoSlug);
+          return { version: toVersionWire(inserted, repoSlug), insertedId: inserted.id };
         });
+        onVersionCommitted?.(insertedId);
+        return version;
       },
 
       put(actor, repoSlug, prevVersionId, destPath, input) {
@@ -468,7 +483,7 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
         const canon = canonicalizeOrCarry(input, prev);
         const body = input.body ?? prev.body;
 
-        return storage.tx(() => {
+        const { version, insertedId } = storage.tx(() => {
           // Verify prev is STILL current (design §4.1 rule 1). Doing it inside
           // the tx before insert closes the race window.
           const current = storage.version_current(repo.id, prev.path);
@@ -511,8 +526,10 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
             author_id: actor.user_id,
             created_at: new Date().toISOString(),
           });
-          return toVersionWire(inserted, repoSlug);
+          return { version: toVersionWire(inserted, repoSlug), insertedId: inserted.id };
         });
+        onVersionCommitted?.(insertedId);
+        return version;
       },
 
       delete(actor, repoSlug, prevVersionId) {
@@ -568,7 +585,7 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
         // validatePath would reject. We SKIP validatePath here — this is the
         // kernel emitting on its own behalf (design §4.1 rule 4).
 
-        return storage.tx(() => {
+        const { version, insertedId } = storage.tx(() => {
           // Re-check prev is still current inside the tx to close the race
           // window between the pre-check above and the insert.
           const current = storage.version_current(repo.id, prev.path);
@@ -595,8 +612,10 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
             author_id: actor.user_id,
             created_at: new Date().toISOString(),
           });
-          return toVersionWire(inserted, repoSlug);
+          return { version: toVersionWire(inserted, repoSlug), insertedId: inserted.id };
         });
+        onVersionCommitted?.(insertedId);
+        return version;
       },
     },
 

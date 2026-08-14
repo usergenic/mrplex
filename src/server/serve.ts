@@ -13,6 +13,13 @@
 
 import { type IncomingMessage, type Server, type ServerResponse, createServer } from "node:http";
 import type { AddressInfo } from "node:net";
+import {
+  type EmbedConfig,
+  createHookFromConfig,
+  describeEmbedConfig,
+} from "../embed/config.js";
+import type { EmbedHook } from "../embed/hook.js";
+import { type Worker, createWorker } from "../embed/worker.js";
 import { type Kernel, createKernel } from "../kernel/kernel.js";
 import { HARDCODED_DEFAULTS, type PathConfig } from "../kernel/path-config.js";
 import { mountMcpStreamableHttp } from "../mcp/server.js";
@@ -27,6 +34,11 @@ export type ServeConfig = {
   /** 0 → bind an OS-chosen port (used by tests). */
   port?: number;
   serverPathConfig?: PathConfig;
+  /**
+   * Embedding hook config (m4-plan §5.3). Absent = worker idles, rank
+   * queries return `rank_unavailable`. See design §5.3 resolved [OPEN].
+   */
+  embed?: EmbedConfig;
   /** Log function for the "serving on http://…" banner. Defaults to console.error. */
   log?: (msg: string) => void;
 };
@@ -40,7 +52,9 @@ export type ServeHandle = {
   host: string;
   /** Base URL callers can hit — e.g. `http://127.0.0.1:8321`. */
   baseUrl: string;
-  /** Close listening socket + storage. Idempotent. */
+  /** The running embed hook + worker, if `embed` was configured. */
+  embed: { hook: EmbedHook; worker: Worker } | null;
+  /** Close listening socket + worker + storage. Idempotent. */
   close: () => Promise<void>;
 };
 
@@ -56,6 +70,7 @@ function normalizeDatabase(url: string): string {
 export function openAndMigrate(
   database: string,
   serverPathConfig?: PathConfig,
+  onVersionCommitted?: (version_id: number) => void,
 ): {
   storage: Storage;
   kernel: Kernel;
@@ -65,6 +80,7 @@ export function openAndMigrate(
   const kernel = createKernel({
     storage,
     serverPathConfig: serverPathConfig ?? HARDCODED_DEFAULTS,
+    onVersionCommitted,
   });
   return { storage, kernel };
 }
@@ -74,7 +90,23 @@ export function openAndMigrate(
  * Never throws for a merely-empty database — bootstrap is a separate step.
  */
 export async function startServer(config: ServeConfig): Promise<ServeHandle> {
-  const { storage, kernel } = openAndMigrate(config.database, config.serverPathConfig);
+  const embedCfg: EmbedConfig = config.embed ?? { kind: "none" };
+  const hook = createHookFromConfig(embedCfg);
+  // Open storage first so the enqueue callback can capture its handle.
+  // Enqueue is unconditional whether or not a hook is configured
+  // (m4-plan §5 decision 5) — a hookless deployment still records the
+  // backlog so a later `embed backfill` doesn't have to walk history.
+  const storage: Storage = sqliteAdapter.open({
+    database: normalizeDatabase(config.database),
+  });
+  storage.migrate();
+  const kernel = createKernel({
+    storage,
+    serverPathConfig: config.serverPathConfig ?? HARDCODED_DEFAULTS,
+    onVersionCommitted: (versionId) => storage.backlog_enqueue(versionId),
+  });
+  const worker = hook ? createWorker({ storage, hook }) : null;
+
   const host = config.host ?? "127.0.0.1";
   const port = config.port ?? 8321;
 
@@ -117,17 +149,37 @@ export async function startServer(config: ServeConfig): Promise<ServeHandle> {
   log(`mrplex: serving on ${baseUrl}`);
   log(`mrplex:   REST   ${baseUrl}/repos, /users, /query, /me/tokens, ...`);
   log(`mrplex:   MCP    ${baseUrl}/mcp  (Streamable HTTP)`);
+  log(`mrplex:   embed  ${describeEmbedConfig(embedCfg)}`);
+
+  // Start the worker AFTER the "listening" log line — a fast-arriving
+  // request that predates the worker still gets served; the write's
+  // backlog row waits until the next drain iteration.
+  worker?.start();
 
   let closed = false;
   const close = async () => {
     if (closed) return;
     closed = true;
+    // Stop accepting new requests first, then drain the worker's
+    // in-flight batch, then close storage.
     await mcp.close().catch(() => {});
     await new Promise<void>((resolve) => server.close(() => resolve()));
+    if (worker) {
+      await worker.stop();
+    }
     storage.close();
   };
 
-  return { server, storage, kernel, port: boundPort, host, baseUrl, close };
+  return {
+    server,
+    storage,
+    kernel,
+    port: boundPort,
+    host,
+    baseUrl,
+    embed: hook && worker ? { hook, worker } : null,
+    close,
+  };
 }
 
 function formatHost(host: string): string {

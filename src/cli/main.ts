@@ -17,11 +17,19 @@ import { Command, InvalidArgumentError, Option } from "commander";
 import type { KernelClient } from "../client/kernel-client.js";
 import { openLocalClient } from "../client/local.js";
 import { openRemoteClient } from "../client/remote-mcp.js";
+import { backfillRepo } from "../embed/backfill.js";
+import {
+  createHookFromConfig,
+  describeEmbedConfig,
+  resolveEmbedConfig,
+} from "../embed/config.js";
+import { createWorker } from "../embed/worker.js";
 import type { ScopeInput } from "../kernel/auth/scope.js";
 import { KernelError } from "../kernel/errors.js";
 import { split as splitFrontmatter } from "../markdown/frontmatter.js";
 import { startMcpStdio } from "../mcp/server.js";
 import { startServer } from "../server/serve.js";
+import { sqliteAdapter } from "../storage-sqlite/adapter.js";
 import { resolveTokenString } from "./auth.js";
 import { type BootstrapError, bootstrap } from "./bootstrap.js";
 import { type CliConfig, loadConfig, saveConfig } from "./config.js";
@@ -264,16 +272,29 @@ function buildProgram(): Command {
     .option("--port <n>", "TCP port (default 8321)", parsePositiveInt)
     .option("--host <h>", "bind host (default 127.0.0.1)")
     .option("--mcp-stdio", "also expose MCP over STDIO for the launch token", false)
+    .option("--embed-url <url>", "HTTP embedding endpoint (§5.3)")
+    .option("--embed-cmd <cmd>", "subprocess embedding command (JSON-lines over stdio)")
     .action(function (this: Command) {
       const gopts = this.optsWithGlobals<GlobalOpts>();
-      const localOpts = this.opts<{ port?: number; host?: string; mcpStdio: boolean }>();
+      const localOpts = this.opts<{
+        port?: number;
+        host?: string;
+        mcpStdio: boolean;
+        embedUrl?: string;
+        embedCmd?: string;
+      }>();
       (async () => {
         try {
           const database = resolveDatabase(gopts);
+          const embedCfg = resolveEmbedConfig({
+            embed_url: localOpts.embedUrl,
+            embed_cmd: localOpts.embedCmd,
+          });
           const handle = await startServer({
             database,
             host: localOpts.host,
             port: localOpts.port,
+            embed: embedCfg,
           });
 
           // Optional STDIO — bound to the launch-time token per §6.2.
@@ -596,6 +617,105 @@ function buildProgram(): Command {
         });
         emit(result, opts, renderQueryTable(result));
       }).catch(reportError);
+    });
+
+  // -------- embed --------
+  // Embed commands are LOCAL-mode only (bypass the client seam like
+  // `bootstrap` and `serve`): backfill drives the worker directly
+  // against storage, and status reads backlog+chunks tables. Running
+  // against a remote server means running these commands on that host
+  // — same as bootstrap.
+  const embed = program.command("embed").description("embedding worker + backlog");
+
+  embed
+    .command("backfill")
+    .description("re-chunk + re-embed current versions missing chunks (§5.3)")
+    .requiredOption("--repo <slug>", "repo to backfill")
+    .option("--embed-url <url>", "HTTP embedding endpoint")
+    .option("--embed-cmd <cmd>", "subprocess embedding command (JSON-lines over stdio)")
+    .action(function (this: Command) {
+      const localOpts = this.opts<{ repo: string; embedUrl?: string; embedCmd?: string }>();
+      const gopts = this.optsWithGlobals<GlobalOpts>();
+      (async () => {
+        try {
+          const embedCfg = resolveEmbedConfig({
+            embed_url: localOpts.embedUrl,
+            embed_cmd: localOpts.embedCmd,
+          });
+          if (embedCfg.kind === "none") {
+            process.stderr.write(
+              "embed backfill: no hook configured — set --embed-url or --embed-cmd\n",
+            );
+            process.exit(1);
+          }
+          const hook = createHookFromConfig(embedCfg);
+          if (!hook) {
+            process.stderr.write("embed backfill: unreachable — missing hook\n");
+            process.exit(1);
+            return;
+          }
+          const storage = sqliteAdapter.open({ database: resolveDatabase(gopts) });
+          const worker = createWorker({ storage, hook });
+          try {
+            const report = await backfillRepo(storage, localOpts.repo, worker, (m) =>
+              process.stderr.write(`${m}\n`),
+            );
+            if (gopts.json) {
+              process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+            } else {
+              process.stdout.write(
+                `backfill ${localOpts.repo}: enqueued=${report.enqueued} processed=${report.processed} failed=${report.failed} skipped=${report.skipped}\n`,
+              );
+            }
+            if (report.failed > 0) process.exit(1);
+          } finally {
+            await worker.stop();
+            storage.close();
+          }
+        } catch (err) {
+          reportError(err);
+        }
+      })();
+    });
+
+  embed
+    .command("status")
+    .description("inspect the embedding backlog (m4-plan §5 decision 6)")
+    .action(function (this: Command) {
+      const gopts = this.optsWithGlobals<GlobalOpts>();
+      try {
+        const storage = sqliteAdapter.open({ database: resolveDatabase(gopts) });
+        try {
+          const now = new Date().toISOString();
+          const status = storage.backlog_status(now);
+          if (gopts.json) {
+            process.stdout.write(`${JSON.stringify(status, null, 2)}\n`);
+          } else {
+            process.stdout.write(
+              `pending: ${status.pending}\ndue:     ${status.due}\nfailing: ${status.failing}\n`,
+            );
+            if (status.oldest_next_retry_at) {
+              process.stdout.write(`oldest retry: ${status.oldest_next_retry_at}\n`);
+            }
+            if (status.models.length > 0) {
+              process.stdout.write("models:\n");
+              for (const m of status.models) {
+                process.stdout.write(`  ${m.model}  chunks=${m.chunk_count}\n`);
+              }
+            }
+            if (status.recent_errors.length > 0) {
+              process.stdout.write("recent errors:\n");
+              for (const e of status.recent_errors) {
+                process.stdout.write(`  v${e.version_id}: ${e.last_error}\n`);
+              }
+            }
+          }
+        } finally {
+          storage.close();
+        }
+      } catch (err) {
+        reportError(err);
+      }
     });
 
   // -------- tokens --------

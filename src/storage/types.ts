@@ -68,6 +68,58 @@ export type VersionsSearchInput = {
 };
 
 /**
+ * Chunks (design §3.2, §5.3). One row per chunk of a version's body.
+ * `embedding` is null while the row is pending embedding (rare in
+ * practice — chunk rows are only inserted alongside their vectors).
+ * Content-hash dedup key is (model, text_hash).
+ */
+export type ChunkRow = {
+  version_id: number;
+  ix: number;
+  text: string;
+  text_hash: string;
+  model: string;
+  embedding: Buffer | null;
+};
+
+export type ChunkUpsertInput = {
+  ix: number;
+  text: string;
+  text_hash: string;
+  model: string;
+  /** Little-endian float32 BLOB. See storage-sqlite/vec.ts. */
+  embedding: Buffer;
+};
+
+export type VectorSearchHit = {
+  version_id: number;
+  chunk_ix: number;
+  score: number; // cosine distance (0 = identical, 2 = opposite)
+};
+
+/**
+ * Embedding backlog (design §3.2, §5.3). One row per version awaiting
+ * (or having failed) embedding. `attempts` counts failed tries; a fresh
+ * enqueue resets `attempts` and `next_retry_at` so a superseding write
+ * doesn't inherit an old backoff.
+ */
+export type BacklogRow = {
+  version_id: number;
+  attempts: number;
+  last_error: string | null;
+  next_retry_at: string | null; // ISO 8601 UTC
+};
+
+export type BacklogStatus = {
+  pending: number; // rows total in the backlog
+  due: number; // rows whose next_retry_at is null or <= now
+  failing: number; // rows with attempts > 0
+  oldest_next_retry_at: string | null;
+  recent_errors: readonly { version_id: number; last_error: string }[];
+  models: readonly { model: string; chunk_count: number }[];
+};
+
+/**
  * Row shape for api_tokens (see design §3.2 and §8). `scopes` is the JSON
  * text as stored; parsing to StoredScope[] happens at the kernel layer.
  */
@@ -163,6 +215,64 @@ export type Storage = {
    * `versions.next_id IS NULL AND versions.repo_id IN (…)` prefix.
    */
   versions_search(input: VersionsSearchInput): VersionRow[];
+
+  /**
+   * Chunks + vectors (design §3.2, §5.3, §7.2.2). Written by the
+   * backlog worker; read by kernel.query's `rank` branch.
+   *
+   * `chunks_upsert` replaces all chunks for `version_id` in one tx.
+   * All vectors in the input must share `model` and the same
+   * dimensionality; the adapter refuses mixed-dim writes (m4-plan §1,
+   * §5.3 "refuse mixed-dim writes to the chunks table").
+   */
+  chunks_upsert(version_id: number, model: string, chunks: readonly ChunkUpsertInput[]): void;
+
+  /**
+   * Content-hash dedup lookup (§5.3). Returns one row per hash present
+   * in the input list for the given model, with its stored vector so
+   * the worker can reuse it without calling the hook.
+   */
+  chunks_by_hash(
+    model: string,
+    text_hashes: readonly string[],
+  ): { text_hash: string; embedding: Buffer }[];
+
+  chunks_by_version(version_id: number): ChunkRow[];
+
+  /**
+   * Distinct (model, chunk_count) pairs across the chunks table — for
+   * `embed status`. `chunk_count` counts rows, not distinct hashes.
+   */
+  chunks_model_summary(): { model: string; chunk_count: number }[];
+
+  /**
+   * Brute-force k-NN over current-version chunks with vectors matching
+   * `model`. §7.2.1 pins SQLite at brute-force in v1 — indexed ANN
+   * arrives with M5's pgvector adapter.
+   *
+   * `k` limits distinct-version results, not chunk hits. The adapter is
+   * responsible for the version-collapse (best chunk per version).
+   */
+  vector_search(
+    repo_ids: readonly number[],
+    model: string,
+    embedding: Buffer,
+    k: number,
+  ): VectorSearchHit[];
+
+  // Embedding backlog (design §5.3). One row per version awaiting or
+  // retrying embedding. Enqueue is idempotent-per-version (upsert).
+  backlog_enqueue(version_id: number): void;
+  /** Rows due now (next_retry_at IS NULL or <= now), oldest first. */
+  backlog_dequeue(now: string, limit: number): BacklogRow[];
+  backlog_retain(input: {
+    version_id: number;
+    attempts: number;
+    last_error: string;
+    next_retry_at: string;
+  }): void;
+  backlog_delete(version_id: number): void;
+  backlog_status(now: string): BacklogStatus;
 
   // Tokens (design §3.2, §8). All queries return null / empty for
   // revoked or expired rows — the adapter does the filter so the kernel
