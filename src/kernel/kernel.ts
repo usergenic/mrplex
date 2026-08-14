@@ -3,14 +3,29 @@
  * translation live. Surfaces (CLI in M0; MCP/REST in M3) call these methods
  * and never touch the storage layer directly.
  *
- * M0 subset: repos.list/get, users.list, docs.get, docs.get_version,
- * docs.history. Writes and auth land in M1.
+ * M0 shipped reads. M1 adds writes with `prev_version_id` enforcement,
+ * frontmatter canonicalization, and real `authorize()` on every op.
  */
 
-import type { Storage, VersionRow } from "../storage/types.js";
+import type { RepoRow, Storage, VersionRow } from "../storage/types.js";
 import type { Action, Actor, Target } from "./auth/actor.js";
 import { authorize } from "./auth/authorize.js";
+import { scopesGrant } from "./auth/scope.js";
+import { pathIsInSystemNamespace } from "./deletion.js";
+import { deletionPath } from "./deletion.js";
 import { KernelError, docNotFound, repoNotFound, versionNotFound } from "./errors.js";
+import {
+  type CanonicalFrontmatter,
+  type FrontmatterInput,
+  canonicalizeFrontmatter,
+} from "./frontmatter-input.js";
+import {
+  HARDCODED_DEFAULTS,
+  type PathConfig,
+  effectivePathConfig,
+  parseRepoOverride,
+} from "./path-config.js";
+import { validatePath } from "./validation.js";
 import { decodeVersionId, encodeVersionId } from "./version-id.js";
 import type { Repo, User, Version } from "./wire.js";
 
@@ -28,13 +43,44 @@ export type Kernel = {
     get(actor: Actor, repo: string, path: string): Version;
     get_version(actor: Actor, repo: string, version_id: string): Version;
     history(actor: Actor, repo: string, path: string, opts?: HistoryOptions): Version[];
+    create(
+      actor: Actor,
+      repo: string,
+      path: string,
+      input: FrontmatterInput & { body: string },
+    ): Version;
+    put(
+      actor: Actor,
+      repo: string,
+      prev_version_id: string,
+      path: string,
+      input: Partial<FrontmatterInput> & { body?: string },
+    ): Version;
+    delete(actor: Actor, repo: string, prev_version_id: string): Version;
   };
+};
+
+export type KernelConfig = {
+  storage: Storage;
+  /**
+   * Server-level path config (§3.5.2 tier 2). Defaults to HARDCODED_DEFAULTS.
+   * Caller is responsible for validating via validateConfig() before passing.
+   */
+  serverPathConfig?: PathConfig;
 };
 
 /** M0-visible system sigils for filtering system-namespaced repo slugs. */
 const SYSTEM_SIGIL_PREFIX = ":";
 
-export function createKernel(storage: Storage): Kernel {
+export function createKernel(config: KernelConfig | Storage): Kernel {
+  // Accept a bare Storage for M0 backwards-compat.
+  const cfg: KernelConfig =
+    "storage" in (config as KernelConfig)
+      ? (config as KernelConfig)
+      : { storage: config as Storage };
+  const storage = cfg.storage;
+  const serverPathConfig = cfg.serverPathConfig ?? HARDCODED_DEFAULTS;
+
   // Author lookup — cheap and hot, so cache within a kernel instance.
   const userCache = new Map<number, User>();
   function userById(id: number): User {
@@ -69,16 +115,11 @@ export function createKernel(storage: Storage): Kernel {
     };
   }
 
-  function resolveRepo(
-    actor: Actor,
-    slug: string,
-    action: Action,
-  ): {
-    id: number;
-    slug: string;
-    path_config: string | null;
-    created_at: string;
-  } {
+  function repoEffectiveConfig(repo: RepoRow): PathConfig {
+    return effectivePathConfig(serverPathConfig, parseRepoOverride(repo.path_config));
+  }
+
+  function resolveRepo(actor: Actor, slug: string, action: Action): RepoRow {
     // Look the repo up FIRST, then authorize on the resolved id — scopes bind
     // ids (§8.2), so we need it to check.
     const row = storage.repos_by_slug(slug);
@@ -86,6 +127,30 @@ export function createKernel(storage: Storage): Kernel {
     const target: Target = { kind: "repo", repo_id: row.id };
     authorize(actor, action, target);
     return row;
+  }
+
+  /**
+   * Redact `current_path` in stale_prev when the caller's read scope doesn't
+   * cover it — design §4.3. Admin sees everything; anyone else sees null.
+   */
+  function currentPathForStaleError(actor: Actor, repo_id: number, path: string): string | null {
+    if (actor.admin) return path;
+    return scopesGrant(actor.scopes, "read", repo_id, path) ? path : null;
+  }
+
+  /**
+   * Canonicalize a write's frontmatter input. Same-path put with no
+   * frontmatter fields set carries over from prev (design implicit — a
+   * body-only edit shouldn't force the caller to re-send the frontmatter).
+   */
+  function canonicalizeOrCarry(
+    input: Partial<FrontmatterInput>,
+    prev: VersionRow | null,
+  ): CanonicalFrontmatter {
+    if (input.frontmatter === undefined && input.frontmatter_raw === undefined && prev) {
+      return { frontmatter: prev.frontmatter, frontmatter_raw: prev.frontmatter_raw };
+    }
+    return canonicalizeFrontmatter(input as FrontmatterInput);
   }
 
   return {
@@ -136,6 +201,168 @@ export function createKernel(storage: Storage): Kernel {
         if (!current) throw docNotFound(repoSlug, path);
         const rows = storage.version_history(current.document_id, opts);
         return rows.map((r) => toVersionWire(r, repoSlug));
+      },
+
+      create(actor, repoSlug, path, input) {
+        const repo = resolveRepo(actor, repoSlug, "write");
+        authorize(actor, "write", { kind: "path", repo_id: repo.id, path });
+        validatePath(path, repoEffectiveConfig(repo));
+        const canon = canonicalizeFrontmatter(input);
+
+        return storage.tx(() => {
+          const existing = storage.version_current(repo.id, path);
+          if (existing) {
+            throw new KernelError("create_conflict", {
+              repo: repoSlug,
+              path,
+              current_version_id: encodeVersionId(existing.id),
+            });
+          }
+          const doc = storage.documents_create(repo.id);
+          const inserted = storage.version_insert({
+            document_id: doc.id,
+            repo_id: repo.id,
+            prev_id: null,
+            path,
+            frontmatter_raw: canon.frontmatter_raw,
+            frontmatter: canon.frontmatter,
+            body: input.body,
+            author_id: actor.user_id,
+            created_at: new Date().toISOString(),
+          });
+          return toVersionWire(inserted, repoSlug);
+        });
+      },
+
+      put(actor, repoSlug, prevVersionId, destPath, input) {
+        const repo = resolveRepo(actor, repoSlug, "write");
+        const prevId = decodeVersionId(prevVersionId);
+        if (prevId === null) throw versionNotFound(prevVersionId);
+        const prev = storage.version_by_id(prevId);
+        if (!prev || prev.repo_id !== repo.id) throw versionNotFound(prevVersionId);
+
+        // Authorize the move (or in-place update, which is a "move" with
+        // source === destination — that still fires scopesGrant on the same
+        // path twice, harmless). The move target lets the system-namespace
+        // carve-out apply for restore (source is system, dest is user).
+        authorize(actor, "write", {
+          kind: "move",
+          repo_id: repo.id,
+          source: prev.path,
+          destination: destPath,
+        });
+
+        validatePath(destPath, repoEffectiveConfig(repo));
+        const canon = canonicalizeOrCarry(input, prev);
+        const body = input.body ?? prev.body;
+
+        return storage.tx(() => {
+          // Verify prev is STILL current (design §4.1 rule 1). Doing it inside
+          // the tx before insert closes the race window.
+          const current = storage.version_current(repo.id, prev.path);
+          if (!current || current.id !== prev.id) {
+            // Document may have moved elsewhere (or been deleted into
+            // :deleted/…) since prev was observed; look up its current
+            // by document_id to give the client an accurate pointer.
+            const docCurrent =
+              current ?? storage.version_history(prev.document_id, { limit: 1 })[0] ?? null;
+            throw new KernelError("stale_prev", {
+              current_version_id: docCurrent ? encodeVersionId(docCurrent.id) : null,
+              current_path: docCurrent
+                ? currentPathForStaleError(actor, repo.id, docCurrent.path)
+                : null,
+              submitted_prev_version_id: prevVersionId,
+            });
+          }
+
+          // If destination differs from source, check for path collision with
+          // a DIFFERENT document.
+          if (destPath !== prev.path) {
+            const occupant = storage.version_current(repo.id, destPath);
+            if (occupant && occupant.document_id !== prev.document_id) {
+              throw new KernelError("path_taken", {
+                repo: repoSlug,
+                path: destPath,
+                current_version_id: encodeVersionId(occupant.id),
+              });
+            }
+          }
+
+          const inserted = storage.version_insert({
+            document_id: prev.document_id,
+            repo_id: repo.id,
+            prev_id: prev.id,
+            path: destPath,
+            frontmatter_raw: canon.frontmatter_raw,
+            frontmatter: canon.frontmatter,
+            body,
+            author_id: actor.user_id,
+            created_at: new Date().toISOString(),
+          });
+          return toVersionWire(inserted, repoSlug);
+        });
+      },
+
+      delete(actor, repoSlug, prevVersionId) {
+        const repo = resolveRepo(actor, repoSlug, "write");
+        const prevId = decodeVersionId(prevVersionId);
+        if (prevId === null) throw versionNotFound(prevVersionId);
+        const prev = storage.version_by_id(prevId);
+        if (!prev || prev.repo_id !== repo.id) throw versionNotFound(prevVersionId);
+
+        // Idempotency (design §4.1 rule 4): if prev is already in the system
+        // namespace, this is a no-op — return the current version unchanged.
+        const cfg = repoEffectiveConfig(repo);
+        if (pathIsInSystemNamespace(prev.path, cfg.system_sigils)) {
+          return toVersionWire(prev, repoSlug);
+        }
+
+        // Compute the deletion path FIRST so we can authorize the move.
+        // Uses the canonical sigil (§3.5.4 — set for input, first for output).
+        const destPath = deletionPath(
+          cfg.system_sigils[0] as string,
+          prev.path,
+          encodeVersionId(prev.id),
+        );
+
+        authorize(actor, "write", {
+          kind: "move",
+          repo_id: repo.id,
+          source: prev.path,
+          destination: destPath,
+        });
+
+        // NOTE the destPath's segment starts with a system sigil, which
+        // validatePath would reject. We SKIP validatePath here — this is the
+        // kernel emitting on its own behalf (design §4.1 rule 4).
+
+        return storage.tx(() => {
+          const current = storage.version_current(repo.id, prev.path);
+          if (!current || current.id !== prev.id) {
+            const docCurrent =
+              current ?? storage.version_history(prev.document_id, { limit: 1 })[0] ?? null;
+            throw new KernelError("stale_prev", {
+              current_version_id: docCurrent ? encodeVersionId(docCurrent.id) : null,
+              current_path: docCurrent
+                ? currentPathForStaleError(actor, repo.id, docCurrent.path)
+                : null,
+              submitted_prev_version_id: prevVersionId,
+            });
+          }
+
+          const inserted = storage.version_insert({
+            document_id: prev.document_id,
+            repo_id: repo.id,
+            prev_id: prev.id,
+            path: destPath,
+            frontmatter_raw: prev.frontmatter_raw,
+            frontmatter: prev.frontmatter,
+            body: prev.body,
+            author_id: actor.user_id,
+            created_at: new Date().toISOString(),
+          });
+          return toVersionWire(inserted, repoSlug);
+        });
       },
     },
   };

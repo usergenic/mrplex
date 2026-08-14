@@ -40,12 +40,12 @@ export function authorize(actor: Actor, action: Action, target: Target): void {
   if (target.kind === "server") return;
 
   if (target.kind === "repo") {
-    if (action === "read") {
-      if (scopesGrantRepo(actor.scopes, target.repo_id)) return;
-      throw forbidden();
-    }
-    // write on the whole repo is not a shape we use — path/move cover the
-    // real cases. Refuse conservatively.
+    // `{kind:"repo"}` is a COARSE addressability check — "can this actor
+    // reach this repo at all?" — regardless of read/write. It's the
+    // pre-check we run before finer-grained {kind:"path"} or
+    // {kind:"move"} authorization for the specific op. If no scope binds
+    // the repo id, forbidden either way.
+    if (scopesGrantRepo(actor.scopes, target.repo_id)) return;
     throw forbidden();
   }
 
