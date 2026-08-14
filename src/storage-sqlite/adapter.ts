@@ -288,6 +288,37 @@ class SqliteStorage implements Storage {
     return rows.map(hydrateVersion);
   }
 
+  fts_index(_version_id: number, _body: string): void {
+    // SQLite FTS5 external-content mode with AFTER INSERT triggers on
+    // `versions` keeps the index in sync automatically (see migration
+    // 0003_fts_docs.sql). The interface method exists so engines that
+    // require explicit calls (or that back FTS with an auxiliary process)
+    // have a place to hook in — see design §7.2.2 "What an adapter is NOT
+    // required to provide."
+  }
+
+  fts_search(repo_ids: readonly number[], query: string): { version_id: number; score: number }[] {
+    if (repo_ids.length === 0) return [];
+    // bm25(fts_docs) returns a score where LOWER is better (BM25 is a
+    // relevance score; SQLite negates the raw score internally to match
+    // most search-engine conventions, but the FTS5 docs say lower =
+    // better). We normalize to "higher = better" so the ordering semantic
+    // stays consistent with what M2's kernel.query expects.
+    const placeholders = repo_ids.map(() => "?").join(",");
+    const rows = this.db
+      .prepare(
+        `select fts_docs.rowid as version_id, -bm25(fts_docs) as score
+           from fts_docs
+           join versions on versions.id = fts_docs.rowid
+          where fts_docs match ?
+            and versions.next_id is null
+            and versions.repo_id in (${placeholders})
+          order by bm25(fts_docs)`,
+      )
+      .all(query, ...repo_ids) as { version_id: number; score: number }[];
+    return rows;
+  }
+
   version_history(document_id: number, opts?: HistoryOptions): VersionRow[] {
     // History walks the version chain (design §3.4), not created_at, so
     // backdated edits and clock skew can't reorder the result. A recursive
