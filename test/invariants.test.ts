@@ -127,6 +127,43 @@ describe("versions partial index: one current per document", () => {
   });
 });
 
+describe("versions cross-document prev rejection", () => {
+  it("refuses prev_id from a DIFFERENT document, even if it is current", () => {
+    const docA = storage.documents_create(repo.id);
+    const docB = storage.documents_create(repo.id);
+    const a1 = storage.version_insert({
+      document_id: docA.id,
+      repo_id: repo.id,
+      prev_id: null,
+      path: "a.md",
+      frontmatter_raw: "",
+      frontmatter: {},
+      body: "a\n",
+      author_id: user.id,
+      created_at: NOW,
+    });
+    // Passing docA's current version as prev while advancing docB must fail:
+    // otherwise the update would advance docA's chain and mis-assign the new
+    // version to docB.
+    expect(() =>
+      storage.version_insert({
+        document_id: docB.id,
+        repo_id: repo.id,
+        prev_id: a1.id,
+        path: "b.md",
+        frontmatter_raw: "",
+        frontmatter: {},
+        body: "b\n",
+        author_id: user.id,
+        created_at: LATER,
+      }),
+    ).toThrow();
+    // docA must still be intact: a1 is still current.
+    expect(storage.version_by_id(a1.id)?.next_id).toBeNull();
+    expect(storage.version_current(repo.id, "a.md")?.id).toBe(a1.id);
+  });
+});
+
 describe("versions partial index: one live doc per (repo, path)", () => {
   it("rejects a second live document at the same path in the same repo", () => {
     const docA = storage.documents_create(repo.id);
@@ -234,6 +271,49 @@ describe("history walks the chain in order", () => {
       created_at: "2026-08-13T00:00:02Z",
     });
     const history = storage.version_history(doc.id);
+    expect(history.map((v: VersionRow) => v.id)).toEqual([v3.id, v2.id, v1.id]);
+  });
+
+  it("orders by chain, not created_at (backdated edits stay chain-ordered)", () => {
+    // If two versions land with created_at going BACKWARDS in wall-clock,
+    // history should still respect chain order (v3 → v2 → v1), not sort
+    // by the timestamps.
+    const doc = storage.documents_create(repo.id);
+    const v1 = storage.version_insert({
+      document_id: doc.id,
+      repo_id: repo.id,
+      prev_id: null,
+      path: "hello.md",
+      frontmatter_raw: "",
+      frontmatter: {},
+      body: "one\n",
+      author_id: user.id,
+      created_at: "2026-08-13T00:00:10Z",
+    });
+    const v2 = storage.version_insert({
+      document_id: doc.id,
+      repo_id: repo.id,
+      prev_id: v1.id,
+      path: "hello.md",
+      frontmatter_raw: "",
+      frontmatter: {},
+      body: "two\n",
+      author_id: user.id,
+      created_at: "2026-08-13T00:00:05Z", // BEFORE v1
+    });
+    const v3 = storage.version_insert({
+      document_id: doc.id,
+      repo_id: repo.id,
+      prev_id: v2.id,
+      path: "hello.md",
+      frontmatter_raw: "",
+      frontmatter: {},
+      body: "three\n",
+      author_id: user.id,
+      created_at: "2026-08-13T00:00:07Z", // between them
+    });
+    const history = storage.version_history(doc.id);
+    // Chain order: current (v3) → v2 → v1, regardless of timestamps.
     expect(history.map((v: VersionRow) => v.id)).toEqual([v3.id, v2.id, v1.id]);
   });
 

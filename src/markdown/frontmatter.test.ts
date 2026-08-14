@@ -30,6 +30,16 @@ describe("split", () => {
     });
   });
 
+  it("recognizes immediately-adjacent delimiters (empty frontmatter, no blank line)", () => {
+    // Closing --- appears right after the opening ---; the parser must not
+    // skip over the shared newline. Round-trip is semantic, not byte-exact
+    // (empty frontmatter collapses to no-frontmatter on rejoin).
+    expect(split("---\n---\nbody\n")).toEqual({
+      frontmatter_raw: "",
+      body: "body\n",
+    });
+  });
+
   it("handles a document with only frontmatter and no body", () => {
     expect(split("---\ntitle: hi\n---\n")).toEqual({
       frontmatter_raw: "title: hi\n",

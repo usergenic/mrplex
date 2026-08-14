@@ -7,7 +7,7 @@
  * M3 with the MCP surface.
  */
 
-import { Command, Option } from "commander";
+import { Command, InvalidArgumentError, Option } from "commander";
 import { SYSTEM_ACTOR } from "../kernel/actor.js";
 import { KernelError } from "../kernel/errors.js";
 import { createKernel } from "../kernel/kernel.js";
@@ -21,6 +21,18 @@ import {
   renderUsersTable,
   renderVersionAsMarkdown,
 } from "./format.js";
+
+/** Strict positive-integer parser for numeric CLI options. */
+function parsePositiveInt(value: string, _prev: unknown): number {
+  if (!/^\d+$/.test(value)) {
+    throw new InvalidArgumentError(`expected a positive integer, got "${value}"`);
+  }
+  const n = Number.parseInt(value, 10);
+  if (!Number.isSafeInteger(n) || n <= 0) {
+    throw new InvalidArgumentError(`expected a positive integer, got "${value}"`);
+  }
+  return n;
+}
 
 type GlobalOpts = { database?: string; json?: boolean };
 
@@ -47,9 +59,14 @@ function withKernel<T>(cmd: Command, fn: (kernel: Kernel, opts: GlobalOpts) => T
 function emit(result: unknown, opts: GlobalOpts, prettyText: string): void {
   if (opts.json) {
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
-  } else {
-    process.stdout.write(`${prettyText}\n`);
+    return;
   }
+  // Table output ends without a newline; markdown output usually ends WITH
+  // one (bodies typically terminate in \n). Ensure exactly one trailing
+  // newline either way — otherwise `docs get` on a newline-terminated doc
+  // paints an extra blank line.
+  const text = prettyText.endsWith("\n") ? prettyText : `${prettyText}\n`;
+  process.stdout.write(text);
 }
 
 function reportError(err: unknown): never {
@@ -155,7 +172,7 @@ function buildProgram(): Command {
   docs
     .command("history <repo> <path>")
     .description("list versions of a document newest-first")
-    .option("--limit <n>", "limit to N most-recent", (v) => Number.parseInt(v, 10))
+    .option("--limit <n>", "limit to N most-recent (positive integer)", parsePositiveInt)
     .option("--before <ts>", "only versions with created_at < <ts>")
     .action(function (this: Command, repo: string, path: string) {
       const localOpts = this.opts<{ limit?: number; before?: string }>();

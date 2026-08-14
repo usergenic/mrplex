@@ -6,9 +6,9 @@
   "bin": {
     "mrplex": "./dist/cli/main.js"
   },
-  "files": ["dist/", "src/storage-sqlite/migrations/"],
+  "files": ["dist/"],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && node scripts/copy-assets.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",

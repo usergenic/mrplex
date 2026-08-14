@@ -36,7 +36,11 @@ export function split(text: string): Split {
     return { frontmatter_raw: "", body: text };
   }
   const bodyStartMarker = `\n${DELIM_LINE}`;
-  const idx = text.indexOf(bodyStartMarker, DELIM_LINE.length);
+  // Search from position (DELIM_LINE.length - 1) — the \n of the opening
+  // delimiter's terminator — so the immediately-adjacent form `---\n---\n<body>`
+  // (empty frontmatter, closing delim right after opening) is recognized.
+  // Starting one character later would skip the `\n---\n` sequence.
+  const idx = text.indexOf(bodyStartMarker, DELIM_LINE.length - 1);
   if (idx === -1) {
     // The trailing `---` at EOF (no final newline) also closes the block.
     if (text.endsWith(`\n${DELIM}`)) {

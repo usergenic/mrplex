@@ -97,4 +97,20 @@ describe("cli", () => {
     expect(out.status).toBe(4);
     expect(out.stderr).toContain("version_not_found");
   });
+
+  it("--limit rejects non-integer / partial-parse / non-positive values", () => {
+    for (const bad of ["2x", "abc", "0", "-1", "1.5", ""]) {
+      const out = run("docs", "history", "notes", "welcome.md", "--limit", bad);
+      expect(out.status).not.toBe(0);
+      expect(out.stderr).toMatch(/positive integer/);
+    }
+  });
+
+  it("docs get emits exactly one trailing newline (no blank line at end)", () => {
+    const out = run("docs", "get", "notes", "welcome.md");
+    expect(out.status).toBe(0);
+    // Body already ends in \n; the CLI must add zero extras.
+    expect(out.stdout.endsWith("\n")).toBe(true);
+    expect(out.stdout.endsWith("\n\n")).toBe(false);
+  });
 });

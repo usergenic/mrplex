@@ -176,12 +176,20 @@ class SqliteStorage implements Storage {
       // (document_id, next_id=NULL). Same discipline is what the design's
       // §7.2.2 obligation #1 asks for.
       if (input.prev_id !== null) {
+        // The placeholder update is also the guard that binds prev to THIS
+        // document: it only matches when the referenced row belongs to the
+        // input document_id AND is still current. A caller passing another
+        // document's current version_id as prev fails here (0 rows changed),
+        // so we can't cross-link chains or orphan a foreign document's
+        // "current" pointer.
         const updated = this.db
-          .prepare("update versions set next_id = id where id = ? and next_id is null")
-          .run(input.prev_id);
+          .prepare(
+            "update versions set next_id = id where id = ? and document_id = ? and next_id is null",
+          )
+          .run(input.prev_id, input.document_id);
         if (updated.changes !== 1) {
           throw new Error(
-            `version_insert: prev_id ${input.prev_id} is not the current version of its document (or does not exist)`,
+            `version_insert: prev_id ${input.prev_id} is not the current version of document ${input.document_id} (or does not exist)`,
           );
         }
       }
@@ -240,20 +248,41 @@ class SqliteStorage implements Storage {
   }
 
   version_history(document_id: number, opts?: HistoryOptions): VersionRow[] {
-    const clauses: string[] = ["document_id = ?"];
+    // History walks the version chain (design §3.4), not created_at, so
+    // backdated edits and clock skew can't reorder the result. A recursive
+    // CTE anchored at the current version follows prev_id back to the root;
+    // rows come out newest-first by construction.
+    const clauses: string[] = [];
     const params: (string | number)[] = [document_id];
     if (opts?.before) {
-      clauses.push("created_at < ?");
+      clauses.push("chain.created_at < ?");
       params.push(opts.before);
     }
+    const where = clauses.length > 0 ? ` where ${clauses.join(" and ")}` : "";
     const limitClause = opts?.limit ? " limit ?" : "";
     if (opts?.limit) params.push(opts.limit);
+
     const rows = this.db
       .prepare(
-        `select id, document_id, repo_id, prev_id, next_id, path,
+        `with recursive chain(
+           id, document_id, repo_id, prev_id, next_id, path,
+           frontmatter_raw, frontmatter, body, author_id, created_at, depth
+         ) as (
+           select id, document_id, repo_id, prev_id, next_id, path,
+                  frontmatter_raw, frontmatter, body, author_id, created_at, 0
+             from versions
+             where document_id = ? and next_id is null
+           union all
+           select v.id, v.document_id, v.repo_id, v.prev_id, v.next_id, v.path,
+                  v.frontmatter_raw, v.frontmatter, v.body, v.author_id, v.created_at,
+                  c.depth + 1
+             from versions v
+             join chain c on v.id = c.prev_id
+         )
+         select id, document_id, repo_id, prev_id, next_id, path,
                 frontmatter_raw, frontmatter, body, author_id, created_at
-         from versions where ${clauses.join(" and ")}
-         order by created_at desc, id desc${limitClause}`,
+         from chain${where}
+         order by depth asc${limitClause}`,
       )
       .all(...params) as VersionRawRow[];
     return rows.map(hydrateVersion);
