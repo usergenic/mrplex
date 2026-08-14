@@ -8,7 +8,7 @@ M2 makes the versioned store **queryable**. M0 shipped point reads and history; 
 
 **In:**
 
-- CEL parser via **`cel-go` compiled to WASM** (design §7.1 decision). Pure parse/typecheck lives in the WASM module; TS owns the AST→SQL translation and everything that touches the database. The `$`-prefixed intrinsics (`$path`, `$created_at`) land via a minimal, vendored patch to the `cel-go` lexer (§5.1).
+- **CEL parser via `@bufbuild/cel` (TypeScript-native)** — supersedes the design's `cel-go`-via-WASM choice for M2. Rationale: `@bufbuild/cel` (from Buf, the protobuf-ES authors) emits the canonical CEL protobuf `ParsedExpr` AST — literally the same shape `cel-go` produces — so the AST→SQL compiler is portable across parsers. That's the M5 parity seam either way. Using `@bufbuild/cel` saves the Go toolchain in CI, the vendored `cel-go` fork, and the WASM build pipeline — for a milestone whose main value is the SQL compiler, not the parser. If M5 later surfaces semantic differences, swap the parser without touching the compiler. `$`-prefixed intrinsics (`$path`, `$created_at`) land via a small, string-aware preprocessor that mangles `$foo` → `__mrplex_i_foo` before `parse()` and unmangles in the AST walker — no fork, no grammar work.
 - CEL→SQL compiler for the **SQLite dialect** — the Postgres branch (§5.2 / §7.2 parity table) waits for M5's Postgres adapter.
 - **FTS via SQLite FTS5**: an `fts_docs` external-content virtual table backed by `versions.body`, populated on every `version_insert` via the adapter's `fts_index` hook, queried by the adapter's `fts_search`.
 - **`kernel.query(spec, actor)`**: composes `filter` (CEL), `text` (FTS), scope-filter (§8.2's implicit `read`-glob AND), and default sigil exclusion (§5.1 hidden/system) into one query. Ordering per §5.1 (FTS score when text present, else `$created_at desc`). `limit` from the spec.
@@ -67,28 +67,28 @@ scripts/
 
 **Tooling additions:**
 
-- **Go toolchain in CI** — `actions/setup-go@v5` in the CI matrix, but only in a `build-artifacts` job that runs once and uploads `dist/cel.wasm`; test jobs consume the artifact so they don't need Go. Local dev either checks in `dist/cel.wasm` OR runs `scripts/build-cel-wasm.sh` on first `npm install` (`postinstall` script).
-- **No new npm deps** at runtime — `WebAssembly` is a Node built-in. Dev-time only: nothing new; tests use vitest and better-sqlite3 exactly as they already do.
+- **`@bufbuild/cel`** as a runtime dependency (TS-native CEL parser + AST; Apache-licensed; from the Buf.build team who wrote protobuf-ES). Small (~1 MB), two transitive deps (`@bufbuild/re2`, `@bufbuild/cel-spec`). No Go toolchain, no WASM build. This is the M2 supersession of the design's `cel-go`/WASM decision — see WS1 rationale.
+- **No new dev tooling** — vitest and better-sqlite3 stay as they are.
 
 ## 3. Workstreams
 
-### WS1 — cel-go WASM artifact
+### WS1 — CEL parser wrapper (@bufbuild/cel + $-preprocessor)
 
-Vendor `cel-go` into `tools/cel-wasm/`. Write the minimal lexer patch (`patches/0001-lex-dollar-identifiers.patch`) that admits `$` as an identifier head character (design §5.1 — grammar-not-policy). Ship `main.go` exposing a single `parse(source: string) → ast_json` function through WASM exports.
+Add `@bufbuild/cel` as a runtime dep. Write `src/kernel/query/cel-parse.ts`:
 
-Concretely: `main.go` takes a UTF-8 string via WASM memory, runs cel-go's parser + type-checker, serializes the resulting AST (or the cel-go-generated protobuf) to JSON, writes it back to WASM memory, and returns the offset+length. TS reads that back into a JS object shaped like the CEL AST spec.
+- `parseCel(source: string): ParsedExpr` — string-aware preprocessor that mangles `$foo` → `INTRINSIC_PREFIX + foo` (skipping over CEL string literals so `"a$b"` is left alone), calls `@bufbuild/cel`'s `parse()`, returns the standard CEL protobuf `ParsedExpr` AST.
+- Errors surface as `KernelError("filter_invalid", { source, error })`.
+- Exports `INTRINSIC_PREFIX` so the AST walker (WS3) can recognize mangled idents and route them to the intrinsic symbol table.
 
-`Makefile`: `GOOS=wasip1 GOARCH=wasm go build -o ../../dist/cel.wasm ./main.go` (or `js/wasm` if Node's WASI support is inadequate — pick at implementation time).
+Design supersession recorded in the m2-plan §5 decisions block. The M5 parity seam is unchanged: `ParsedExpr` is the CEL spec's canonical protobuf AST — the same shape `cel-go` emits — so if we ever swap to `cel-go`/WASM the AST→SQL compiler is unchanged.
 
-Acceptance: `dist/cel.wasm` builds; loading it in a Node test shows a single `parse` export.
+Acceptance: `parseCel('$path.startsWith("drafts/")')` returns an AST with an Ident node named `__mrplex_i_path`; `parseCel('bad syntax [')` throws `filter_invalid` with the parser's message; string content containing `$` (e.g. `contains(body, "$foo")`) is NOT preprocessed.
 
-### WS2 — TS-side WASM loader + AST types
+### WS2 — AST walker types
 
-`src/kernel/query/cel-wasm.ts` — a one-shot module-level loader that reads `dist/cel.wasm` (via `readFile`), instantiates it once, and exports `parseCel(source: string): CelAst`. Errors from the parser (syntax or type-check) surface as `KernelError("filter_invalid", { source, error })`.
+`src/kernel/query/ast.ts` — thin TS re-exports of the ParsedExpr subset our compiler walks: `Expr`, `Call`, `Ident`, `Const`, `Select`, `Comprehension`. `@bufbuild/cel` ships with `ParsedExpr` typed from `@bufbuild/cel-spec`; we alias the subset we care about to keep the compiler prose readable.
 
-`src/kernel/query/ast.ts` — TS types for the CEL AST subset we handle: `Expr`, `Call`, `Ident`, `Const`, `Select`, `Comprehension`. Small; only what the SQL compiler traverses.
-
-Acceptance: `parseCel('status == "draft"')` returns a shaped AST; malformed input returns `filter_invalid` with the parser's error message.
+Acceptance: types compile against `@bufbuild/cel-spec`'s generated `syntax_pb.js`; the compiler in WS3 imports only from `./ast.js`.
 
 ### WS3 — CEL AST → SQL compiler (SQLite dialect)
 

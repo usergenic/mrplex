@@ -48,6 +48,7 @@ import {
   pathWarning,
   validateRepoOverride,
 } from "./path-config.js";
+import { type QuerySpec, runQuery } from "./query/query.js";
 import { validatePath, validateSlug } from "./validation.js";
 import { decodeVersionId, encodeVersionId } from "./version-id.js";
 import type { PathWarning, Repo, Scope, Token, User, Version } from "./wire.js";
@@ -106,6 +107,7 @@ export type Kernel = {
     ): TokenCreateResult;
     revoke(actor: Actor, token_id: string): Token;
   };
+  query(actor: Actor, spec: QuerySpec): Version[];
 };
 
 export type KernelConfig = {
@@ -638,6 +640,17 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
         const revoked = storage.tokens_revoke(id, new Date().toISOString());
         return tokenRowToWire(revoked ?? row);
       },
+    },
+
+    query(actor: Actor, spec: QuerySpec): Version[] {
+      // Server-level read authorization — the QuerySpec.repo field + scope
+      // enforcement inside runQuery() do the fine-grained filtering.
+      authorize(actor, "read", { kind: "server" });
+      return runQuery(actor, spec, {
+        storage,
+        serverPathConfig,
+        toVersionWire,
+      });
     },
   };
 }

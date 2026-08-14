@@ -1,3 +1,4 @@
+import { RE2JS } from "@bufbuild/re2";
 import Database from "better-sqlite3";
 import type {
   DocumentRow,
@@ -12,6 +13,7 @@ import type {
   UserRow,
   VersionInsertInput,
   VersionRow,
+  VersionsSearchInput,
 } from "../storage/types.js";
 import { migrate } from "./migrations/index.js";
 
@@ -34,6 +36,30 @@ const hydrateVersion = (row: VersionRawRow): VersionRow => ({
   frontmatter: JSON.parse(row.frontmatter) as FrontmatterJson,
 });
 
+/**
+ * Compile + cache RE2JS patterns per SqliteStorage instance. Returns null
+ * for patterns that fail to compile — matches SQLite's regexp() convention
+ * of "no match" rather than raising, so a bad pattern doesn't kill the
+ * whole query.
+ */
+const re2Cache = new WeakMap<Database.Database, Map<string, RE2JS | null>>();
+function compileRegexpCachedFor(db: Database.Database, pattern: string): RE2JS | null {
+  let cache = re2Cache.get(db);
+  if (!cache) {
+    cache = new Map();
+    re2Cache.set(db, cache);
+  }
+  if (cache.has(pattern)) return cache.get(pattern) ?? null;
+  let compiled: RE2JS | null;
+  try {
+    compiled = RE2JS.compile(pattern);
+  } catch {
+    compiled = null;
+  }
+  cache.set(pattern, compiled);
+  return compiled;
+}
+
 function parseSqliteUrl(url: string): string {
   const m = url.match(/^sqlite:(.+)$/);
   if (!m || !m[1]) {
@@ -53,6 +79,33 @@ class SqliteStorage implements Storage {
     this.db.pragma("synchronous = NORMAL");
     this.db.pragma("foreign_keys = ON");
     this.db.pragma("busy_timeout = 5000");
+    // regexp() user function — the SQL side of CEL's matches() (m2-plan
+    // §5). Two reasons this uses RE2JS instead of the built-in RegExp:
+    //   1. CEL spec conformance: matches() is defined against Google's RE2
+    //      dialect (linear-time, no lookaround). JS's RegExp has different
+    //      features AND different worst-case behavior; using RE2JS keeps
+    //      the language contract stable when M5's Postgres adapter lands
+    //      (Postgres uses `~` with its own regex library — RE2JS's syntax
+    //      is a closer match than PCRE-style JS regex).
+    //   2. ReDoS: any read-scoped caller can otherwise craft `(a+)+b`-
+    //      shaped patterns that hang the event loop. RE2JS is a linear-
+    //      time engine by construction, so pathological input costs the
+    //      same as any other input.
+    //
+    // We cache compiled RE2JS instances per pattern via re2Cache — SQLite
+    // calls this UDF once per row scanned; recompiling for every call
+    // would multiply cost by the row count.
+    const dbHandle = this.db;
+    this.db.function(
+      "regexp",
+      { deterministic: true },
+      (pattern: unknown, input: unknown): number => {
+        if (typeof pattern !== "string" || typeof input !== "string") return 0;
+        const compiled = compileRegexpCachedFor(dbHandle, pattern);
+        if (!compiled) return 0;
+        return compiled.matches(input) ? 1 : 0;
+      },
+    );
   }
 
   close(): void {
@@ -285,6 +338,52 @@ class SqliteStorage implements Storage {
          order by path`,
       )
       .all(repo_id) as VersionRawRow[];
+    return rows.map(hydrateVersion);
+  }
+
+  fts_index(_version_id: number, _body: string): void {
+    // SQLite FTS5 external-content mode with AFTER INSERT triggers on
+    // `versions` keeps the index in sync automatically (see migration
+    // 0003_fts_docs.sql). The interface method exists so engines that
+    // require explicit calls (or that back FTS with an auxiliary process)
+    // have a place to hook in — see design §7.2.2 "What an adapter is NOT
+    // required to provide."
+  }
+
+  versions_search(input: VersionsSearchInput): VersionRow[] {
+    if (input.repo_ids.length === 0) return [];
+    const repoPh = input.repo_ids.map(() => "?").join(",");
+    const clauses: string[] = ["versions.next_id IS NULL", `versions.repo_id IN (${repoPh})`];
+    const params: unknown[] = [...input.repo_ids];
+    if (input.where_sql.trim().length > 0) {
+      clauses.push(`(${input.where_sql})`);
+      params.push(...input.where_params);
+    }
+    let sql: string;
+    if (input.text !== undefined) {
+      clauses.push("versions.id = fts_docs.rowid");
+      clauses.push("fts_docs MATCH ?");
+      params.push(input.text);
+      sql = `SELECT versions.id, versions.document_id, versions.repo_id,
+                    versions.prev_id, versions.next_id, versions.path,
+                    versions.frontmatter_raw, versions.frontmatter,
+                    versions.body, versions.author_id, versions.created_at
+             FROM versions, fts_docs
+             WHERE ${clauses.join(" AND ")}
+             ORDER BY bm25(fts_docs)
+             LIMIT ?`;
+    } else {
+      sql = `SELECT versions.id, versions.document_id, versions.repo_id,
+                    versions.prev_id, versions.next_id, versions.path,
+                    versions.frontmatter_raw, versions.frontmatter,
+                    versions.body, versions.author_id, versions.created_at
+             FROM versions
+             WHERE ${clauses.join(" AND ")}
+             ORDER BY versions.created_at DESC, versions.id DESC
+             LIMIT ?`;
+    }
+    params.push(input.limit);
+    const rows = this.db.prepare(sql).all(...params) as VersionRawRow[];
     return rows.map(hydrateVersion);
   }
 

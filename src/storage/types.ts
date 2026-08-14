@@ -57,6 +57,16 @@ export type HistoryOptions = {
   before?: string; // ISO 8601 UTC
 };
 
+export type VersionsSearchInput = {
+  repo_ids: readonly number[];
+  /** Additional WHERE clauses, already ANDed by the kernel. May be empty. */
+  where_sql: string;
+  where_params: readonly (string | number | bigint | null)[];
+  /** FTS5 MATCH string. If present, results order by BM25. */
+  text?: string;
+  limit: number;
+};
+
 /**
  * Row shape for api_tokens (see design §3.2 and §8). `scopes` is the JSON
  * text as stored; parsing to StoredScope[] happens at the kernel layer.
@@ -126,6 +136,33 @@ export type Storage = {
    * next_id is null, so O(live-set) per repo.
    */
   versions_live_by_repo(repo_id: number): VersionRow[];
+
+  // Full-text search (design §5.1, §7.2.2). Indexes CURRENT versions
+  // only — the versions_search method above filters live rows itself.
+  //
+  //   fts_index — hook the storage engine offers if it needs an explicit
+  //               indexing call. SQLite's FTS5 external-content mode uses
+  //               triggers, so this method is a no-op there; kept for
+  //               interface symmetry with engines that need it.
+  //
+  // FTS querying itself lives in versions_search (below) which JOINs
+  // fts_docs directly, so kernel.query has one path through the
+  // adapter, not two.
+  fts_index(version_id: number, body: string): void;
+
+  /**
+   * Composed query — the kernel orchestrator (§5) hands over a pre-built
+   * WHERE fragment (CEL compilation + scope filter + sigil exclusion, all
+   * ANDed and parameterized) plus optional FTS text and a limit; the
+   * adapter runs it and returns live versions. Ordering per §5.1:
+   * text-score if `text` is present, else `$created_at DESC`.
+   *
+   * The kernel is responsible for generating a fragment that ONLY uses
+   * `versions.*` (and, for polymorphic frontmatter, `json_each` subqueries
+   * over `versions.frontmatter`). The adapter appends the
+   * `versions.next_id IS NULL AND versions.repo_id IN (…)` prefix.
+   */
+  versions_search(input: VersionsSearchInput): VersionRow[];
 
   // Tokens (design §3.2, §8). All queries return null / empty for
   // revoked or expired rows — the adapter does the filter so the kernel
