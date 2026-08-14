@@ -13,10 +13,13 @@
  */
 
 /**
- * Compile a single glob (WITHOUT leading `!`) to an anchored RegExp.
- * Callers strip `!` before calling and track the negation flag themselves.
+ * Compile a single glob (WITHOUT leading `!`) to a regex source string.
+ * Returns the raw pattern (no leading/trailing anchor); wrap in `^...$`
+ * for full-string matching. Kept separate from compileGlob so callers
+ * that need the source (e.g. to hand to a SQL regexp() UDF) don't have
+ * to re-derive it from RegExp.source.
  */
-export function compileGlob(glob: string): RegExp {
+export function globToRegexSource(glob: string): string {
   let source = "";
   for (let i = 0; i < glob.length; i++) {
     const ch = glob[i] as string;
@@ -41,7 +44,15 @@ export function compileGlob(glob: string): RegExp {
     }
     source += ch;
   }
-  return new RegExp(`^${source}$`);
+  return source;
+}
+
+/**
+ * Compile a single glob (WITHOUT leading `!`) to an anchored RegExp.
+ * Callers strip `!` before calling and track the negation flag themselves.
+ */
+export function compileGlob(glob: string): RegExp {
+  return new RegExp(`^${globToRegexSource(glob)}$`);
 }
 
 /**

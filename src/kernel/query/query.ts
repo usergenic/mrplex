@@ -4,11 +4,11 @@
  * Composes:
  *   • CEL filter (§5.1) — compiled to SQL via compile-sqlite.ts
  *   • FTS text (§5.1) — the SQLite FTS5 branch is wired in the adapter
- *   • Scope filter (§8.2) — the caller's read globs, post-filtered in TS
- *     (M2 simplification — see comment in filterByScope). Silently drops
- *     rows outside scope, not 403.
- *   • Default sigil exclusion (§5.1) — hidden/system paths hidden unless
- *     opt-in flags are set.
+ *   • Scope filter (§8.2) — compiled to SQL via the RE2-backed regexp UDF.
+ *     Silently drops rows outside scope, not 403.
+ *   • Default sigil exclusion (§5.1, §3.5.5) — hidden/system paths hidden
+ *     unless opt-in flags are set. Per-repo: each repo group contributes
+ *     its own sigil clauses based on its effective config.
  *   • Result ordering (§5.1 pin) — text-score if `text` is present,
  *     else `$created_at DESC`.
  *   • Limit — required; kernel provides the default.
@@ -17,13 +17,11 @@
  */
 
 import type { RepoRow, Storage, VersionRow } from "../../storage/types.js";
-import type { Actor } from "../auth/actor.js";
-import { pathMatchesGlobs } from "../auth/glob.js";
-import { slugMatchesPattern } from "../auth/glob.js";
+import type { Actor, StoredScope } from "../auth/actor.js";
+import { globToRegexSource, slugMatchesPattern } from "../auth/glob.js";
 import { KernelError } from "../errors.js";
 import type { PathConfig } from "../path-config.js";
 import { effectivePathConfig, parseRepoOverride } from "../path-config.js";
-import { pathHasSigilSegment } from "../validation.js";
 import type { Version } from "../wire.js";
 import { parseCel } from "./cel-parse.js";
 import { compileFilter } from "./compile-sqlite.js";
@@ -39,6 +37,16 @@ export type QuerySpec = {
   include_system?: boolean;
 };
 
+const KNOWN_SPEC_FIELDS = new Set<keyof QuerySpec>([
+  "repo",
+  "filter",
+  "text",
+  "rank",
+  "limit",
+  "include_hidden",
+  "include_system",
+]);
+
 export type QueryDeps = {
   storage: Storage;
   serverPathConfig: PathConfig;
@@ -48,17 +56,13 @@ export type QueryDeps = {
 /** M2 default when the spec omits limit. */
 export const DEFAULT_QUERY_LIMIT = 50;
 
-/** Overfetch multiplier so post-filter scope drops don't shrink the result. */
-const OVERFETCH_MULTIPLIER = 4;
-const MAX_INTERNAL_LIMIT = 1_000;
-
 export function runQuery(actor: Actor, spec: QuerySpec, deps: QueryDeps): Version[] {
   validateSpec(spec);
 
   // 1. Resolve repos the caller can address.
   const reposById = new Map<number, RepoRow>();
   for (const row of deps.storage.repos_list()) reposById.set(row.id, row);
-  const targetRepos = filterReposByAccessAndSpec(actor, spec, reposById);
+  const targetRepos = filterReposByAccessAndSpec(actor, spec, reposById, deps.serverPathConfig);
   if (targetRepos.length === 0) return [];
 
   // 2. Compile the filter (if any) once.
@@ -74,44 +78,41 @@ export function runQuery(actor: Actor, spec: QuerySpec, deps: QueryDeps): Versio
     whereParams = compiled.params;
   }
 
-  // 3. Sigil exclusion — build a WHERE clause using the server-level config.
-  //    (Per-repo overrides are noted as an M2 limitation — see comment.)
-  const sigilExclusion = buildSigilExclusion(
+  // 3. Per-repo sigil exclusion (§3.5.5). Group repos by effective config
+  //    so multiple repos sharing the same config share one clause.
+  const sigilExclusion = buildPerRepoSigilExclusion(
+    targetRepos,
     deps.serverPathConfig,
     spec.include_hidden ?? false,
     spec.include_system ?? false,
   );
-  const combinedWhere = combineWhere(whereSql, sigilExclusion.sql);
+
+  // 4. Scope filter compiled to SQL (§8.2). Admins bypass; anyone else
+  //    gets a WHERE clause built from their read globs, evaluated by the
+  //    RE2-backed regexp UDF (see storage-sqlite/adapter.ts).
+  const scopeFilter = actor.admin ? { sql: "", params: [] } : buildScopeFilter(actor.scopes);
+
+  // 5. Combine everything the kernel supplies.
+  const combinedWhere = joinWhere([whereSql, sigilExclusion.sql, scopeFilter.sql]);
   const combinedParams: (string | number | bigint | null)[] = [
     ...whereParams,
     ...sigilExclusion.params,
+    ...scopeFilter.params,
   ];
 
-  // 4. Overfetch to keep the caller-facing `limit` honest under post-filter
-  //    scope drops.
+  // 6. Storage-level search.
   const userLimit = spec.limit ?? DEFAULT_QUERY_LIMIT;
   if (userLimit <= 0) return [];
-  const internalLimit = actor.admin
-    ? userLimit
-    : Math.min(userLimit * OVERFETCH_MULTIPLIER, MAX_INTERNAL_LIMIT);
-
-  // 5. Run the storage-level search.
   const rows = deps.storage.versions_search({
     repo_ids: targetRepos.map((r) => r.id),
     where_sql: combinedWhere,
     where_params: combinedParams,
     text: spec.text,
-    limit: internalLimit,
+    limit: userLimit,
   });
 
-  // 6. Post-filter for scope (§8.2). Admins skip.
-  const scoped = actor.admin ? rows : rows.filter((row) => scopeAllowsRow(actor, row));
-
-  // 7. Slice to the user-facing limit.
-  const bounded = scoped.slice(0, userLimit);
-
-  // 8. Hydrate into wire Version[].
-  return bounded.map((row) => {
+  // 7. Hydrate.
+  return rows.map((row) => {
     const repoSlug = (reposById.get(row.repo_id) as RepoRow).slug;
     return deps.toVersionWire(row, repoSlug);
   });
@@ -122,6 +123,14 @@ export function runQuery(actor: Actor, spec: QuerySpec, deps: QueryDeps): Versio
 // -----------------------------------------------------------------------------
 
 function validateSpec(spec: QuerySpec): void {
+  // m2-plan §3 WS7 step 1: filter_invalid on unknown fields.
+  for (const key of Object.keys(spec)) {
+    if (!KNOWN_SPEC_FIELDS.has(key as keyof QuerySpec)) {
+      throw new KernelError("filter_invalid", {
+        reason: `unknown QuerySpec field: ${JSON.stringify(key)}`,
+      });
+    }
+  }
   if (spec.rank !== undefined) {
     throw new KernelError("filter_invalid", {
       reason: "the `rank` mode is deferred to M4 (embeddings)",
@@ -144,17 +153,21 @@ function filterReposByAccessAndSpec(
   actor: Actor,
   spec: QuerySpec,
   reposById: Map<number, RepoRow>,
+  serverConfig: PathConfig,
 ): RepoRow[] {
   const patterns =
     spec.repo === undefined ? undefined : Array.isArray(spec.repo) ? spec.repo : [spec.repo];
+  const systemSigils = serverConfig.system_sigils;
   return [...reposById.values()]
     .filter((repo) => {
       // Actor must be able to address the repo at all.
       if (!actor.admin && !actorBindsRepo(actor, repo.id)) return false;
-      // Skip system-namespaced repo slugs unless include_system flag.
-      // (System repos are only surfaced by repos.list with include_system.)
-      // No wire flag for this in query; system repos are always excluded here.
-      if (repo.slug.startsWith(":")) return false;
+      // System-namespaced repo slugs are always excluded from query
+      // results. The query surface intentionally has no include-system
+      // flag for repos themselves — `repos.list --include-system` is
+      // the surface for that. Uses the configured system sigils so
+      // migrations from `:` to `#` (etc.) don't leak deleted repos.
+      if (systemSigils.some((sigil) => repo.slug.startsWith(sigil))) return false;
       if (patterns === undefined) return true;
       return patterns.some((pattern) => slugMatchesPattern(pattern, repo.slug));
     })
@@ -168,65 +181,146 @@ function actorBindsRepo(actor: Actor, repoId: number): boolean {
 }
 
 // -----------------------------------------------------------------------------
-// Sigil exclusion (§5.1)
+// Per-repo sigil exclusion (§5.1, §3.5.5)
 // -----------------------------------------------------------------------------
 
-function buildSigilExclusion(
+function buildPerRepoSigilExclusion(
+  repos: readonly RepoRow[],
   serverConfig: PathConfig,
   includeHidden: boolean,
   includeSystem: boolean,
 ): { sql: string; params: (string | number | bigint | null)[] } {
-  // NOTE (m2-plan §7): For M2 we use server-level config sigils, not the
-  // per-repo effective config. Real per-repo differences in sigils are
-  // rare (path config is setup-time — §3.5.2); when they matter, this
-  // should be refactored to build one per-repo clause each.
-  const sigils: string[] = [];
-  if (!includeHidden) sigils.push(...serverConfig.hidden_sigils);
-  if (!includeSystem) sigils.push(...serverConfig.system_sigils);
-  if (sigils.length === 0) return { sql: "", params: [] };
+  if (repos.length === 0) return { sql: "", params: [] };
+  // Group repos by their effective (hidden_sigils, system_sigils) — a
+  // signature string keyed off the tuple. Repos sharing a group share
+  // one exclusion sub-clause.
+  const groups = new Map<string, { sigils: string[]; repoIds: number[] }>();
+  for (const repo of repos) {
+    const cfg = effectivePathConfig(serverConfig, parseRepoOverride(repo.path_config));
+    const sigils: string[] = [];
+    if (!includeHidden) sigils.push(...cfg.hidden_sigils);
+    if (!includeSystem) sigils.push(...cfg.system_sigils);
+    const key = JSON.stringify(sigils);
+    const existing = groups.get(key);
+    if (existing) {
+      existing.repoIds.push(repo.id);
+    } else {
+      groups.set(key, { sigils, repoIds: [repo.id] });
+    }
+  }
   const clauses: string[] = [];
   const params: (string | number | bigint | null)[] = [];
-  for (const sigil of sigils) {
-    const escaped = sigil.replace(/[\\%_]/g, (ch) => `\\${ch}`);
-    // Segment-starts-with-sigil in one of two positions:
-    //   • start of path                    → path LIKE 'S%'
-    //   • immediately after a '/'          → path LIKE '%/S%'
-    clauses.push("versions.path NOT LIKE ? ESCAPE '\\'");
-    clauses.push("versions.path NOT LIKE ? ESCAPE '\\'");
-    params.push(`${escaped}%`);
-    params.push(`%/${escaped}%`);
+  for (const { sigils, repoIds } of groups.values()) {
+    if (sigils.length === 0) continue; // this group's repos have no exclusion
+    // Emit in SQL text order: `repo_id NOT IN (...)` first (params ← repo
+    // ids), then the sigil `NOT LIKE ?` clauses (params ← escaped patterns).
+    // If we push in a different order the placeholders bind wrong.
+    const repoPh = repoIds.map(() => "?").join(",");
+    for (const id of repoIds) params.push(id);
+    const sigilClauses: string[] = [];
+    for (const sigil of sigils) {
+      const escaped = sigil.replace(/[\\%_]/g, (ch) => `\\${ch}`);
+      sigilClauses.push("versions.path NOT LIKE ? ESCAPE '\\'");
+      sigilClauses.push("versions.path NOT LIKE ? ESCAPE '\\'");
+      params.push(`${escaped}%`);
+      params.push(`%/${escaped}%`);
+    }
+    clauses.push(`(versions.repo_id NOT IN (${repoPh}) OR (${sigilClauses.join(" AND ")}))`);
   }
   return { sql: clauses.join(" AND "), params };
 }
 
 // -----------------------------------------------------------------------------
-// Scope post-filter (§8.2)
+// Scope filter → SQL (§8.2, compiled via the RE2-backed regexp UDF)
 // -----------------------------------------------------------------------------
 
-function scopeAllowsRow(actor: Actor, row: VersionRow): boolean {
-  for (const scope of actor.scopes) {
-    if (!scopeCoversRepo(scope, row.repo_id)) continue;
+function buildScopeFilter(scopes: readonly StoredScope[]): {
+  sql: string;
+  params: (string | number | bigint | null)[];
+} {
+  // Compile each scope entry to a SQL sub-clause:
+  //   (versions.repo_id IN (bound_repos) AND (path matches any read glob))
+  // OR them together; a row is allowed if any scope entry admits it.
+  //
+  // Gitignore semantics for a glob list: last-match-wins with `!` as
+  // negation, via a nested CASE over the RE2-backed regexp() UDF for each
+  // pattern (see globsToLastMatchCaseSql).
+  //
+  // If the actor has NO scopes at all, the filter is `0` (falsy) — no
+  // row is allowed. Consistent with §8.2's silent-drop.
+  if (scopes.length === 0) return { sql: "0", params: [] };
+  const scopeSqls: string[] = [];
+  const scopeParams: (string | number | bigint | null)[] = [];
+  for (const scope of scopes) {
     const globs = scope.read ?? [];
-    if (pathMatchesGlobs(globs, row.path)) return true;
+    if (globs.length === 0) continue; // no read → this scope contributes nothing
+    // Emit in SQL text order: `repo_id IN (...)` first (bind ids), THEN the
+    // regex patterns in the CASE.
+    if (scope.repos === "*") {
+      const globExpr = globsToLastMatchCaseSql(globs, scopeParams);
+      scopeSqls.push(`(${globExpr})`);
+    } else if (scope.repos.length > 0) {
+      const ph = scope.repos.map(() => "?").join(",");
+      for (const id of scope.repos) scopeParams.push(id);
+      const globExpr = globsToLastMatchCaseSql(globs, scopeParams);
+      scopeSqls.push(`(versions.repo_id IN (${ph}) AND (${globExpr}))`);
+    }
   }
-  return false;
+  if (scopeSqls.length === 0) return { sql: "0", params: [] };
+  return { sql: scopeSqls.join(" OR "), params: scopeParams };
 }
 
-function scopeCoversRepo(scope: { repos: "*" | number[] }, repoId: number): boolean {
-  if (scope.repos === "*") return true;
-  return scope.repos.includes(repoId);
+/**
+ * Compile a gitignore-style glob list to a SQL expression that returns 1
+ * if the last-matching glob is positive, 0 otherwise. Uses the
+ * RE2-backed regexp() UDF for each pattern (fast + linear-time).
+ *
+ * Encoding: we CASE-walk the globs; each iteration sets a running
+ * accumulator to 1 (positive match), 0 (negative match), or leaves it.
+ * Because SQL doesn't have iterative state, we simulate with a nested
+ * CASE — last-match-wins by evaluating in REVERSE glob order and
+ * short-circuiting on the first match.
+ */
+function globsToLastMatchCaseSql(
+  globs: readonly string[],
+  params: (string | number | bigint | null)[],
+): string {
+  // Build a nested CASE that evaluates each glob outer-to-inner in
+  // GLOB-ORDER — meaning the LAST glob's check is the OUTERMOST CASE, so
+  // its verdict wins when it matches (last-match-wins per gitignore
+  // semantics). A missing match yields 0 (no coverage).
+  //
+  // SQL `?` placeholders bind positionally by their appearance in the
+  // SQL text, so params must land in outermost-first order — we walk
+  // globs forward and UNSHIFT into a local params list so the LAST glob
+  // (which we wrapped last, i.e. outermost) ends up first in the list.
+  let expr = "0";
+  const localParams: string[] = [];
+  for (let i = 0; i < globs.length; i++) {
+    const g = globs[i] as string;
+    const negated = g.startsWith("!");
+    const raw = negated ? g.slice(1) : g;
+    const regex = `^${globToRegexSource(raw)}$`;
+    // This iteration wraps the current accumulator as the ELSE branch,
+    // making the new WHEN clause the outermost. Its `?` will appear
+    // FIRST in the SQL text — so its pattern goes to the head of the
+    // local params list.
+    localParams.unshift(regex);
+    expr = `(CASE WHEN regexp(?, versions.path) THEN ${negated ? "0" : "1"} ELSE ${expr} END)`;
+  }
+  for (const p of localParams) params.push(p);
+  return expr;
 }
 
 // -----------------------------------------------------------------------------
 // Utility
 // -----------------------------------------------------------------------------
 
-function combineWhere(a: string, b: string): string {
-  const aTrim = a.trim();
-  const bTrim = b.trim();
-  if (!aTrim) return bTrim;
-  if (!bTrim) return aTrim;
-  return `(${aTrim}) AND (${bTrim})`;
+function joinWhere(fragments: readonly string[]): string {
+  const nonEmpty = fragments.map((f) => f.trim()).filter((f) => f.length > 0);
+  if (nonEmpty.length === 0) return "";
+  if (nonEmpty.length === 1) return nonEmpty[0] as string;
+  return nonEmpty.map((f) => `(${f})`).join(" AND ");
 }
 
 /**
@@ -236,6 +330,3 @@ function combineWhere(a: string, b: string): string {
 export function repoEffectiveConfig(repo: RepoRow, serverConfig: PathConfig): PathConfig {
   return effectivePathConfig(serverConfig, parseRepoOverride(repo.path_config));
 }
-
-// Also referenced from tests to spot-check sigil exclusion behavior.
-export const __internal = { pathHasSigilSegment };

@@ -269,6 +269,22 @@ describe("string methods", () => {
     void _b;
     expect(runQuery('slug.matches("^v\\\\d+\\\\.\\\\d+\\\\.\\\\d+$")')).toEqual([a]);
   });
+
+  it("matches is ReDoS-safe (RE2JS linear-time — a catastrophic pattern completes instantly)", () => {
+    // This pattern + input would take multiple SECONDS in JS's built-in
+    // RegExp (exponential backtracking). RE2JS returns in microseconds.
+    // If we ever regress the regexp UDF to JS RegExp, this test hangs the
+    // whole vitest run — canary by design.
+    const [_a] = seed([{ path: "a.md", frontmatter: { slug: `${"a".repeat(30)}b` } }]);
+    void _a;
+    const start = Date.now();
+    const result = runQuery('slug.matches("^(a+)+$")');
+    const elapsed = Date.now() - start;
+    expect(result).toEqual([]);
+    // Generous ceiling — RE2JS runs in <1ms on typical hardware; a
+    // failing RegExp swap here would take seconds.
+    expect(elapsed).toBeLessThan(500);
+  });
 });
 
 // -----------------------------------------------------------------------------

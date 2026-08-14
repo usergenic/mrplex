@@ -1,3 +1,4 @@
+import { RE2JS } from "@bufbuild/re2";
 import Database from "better-sqlite3";
 import type {
   DocumentRow,
@@ -35,6 +36,30 @@ const hydrateVersion = (row: VersionRawRow): VersionRow => ({
   frontmatter: JSON.parse(row.frontmatter) as FrontmatterJson,
 });
 
+/**
+ * Compile + cache RE2JS patterns per SqliteStorage instance. Returns null
+ * for patterns that fail to compile — matches SQLite's regexp() convention
+ * of "no match" rather than raising, so a bad pattern doesn't kill the
+ * whole query.
+ */
+const re2Cache = new WeakMap<Database.Database, Map<string, RE2JS | null>>();
+function compileRegexpCachedFor(db: Database.Database, pattern: string): RE2JS | null {
+  let cache = re2Cache.get(db);
+  if (!cache) {
+    cache = new Map();
+    re2Cache.set(db, cache);
+  }
+  if (cache.has(pattern)) return cache.get(pattern) ?? null;
+  let compiled: RE2JS | null;
+  try {
+    compiled = RE2JS.compile(pattern);
+  } catch {
+    compiled = null;
+  }
+  cache.set(pattern, compiled);
+  return compiled;
+}
+
 function parseSqliteUrl(url: string): string {
   const m = url.match(/^sqlite:(.+)$/);
   if (!m || !m[1]) {
@@ -54,33 +79,31 @@ class SqliteStorage implements Storage {
     this.db.pragma("synchronous = NORMAL");
     this.db.pragma("foreign_keys = ON");
     this.db.pragma("busy_timeout = 5000");
-    // regexp() user function — used by CEL's matches() via the AST→SQL
-    // compiler (m2-plan §5). Portable to Postgres via ~; we ship a
-    // deterministic JS-backed impl here rather than depend on the SQLite
-    // REGEXP extension.
+    // regexp() user function — the SQL side of CEL's matches() (m2-plan
+    // §5). Two reasons this uses RE2JS instead of the built-in RegExp:
+    //   1. CEL spec conformance: matches() is defined against Google's RE2
+    //      dialect (linear-time, no lookaround). JS's RegExp has different
+    //      features AND different worst-case behavior; using RE2JS keeps
+    //      the language contract stable when M5's Postgres adapter lands
+    //      (Postgres uses `~` with its own regex library — RE2JS's syntax
+    //      is a closer match than PCRE-style JS regex).
+    //   2. ReDoS: any read-scoped caller can otherwise craft `(a+)+b`-
+    //      shaped patterns that hang the event loop. RE2JS is a linear-
+    //      time engine by construction, so pathological input costs the
+    //      same as any other input.
     //
-    // ReDoS note: this uses JS RegExp, which is a backtracking engine and
-    // can be attacked with catastrophic patterns like `(a+)+b`. In v1 the
-    // SQLite adapter is only used for personal / single-user deployments
-    // (design §7.1: "Local, embedded" + "zo.computer personal server"),
-    // where a bad regex is a self-DoS the user can kill. When we grow into
-    // shared-tenancy on SQLite (unlikely — the design steers those onto
-    // Postgres), swap this for RE2JS (linear-time) — it's already a
-    // transitive dep via @bufbuild/cel's @bufbuild/re2, so the change is
-    // ~5 lines and adds nothing to the install. M5's Postgres branch will
-    // use the native `~` operator, whose regex engine is far less prone to
-    // catastrophic backtracking, with `statement_timeout` as the standard
-    // deployment-level mitigation.
+    // We cache compiled RE2JS instances per pattern via re2Cache — SQLite
+    // calls this UDF once per row scanned; recompiling for every call
+    // would multiply cost by the row count.
+    const dbHandle = this.db;
     this.db.function(
       "regexp",
       { deterministic: true },
       (pattern: unknown, input: unknown): number => {
         if (typeof pattern !== "string" || typeof input !== "string") return 0;
-        try {
-          return new RegExp(pattern).test(input) ? 1 : 0;
-        } catch {
-          return 0;
-        }
+        const compiled = compileRegexpCachedFor(dbHandle, pattern);
+        if (!compiled) return 0;
+        return compiled.matches(input) ? 1 : 0;
       },
     );
   }
@@ -362,28 +385,6 @@ class SqliteStorage implements Storage {
     params.push(input.limit);
     const rows = this.db.prepare(sql).all(...params) as VersionRawRow[];
     return rows.map(hydrateVersion);
-  }
-
-  fts_search(repo_ids: readonly number[], query: string): { version_id: number; score: number }[] {
-    if (repo_ids.length === 0) return [];
-    // bm25(fts_docs) returns a score where LOWER is better (BM25 is a
-    // relevance score; SQLite negates the raw score internally to match
-    // most search-engine conventions, but the FTS5 docs say lower =
-    // better). We normalize to "higher = better" so the ordering semantic
-    // stays consistent with what M2's kernel.query expects.
-    const placeholders = repo_ids.map(() => "?").join(",");
-    const rows = this.db
-      .prepare(
-        `select fts_docs.rowid as version_id, -bm25(fts_docs) as score
-           from fts_docs
-           join versions on versions.id = fts_docs.rowid
-          where fts_docs match ?
-            and versions.next_id is null
-            and versions.repo_id in (${placeholders})
-          order by bm25(fts_docs)`,
-      )
-      .all(query, ...repo_ids) as { version_id: number; score: number }[];
-    return rows;
   }
 
   version_history(document_id: number, opts?: HistoryOptions): VersionRow[] {

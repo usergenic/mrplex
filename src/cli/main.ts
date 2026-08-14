@@ -551,7 +551,9 @@ function buildProgram(): Command {
     .description("search documents — CEL filter + FTS text (design §5)")
     .option(
       "--repo <slug-or-glob>",
-      "repo slug or glob, comma-separated for multiple (default: all in scope)",
+      "repo slug or glob; repeat the flag to query multiple (default: all in scope)",
+      // Commander collector: accumulate into an array across repeated flags.
+      (value: string, prev: string[] | undefined) => [...(prev ?? []), value],
     )
     .option("--filter <expr>", "CEL filter expression")
     .option("--text <query>", "FTS5 query over body")
@@ -560,7 +562,7 @@ function buildProgram(): Command {
     .option("--include-system", "surface :-prefixed (deleted, etc.) paths", false)
     .action(function (this: Command) {
       const localOpts = this.opts<{
-        repo?: string;
+        repo?: string[];
         filter?: string;
         text?: string;
         limit?: number;
@@ -570,7 +572,7 @@ function buildProgram(): Command {
       try {
         const result = withActorAndKernel(this, (kernel, actor) =>
           kernel.query(actor, {
-            repo: localOpts.repo?.includes(",") ? localOpts.repo.split(",") : localOpts.repo,
+            repo: localOpts.repo,
             filter: localOpts.filter,
             text: localOpts.text,
             limit: localOpts.limit,

@@ -174,6 +174,65 @@ describe("query — scope filter (§8.2)", () => {
     const results = kernel.query(admin, { repo: "notes" });
     expect(results.map((v) => v.path).sort()).toEqual(["a.md", "b.md"]);
   });
+
+  it("scope filter honors ! negation with last-match-wins semantics", () => {
+    seedDoc("notes", "drafts/one.md", {}, "");
+    seedDoc("notes", "drafts/pinned/two.md", {}, "");
+    seedDoc("notes", "drafts/three.md", {}, "");
+    const repoRow = storage.repos_by_slug("notes");
+    if (!repoRow) throw new Error("seed");
+    const scoped: Actor = {
+      user_id: admin.user_id,
+      admin: false,
+      scopes: [{ repos: [repoRow.id], read: ["drafts/**", "!drafts/pinned/**"] }],
+    };
+    const results = kernel.query(scoped, { repo: "notes" });
+    expect(results.map((v) => v.path).sort()).toEqual(["drafts/one.md", "drafts/three.md"]);
+  });
+
+  it("scope filter respects limit under narrow scope (no silent under-count)", () => {
+    // 10 rows in scope, 10 rows out — limit 5 must return 5 in-scope rows,
+    // not 5 minus scope drops. The pre-fix implementation would overfetch
+    // and slice, silently returning fewer than 5 when out-of-scope rows
+    // dominated the top of the created_at ordering.
+    for (let i = 0; i < 10; i++) seedDoc("notes", `out/${i}.md`, {}, "");
+    for (let i = 0; i < 10; i++) seedDoc("notes", `in/${i}.md`, {}, "");
+    const repoRow = storage.repos_by_slug("notes");
+    if (!repoRow) throw new Error("seed");
+    const scoped: Actor = {
+      user_id: admin.user_id,
+      admin: false,
+      scopes: [{ repos: [repoRow.id], read: ["in/**"] }],
+    };
+    const results = kernel.query(scoped, { repo: "notes", limit: 5 });
+    expect(results).toHaveLength(5);
+    expect(results.every((v) => v.path.startsWith("in/"))).toBe(true);
+  });
+});
+
+// -----------------------------------------------------------------------------
+// Per-repo sigil exclusion (§3.5.5)
+// -----------------------------------------------------------------------------
+
+describe("query — per-repo sigil exclusion", () => {
+  it("respects per-repo hidden_sigils override", () => {
+    // Second repo overrides hidden_sigils to include "_" too.
+    storage.repos_create({
+      slug: "custom",
+      created_at: "2026-08-14T00:00:01Z",
+    });
+    kernel.repos.set_path_config(admin, "custom", {
+      hidden_sigils: [".", "_"],
+    });
+    seedDoc("notes", "_notes_hidden_by_custom_only.md", {}, "");
+    seedDoc("custom", "_hidden_in_custom.md", {}, "");
+    // On notes (server default hidden=["."]), the _-prefixed file is NOT
+    // hidden. On custom (override hidden=[".","_"]), it IS hidden.
+    const notesResults = kernel.query(admin, { repo: "notes" });
+    expect(notesResults.map((v) => v.path)).toEqual(["_notes_hidden_by_custom_only.md"]);
+    const customResults = kernel.query(admin, { repo: "custom" });
+    expect(customResults).toEqual([]);
+  });
 });
 
 // -----------------------------------------------------------------------------
@@ -265,6 +324,44 @@ describe("query — validation", () => {
       throw new Error("expected throw");
     } catch (err) {
       expect((err as KernelError).code).toBe("filter_invalid");
+    }
+  });
+
+  it("unknown QuerySpec fields return filter_invalid", () => {
+    try {
+      kernel.query(admin, { limit_typo: 5 } as never);
+      throw new Error("expected throw");
+    } catch (err) {
+      expect((err as KernelError).code).toBe("filter_invalid");
+      const data = (err as KernelError<{ reason: string }>).data;
+      expect(data.reason).toContain("limit_typo");
+    }
+  });
+
+  it("bare list() outside a hint context returns filter_invalid", () => {
+    try {
+      kernel.query(admin, { repo: "notes", filter: 'list(tags) == "foo"' });
+      throw new Error("expected throw");
+    } catch (err) {
+      expect((err as KernelError).code).toBe("filter_invalid");
+      const data = (err as KernelError<{ reason: string }>).data;
+      expect(data.reason).toMatch(/list\(\)/);
+    }
+  });
+
+  it("member access on a comprehension iter-var returns filter_invalid", () => {
+    // Would otherwise silently compile a.name as a top-level frontmatter
+    // key path — wrong data with no user signal.
+    try {
+      kernel.query(admin, {
+        repo: "notes",
+        filter: 'list(authors).all(a, a.name == "alice")',
+      });
+      throw new Error("expected throw");
+    } catch (err) {
+      expect((err as KernelError).code).toBe("filter_invalid");
+      const data = (err as KernelError<{ reason: string }>).data;
+      expect(data.reason).toMatch(/iter-var/);
     }
   });
 

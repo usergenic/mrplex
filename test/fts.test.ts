@@ -1,12 +1,16 @@
 /**
- * FTS integration tests — SQLite FTS5 adapter methods + trigger behavior.
+ * FTS integration tests — SQLite FTS5 through versions_search.
  *
  * Two things to prove:
  *  1. The AFTER INSERT trigger stays in sync with the version_insert
  *     three-statement dance (placeholder update, insert, prev update).
- *  2. fts_search returns only CURRENT versions (design §5.1's
+ *  2. versions_search's FTS branch returns only CURRENT versions (§5.1's
  *     "search indexes cover current versions only"), scoped to the given
  *     repo set, ordered by BM25 (best first).
+ *
+ * We test through versions_search rather than a lower-level primitive so
+ * there's one production path — no risk of the tests exercising code
+ * kernel.query doesn't touch.
  */
 
 import { tmpdir } from "node:os";
@@ -22,11 +26,23 @@ let otherRepo: RepoRow;
 
 const NOW = "2026-08-14T00:00:00Z";
 const LATER = "2026-08-14T00:00:01Z";
-const LATEST = "2026-08-14T00:00:02Z";
 
 function fresh(): Storage {
   const path = join(tmpdir(), `mrplex-fts-${Date.now()}-${Math.random()}.db`);
   return sqliteAdapter.open({ database: `sqlite:${path}` });
+}
+
+/** Search-and-return ids via the same versions_search path kernel.query uses. */
+function ftsIds(repoIds: readonly number[], text: string): number[] {
+  return storage
+    .versions_search({
+      repo_ids: repoIds,
+      where_sql: "",
+      where_params: [],
+      text,
+      limit: 100,
+    })
+    .map((v) => v.id);
 }
 
 beforeEach(() => {
@@ -54,9 +70,7 @@ describe("fts trigger sync with version_insert", () => {
       author_id: user.id,
       created_at: NOW,
     });
-    const hits = storage.fts_search([repo.id], "quick");
-    expect(hits).toHaveLength(1);
-    expect(hits[0]?.version_id).toBe(v.id);
+    expect(ftsIds([repo.id], "quick")).toEqual([v.id]);
   });
 
   it("indexes every version — the three-statement dance doesn't double-insert or drop", () => {
@@ -83,14 +97,13 @@ describe("fts trigger sync with version_insert", () => {
       author_id: user.id,
       created_at: LATER,
     });
-    // Searching for apple should return v2 only — even though v1 also
-    // contains "apple", it's superseded (next_id is not null).
-    const hits = storage.fts_search([repo.id], "apple");
-    expect(hits.map((h) => h.version_id)).toEqual([v2.id]);
+    // Searching for apple returns only v2 — v1 also contains "apple" but is
+    // superseded (next_id set).
+    expect(ftsIds([repo.id], "apple")).toEqual([v2.id]);
   });
 });
 
-describe("fts_search — current-only filter", () => {
+describe("versions_search — FTS branch, current-only filter", () => {
   it("skips versions whose next_id is not null", () => {
     const doc = storage.documents_create(repo.id);
     const v1 = storage.version_insert({
@@ -115,9 +128,7 @@ describe("fts_search — current-only filter", () => {
       author_id: user.id,
       created_at: LATER,
     });
-    // v1 is in the FTS index, but next_id is set — should not appear.
-    const hits = storage.fts_search([repo.id], "uniquetokenv1");
-    expect(hits).toEqual([]);
+    expect(ftsIds([repo.id], "uniquetokenv1")).toEqual([]);
   });
 
   it("restricts to the given repo set", () => {
@@ -145,15 +156,12 @@ describe("fts_search — current-only filter", () => {
       author_id: user.id,
       created_at: LATER,
     });
-    const notesHits = storage.fts_search([repo.id], "sharedterm");
-    expect(notesHits).toHaveLength(1);
-    const otherHits = storage.fts_search([otherRepo.id], "sharedterm");
-    expect(otherHits).toHaveLength(1);
-    const bothHits = storage.fts_search([repo.id, otherRepo.id], "sharedterm");
-    expect(bothHits).toHaveLength(2);
+    expect(ftsIds([repo.id], "sharedterm")).toHaveLength(1);
+    expect(ftsIds([otherRepo.id], "sharedterm")).toHaveLength(1);
+    expect(ftsIds([repo.id, otherRepo.id], "sharedterm")).toHaveLength(2);
   });
 
-  it("returns [] for an empty repo set (avoids `IN ()` syntax errors)", () => {
+  it("returns [] for an empty repo set", () => {
     const doc = storage.documents_create(repo.id);
     storage.version_insert({
       document_id: doc.id,
@@ -166,7 +174,7 @@ describe("fts_search — current-only filter", () => {
       author_id: user.id,
       created_at: NOW,
     });
-    expect(storage.fts_search([], "anything")).toEqual([]);
+    expect(ftsIds([], "anything")).toEqual([]);
   });
 
   it("returns [] for a MATCH that hits nothing", () => {
@@ -182,15 +190,14 @@ describe("fts_search — current-only filter", () => {
       author_id: user.id,
       created_at: NOW,
     });
-    expect(storage.fts_search([repo.id], "nonexistentterm")).toEqual([]);
+    expect(ftsIds([repo.id], "nonexistentterm")).toEqual([]);
   });
 });
 
-describe("fts_search — ranking + query syntax", () => {
-  it("returns rows ordered by BM25 — best first (higher normalized score)", () => {
+describe("versions_search — FTS ranking + query syntax", () => {
+  it("returns rows ordered by BM25 — best first", () => {
     const doc1 = storage.documents_create(repo.id);
     const doc2 = storage.documents_create(repo.id);
-    // doc1 has "pricing" once; doc2 has "pricing" three times → doc2 more relevant.
     storage.version_insert({
       document_id: doc1.id,
       repo_id: repo.id,
@@ -202,7 +209,7 @@ describe("fts_search — ranking + query syntax", () => {
       author_id: user.id,
       created_at: NOW,
     });
-    storage.version_insert({
+    const v2 = storage.version_insert({
       document_id: doc2.id,
       repo_id: repo.id,
       prev_id: null,
@@ -213,13 +220,10 @@ describe("fts_search — ranking + query syntax", () => {
       author_id: user.id,
       created_at: LATER,
     });
-    const hits = storage.fts_search([repo.id], "pricing");
-    expect(hits).toHaveLength(2);
-    // doc2 (id=2) should be ranked first (better BM25 = more negative raw → higher after negation).
-    // The exact score depends on the tokenizer + corpus stats, but ordering is stable.
-    const firstScore = hits[0]?.score ?? 0;
-    const secondScore = hits[1]?.score ?? 0;
-    expect(firstScore).toBeGreaterThanOrEqual(secondScore);
+    const ids = ftsIds([repo.id], "pricing");
+    expect(ids).toHaveLength(2);
+    // The more-relevant doc (v2, 4× pricing) should come first.
+    expect(ids[0]).toBe(v2.id);
   });
 
   it("supports FTS5 boolean operators (OR)", () => {
@@ -247,8 +251,7 @@ describe("fts_search — ranking + query syntax", () => {
       author_id: user.id,
       created_at: LATER,
     });
-    const hits = storage.fts_search([repo.id], "welcome OR pricing");
-    expect(hits).toHaveLength(2);
+    expect(ftsIds([repo.id], "welcome OR pricing")).toHaveLength(2);
   });
 
   it("porter-stemmed English — plurals + verb forms match root", () => {
@@ -264,9 +267,9 @@ describe("fts_search — ranking + query syntax", () => {
       author_id: user.id,
       created_at: NOW,
     });
-    // porter stemmer maps "runs", "running", "run" all to "run"
-    expect(storage.fts_search([repo.id], "run")).toHaveLength(1);
-    expect(storage.fts_search([repo.id], "dog")).toHaveLength(1);
+    // porter stems: run/running/runs → run; dog/dogs → dog
+    expect(ftsIds([repo.id], "run")).toHaveLength(1);
+    expect(ftsIds([repo.id], "dog")).toHaveLength(1);
   });
 });
 

@@ -52,8 +52,13 @@ function compileIntrinsic(mangledName: string): string {
   const name = mangledName.slice(INTRINSIC_PREFIX.length);
   const column = INTRINSIC_COLUMNS[name];
   if (!column) {
+    // Derive the "expected" list from INTRINSIC_COLUMNS so the message
+    // can't drift from the code.
+    const expected = Object.keys(INTRINSIC_COLUMNS)
+      .map((k) => `$${k}`)
+      .join(", ");
     throw new KernelError("filter_invalid", {
-      reason: `unknown intrinsic $${name} (expected $path or $created_at)`,
+      reason: `unknown intrinsic $${name} (expected ${expected})`,
     });
   }
   return column;
@@ -209,9 +214,16 @@ function compileCall(expr: CelExpr): SqlFragment {
       return compileMatches(args[0] as CelExpr, args[1] as CelExpr);
     }
     if (fn === "list" && args.length === 1) {
-      // Bare list() — outside a hint-consuming context, just compile the inner
-      // expression. The hint role fires in @in / comprehensions.
-      return compileExpr(args[0] as CelExpr);
+      // Bare `list(x)` outside a `@in` / comprehension context is a silent
+      // semantic loss — `list(tags) == "foo"` would compile as
+      // `tags == "foo"`, which fails on list-valued frontmatter. Since
+      // list() is a compile-time hint (§5.2) that only makes sense in
+      // hint-consuming contexts, reject it here so users get a clear
+      // signal that they probably meant `"foo" in list(tags)`.
+      throw new KernelError("filter_invalid", {
+        reason:
+          "list() is a hint that must sit inside `in` or a comprehension (.all/.exists), not stand alone",
+      });
     }
   }
 
@@ -587,7 +599,17 @@ function compileWithIterSubstitution(
     return recompileCallWithSubstitutedArgs(call.function, targetCompiled, args);
   }
   if (kind === "selectExpr") {
-    // Compile as normal — selects don't normally reference the iter var.
+    // Guard against silent-wrong-results: if the select's root IS the iter
+    // var (e.g. `list(authors).all(a, a.name == "alice")`), the fall-
+    // through to compileExpr would compile `a.name` as if it were a
+    // frontmatter path — semantically wrong and impossible to notice.
+    // Reject explicitly until we grow proper member-access support.
+    const root = collectSelectPath(expr)?.[0];
+    if (root === iterVar) {
+      throw new KernelError("filter_invalid", {
+        reason: `member access on comprehension iter-var '${iterVar}' is not yet supported`,
+      });
+    }
     return compileExpr(expr);
   }
   return compileExpr(expr);

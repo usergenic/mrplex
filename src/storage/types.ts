@@ -138,19 +138,17 @@ export type Storage = {
   versions_live_by_repo(repo_id: number): VersionRow[];
 
   // Full-text search (design §5.1, §7.2.2). Indexes CURRENT versions
-  // only — fts_search filters live rows itself so the kernel doesn't
-  // have to remember.
+  // only — the versions_search method above filters live rows itself.
   //
-  //   fts_index  — hook the storage engine offers if it needs an explicit
-  //                indexing call. SQLite's FTS5 external-content mode
-  //                uses triggers, so this method is a no-op there; kept
-  //                for interface symmetry with engines that need it.
-  //   fts_search — MATCH the FTS query, restrict to live versions in the
-  //                given repo set, return (version_id, score) newest-
-  //                score-first. Ranking scores are not portable across
-  //                adapters (§7.2 parity table); result SETS are.
+  //   fts_index — hook the storage engine offers if it needs an explicit
+  //               indexing call. SQLite's FTS5 external-content mode uses
+  //               triggers, so this method is a no-op there; kept for
+  //               interface symmetry with engines that need it.
+  //
+  // FTS querying itself lives in versions_search (below) which JOINs
+  // fts_docs directly, so kernel.query has one path through the
+  // adapter, not two.
   fts_index(version_id: number, body: string): void;
-  fts_search(repo_ids: readonly number[], query: string): { version_id: number; score: number }[];
 
   /**
    * Composed query — the kernel orchestrator (§5) hands over a pre-built
