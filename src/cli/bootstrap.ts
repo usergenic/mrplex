@@ -14,9 +14,7 @@ import { sqliteAdapter } from "../storage-sqlite/adapter.js";
 
 const BOOTSTRAP_USER_SLUG = "system";
 const BOOTSTRAP_LABEL = "root";
-const BOOTSTRAP_SCOPES_JSON = JSON.stringify([
-  { repos: "*", read: ["**"], write: ["**"] },
-]);
+const BOOTSTRAP_SCOPES_JSON = JSON.stringify([{ repos: "*", read: ["**"], write: ["**"] }]);
 
 export type BootstrapResult = {
   token: string;
