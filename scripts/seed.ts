@@ -35,11 +35,16 @@ function walkMarkdown(dir: string, out: string[] = []): string[] {
   return out;
 }
 
-function assertEmpty(storage: Storage): void {
-  const users = storage.users_list();
+function assertSeedable(storage: Storage): void {
+  // The database may already have a `system` user + a root token from
+  // `mrplex bootstrap` — that's an intended shape. What we want to refuse
+  // is running against a database with pre-existing user data (alice, notes,
+  // …) so we don't corrupt real data. Check for the specific fixture shape
+  // seed produces: any user other than "system", or ANY repo at all.
+  const users = storage.users_list().filter((u) => u.slug !== "system");
   const repos = storage.repos_list();
   if (users.length > 0 || repos.length > 0) {
-    throw new Error("seed: database is not empty — refusing to run. Delete the file and retry.");
+    throw new Error("seed: database already has non-system users or any repos — refusing to run.");
   }
 }
 
@@ -52,7 +57,7 @@ function main(): void {
   console.error(`seed: opening ${args.database}`);
   const storage = sqliteAdapter.open({ database: args.database });
   try {
-    assertEmpty(storage);
+    assertSeedable(storage);
     let clock = 0;
 
     const alice = storage.users_create({ slug: "alice", created_at: isoAt(clock++) });

@@ -10,6 +10,7 @@ export type KernelErrorCode =
   | "user_not_found"
   | "doc_not_found"
   | "version_not_found"
+  | "token_not_found"
   | "version_not_in_document"
   | "slug_invalid"
   | "path_invalid"
@@ -43,5 +44,14 @@ export const docNotFound = (repo: string, path: string) =>
 export const versionNotFound = (versionId: string) =>
   new KernelError("version_not_found", { version_id: versionId });
 
+export const tokenNotFound = (tokenId: string) =>
+  new KernelError("token_not_found", { token_id: tokenId });
+
 export const versionNotInDocument = (versionId: string, repo: string, path: string) =>
   new KernelError("version_not_in_document", { version_id: versionId, repo, path });
+
+// Auth (§8.4). `unauthorized` = no/bad/expired token; `forbidden` = valid
+// token, insufficient scope. Both errors deliberately omit resource details
+// per §8.4 (don't leak existence via forbidden-vs-not-found ambiguity).
+export const unauthorized = () => new KernelError("unauthorized", {});
+export const forbidden = () => new KernelError("forbidden", {});

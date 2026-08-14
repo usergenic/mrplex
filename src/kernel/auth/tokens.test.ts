@@ -1,0 +1,154 @@
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { sqliteAdapter } from "../../storage-sqlite/adapter.js";
+import type { Storage } from "../../storage/types.js";
+import type { StoredScope } from "./actor.js";
+import {
+  generateSecret,
+  hashSecret,
+  hashesEqual,
+  parseStoredScopes,
+  resolveActor,
+  serializeStoredScopes,
+} from "./tokens.js";
+
+describe("generateSecret", () => {
+  it("returns a mrplex_-prefixed base64url string", () => {
+    const s = generateSecret();
+    expect(s).toMatch(/^mrplex_[A-Za-z0-9_-]+$/);
+    // 32 bytes → 43 chars of unpadded base64url.
+    expect(s.length).toBe("mrplex_".length + 43);
+  });
+
+  it("produces unique secrets across calls", () => {
+    const secrets = new Set<string>();
+    for (let i = 0; i < 1000; i++) secrets.add(generateSecret());
+    expect(secrets.size).toBe(1000);
+  });
+});
+
+describe("hashSecret", () => {
+  it("is deterministic (same input → same digest)", () => {
+    expect(hashSecret("mrplex_abc")).toBe(hashSecret("mrplex_abc"));
+  });
+
+  it("produces a hex-encoded 64-char digest", () => {
+    expect(hashSecret("anything")).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("distinct secrets → distinct digests", () => {
+    expect(hashSecret("a")).not.toBe(hashSecret("b"));
+  });
+});
+
+describe("hashesEqual", () => {
+  it("equal for equal hex digests", () => {
+    const h = hashSecret("x");
+    expect(hashesEqual(h, h)).toBe(true);
+  });
+  it("not equal for different digests", () => {
+    expect(hashesEqual(hashSecret("a"), hashSecret("b"))).toBe(false);
+  });
+  it("not equal for different-length strings", () => {
+    expect(hashesEqual("aa", "aabb")).toBe(false);
+  });
+});
+
+describe("parseStoredScopes / serializeStoredScopes", () => {
+  it("round-trips a typical scopes array", () => {
+    const scopes: StoredScope[] = [
+      { repos: [1, 2], read: ["**"], write: ["inbox/**"] },
+      { repos: "*", read: ["**"] },
+    ];
+    expect(parseStoredScopes(serializeStoredScopes(scopes))).toEqual(scopes);
+  });
+
+  it("round-trips an empty array", () => {
+    expect(parseStoredScopes(serializeStoredScopes([]))).toEqual([]);
+  });
+
+  it("rejects non-array JSON", () => {
+    expect(() => parseStoredScopes(JSON.stringify({ nope: true }))).toThrow(/array/);
+  });
+
+  it("rejects entries whose repos is not '*' or number[]", () => {
+    expect(() => parseStoredScopes(JSON.stringify([{ repos: "notes", read: ["**"] }]))).toThrow(
+      /repos/,
+    );
+  });
+});
+
+describe("resolveActor (SQLite backed)", () => {
+  let storage: Storage;
+
+  beforeEach(() => {
+    const path = join(tmpdir(), `mrplex-tokens-${Date.now()}-${Math.random()}.db`);
+    storage = sqliteAdapter.open({ database: `sqlite:${path}` });
+  });
+
+  afterEach(() => {
+    storage.close();
+  });
+
+  function issueToken(
+    input: {
+      admin?: boolean;
+      scopes?: StoredScope[];
+      expires_at?: string | null;
+    } = {},
+  ) {
+    const user = storage.users_create({ slug: "alice", created_at: "2026-08-14T00:00:00Z" });
+    const secret = generateSecret();
+    const row = storage.tokens_create({
+      user_id: user.id,
+      secret_hash: hashSecret(secret),
+      label: "test",
+      scopes: serializeStoredScopes(input.scopes ?? [{ repos: "*", read: ["**"] }]),
+      admin: input.admin ?? false,
+      expires_at: input.expires_at ?? null,
+      created_at: "2026-08-14T00:00:01Z",
+    });
+    return { user, secret, row };
+  }
+
+  it("resolves a valid token to an Actor", () => {
+    const { user, secret } = issueToken({ admin: true });
+    const actor = resolveActor(secret, storage);
+    expect(actor).not.toBeNull();
+    expect(actor?.user_id).toBe(user.id);
+    expect(actor?.admin).toBe(true);
+    expect(actor?.scopes).toEqual([{ repos: "*", read: ["**"] }]);
+    expect(actor?.token_id).toBeDefined();
+  });
+
+  it("returns null for an unknown secret", () => {
+    expect(resolveActor(generateSecret(), storage)).toBeNull();
+  });
+
+  it("returns null for a revoked token", () => {
+    const { secret, row } = issueToken();
+    storage.tokens_revoke(row.id, "2026-08-14T00:00:02Z");
+    expect(resolveActor(secret, storage)).toBeNull();
+  });
+
+  it("returns null for an expired token", () => {
+    const { secret } = issueToken({ expires_at: "2020-01-01T00:00:00Z" });
+    expect(resolveActor(secret, storage)).toBeNull();
+  });
+
+  it("touches last_used_at on a successful resolve", () => {
+    const { secret, row } = issueToken();
+    expect(storage.tokens_by_id(row.id)?.last_used_at).toBeNull();
+    resolveActor(secret, storage);
+    const after = storage.tokens_by_id(row.id);
+    expect(after?.last_used_at).not.toBeNull();
+  });
+
+  it("users_delete precondition: tokens_revoke_by_user takes them all out", () => {
+    const { user, secret } = issueToken();
+    expect(resolveActor(secret, storage)).not.toBeNull();
+    storage.tokens_revoke_by_user(user.id, "2026-08-14T00:00:02Z");
+    expect(resolveActor(secret, storage)).toBeNull();
+  });
+});

@@ -7,6 +7,8 @@ import type {
   RepoRow,
   Storage,
   StorageAdapter,
+  TokenInsertInput,
+  TokenRow,
   UserRow,
   VersionInsertInput,
   VersionRow,
@@ -106,6 +108,14 @@ class SqliteStorage implements Storage {
     return row;
   }
 
+  users_rename(id: number, new_slug: string): UserRow {
+    const row = this.db
+      .prepare("update users set slug = ? where id = ? returning id, slug, created_at")
+      .get(new_slug, id) as UserRow | undefined;
+    if (!row) throw new Error(`users_rename: user ${id} not found`);
+    return row;
+  }
+
   users_by_slug(slug: string): UserRow | null {
     return (
       (this.db.prepare("select id, slug, created_at from users where slug = ?").get(slug) as
@@ -134,6 +144,24 @@ class SqliteStorage implements Storage {
         "insert into repos(slug, created_at) values (?, ?) returning id, slug, path_config, created_at",
       )
       .get(input.slug, input.created_at) as RepoRow;
+    return row;
+  }
+
+  repos_rename(id: number, new_slug: string): RepoRow {
+    const row = this.db
+      .prepare("update repos set slug = ? where id = ? returning id, slug, path_config, created_at")
+      .get(new_slug, id) as RepoRow | undefined;
+    if (!row) throw new Error(`repos_rename: repo ${id} not found`);
+    return row;
+  }
+
+  repos_set_path_config(id: number, path_config: string | null): RepoRow {
+    const row = this.db
+      .prepare(
+        "update repos set path_config = ? where id = ? returning id, slug, path_config, created_at",
+      )
+      .get(path_config, id) as RepoRow | undefined;
+    if (!row) throw new Error(`repos_set_path_config: repo ${id} not found`);
     return row;
   }
 
@@ -247,6 +275,19 @@ class SqliteStorage implements Storage {
     return row ? hydrateVersion(row) : null;
   }
 
+  versions_live_by_repo(repo_id: number): VersionRow[] {
+    const rows = this.db
+      .prepare(
+        `select id, document_id, repo_id, prev_id, next_id, path,
+                frontmatter_raw, frontmatter, body, author_id, created_at
+         from versions
+         where repo_id = ? and next_id is null
+         order by path`,
+      )
+      .all(repo_id) as VersionRawRow[];
+    return rows.map(hydrateVersion);
+  }
+
   version_history(document_id: number, opts?: HistoryOptions): VersionRow[] {
     // History walks the version chain (design §3.4), not created_at, so
     // backdated edits and clock skew can't reorder the result. A recursive
@@ -286,6 +327,99 @@ class SqliteStorage implements Storage {
       )
       .all(...params) as VersionRawRow[];
     return rows.map(hydrateVersion);
+  }
+
+  // Tokens (design §3.2, §8). SQLite has no boolean, so `admin` stores 0/1.
+  // `tokens_by_hash` / `tokens_list` filter out revoked and expired rows here
+  // so the kernel never has to remember.
+  tokens_create(input: TokenInsertInput): TokenRow {
+    return this.db
+      .prepare(
+        `insert into api_tokens
+           (user_id, secret_hash, label, scopes, admin,
+            expires_at, revoked_at, created_at, last_used_at)
+         values (?, ?, ?, ?, ?, ?, null, ?, null)
+         returning id, user_id, secret_hash, label, scopes,
+                   admin, expires_at, revoked_at, created_at, last_used_at`,
+      )
+      .get(
+        input.user_id,
+        input.secret_hash,
+        input.label,
+        input.scopes,
+        input.admin ? 1 : 0,
+        input.expires_at,
+        input.created_at,
+      ) as TokenRow;
+  }
+
+  tokens_by_hash(hash: string): TokenRow | null {
+    // Filter revoked + expired at read time.
+    return (
+      (this.db
+        .prepare(
+          `select id, user_id, secret_hash, label, scopes,
+                  admin, expires_at, revoked_at, created_at, last_used_at
+             from api_tokens
+             where secret_hash = ?
+               and revoked_at is null
+               and (expires_at is null or expires_at > ?)`,
+        )
+        .get(hash, new Date().toISOString()) as TokenRow | undefined) ?? null
+    );
+  }
+
+  tokens_by_id(id: number): TokenRow | null {
+    return (
+      (this.db
+        .prepare(
+          `select id, user_id, secret_hash, label, scopes,
+                  admin, expires_at, revoked_at, created_at, last_used_at
+             from api_tokens where id = ?`,
+        )
+        .get(id) as TokenRow | undefined) ?? null
+    );
+  }
+
+  tokens_list(user_id: number): TokenRow[] {
+    // Filter revoked + expired at read time (adapter contract, matching
+    // tokens_by_hash) so the kernel doesn't have to remember.
+    return this.db
+      .prepare(
+        `select id, user_id, secret_hash, label, scopes,
+                admin, expires_at, revoked_at, created_at, last_used_at
+           from api_tokens
+           where user_id = ?
+             and revoked_at is null
+             and (expires_at is null or expires_at > ?)
+           order by created_at desc, id desc`,
+      )
+      .all(user_id, new Date().toISOString()) as TokenRow[];
+  }
+
+  tokens_revoke(id: number, revoked_at: string): TokenRow | null {
+    const row = this.db
+      .prepare(
+        `update api_tokens set revoked_at = coalesce(revoked_at, ?)
+           where id = ?
+         returning id, user_id, secret_hash, label, scopes,
+                   admin, expires_at, revoked_at, created_at, last_used_at`,
+      )
+      .get(revoked_at, id) as TokenRow | undefined;
+    return row ?? null;
+  }
+
+  tokens_revoke_by_user(user_id: number, revoked_at: string): void {
+    this.db
+      .prepare("update api_tokens set revoked_at = coalesce(revoked_at, ?) where user_id = ?")
+      .run(revoked_at, user_id);
+  }
+
+  tokens_touch_last_used(id: number, when: string): void {
+    // §8.5: best-effort, non-transactional. If we're inside a tx, it'll still
+    // get committed with the rest — that's fine, this is a "cheap enough"
+    // update on the hot auth path.
+    this.db.prepare("update api_tokens set last_used_at = ? where id = ?").run(when, id);
   }
 }
 
