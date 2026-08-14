@@ -451,7 +451,7 @@ All three implement the same contract; the kernel doesn't know which is in play.
 
 **Model changes.** If the hook starts returning a different `model` or `dim`, the server writes a warning and stores the new-model vectors alongside the old ones (the `chunks.model` column, §3.2 — the same column that keys dedup above). Vector search filters by current model. Backfill re-embeds under the new model on demand.
 
-`[OPEN]` Whether to ship a default "no-op" hook (returns zero vectors, `dim = 1`) so the server starts cleanly without any embedding configuration, at the cost of hiding misconfiguration. Leaning yes for dev, warn loudly.
+**Resolved — no default no-op hook.** A zero-vector hook wouldn't just hide misconfiguration: cosine distance against zero vectors is degenerate, so every rank query would return arbitrarily-ordered results shaped exactly like a working semantic search — silent garbage rather than a visible gap. Instead: the server starts cleanly with embedding *off* (worker idle), `rank` queries fail loudly with `rank_unavailable`, and dev/test workflows use a stub embedder script that returns deterministic real vectors (see [m4-plan.md](m4-plan.md), decisions 2 and 4).
 
 ## 6. Interfaces
 
