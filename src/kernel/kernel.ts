@@ -79,10 +79,12 @@ export function createKernel(storage: Storage): Kernel {
     path_config: string | null;
     created_at: string;
   } {
-    const target: Target = { kind: "repo", slug };
-    authorize(actor, action, target);
+    // Look the repo up FIRST, then authorize on the resolved id — scopes bind
+    // ids (§8.2), so we need it to check.
     const row = storage.repos_by_slug(slug);
     if (!row) throw repoNotFound(slug);
+    const target: Target = { kind: "repo", repo_id: row.id };
+    authorize(actor, action, target);
     return row;
   }
 
@@ -111,7 +113,7 @@ export function createKernel(storage: Storage): Kernel {
     docs: {
       get(actor, repoSlug, path) {
         const repo = resolveRepo(actor, repoSlug, "read");
-        authorize(actor, "read", { kind: "path", repo: repoSlug, path });
+        authorize(actor, "read", { kind: "path", repo_id: repo.id, path });
         const row = storage.version_current(repo.id, path);
         if (!row) throw docNotFound(repoSlug, path);
         return toVersionWire(row, repoSlug);
@@ -123,13 +125,13 @@ export function createKernel(storage: Storage): Kernel {
         if (id === null) throw versionNotFound(versionId);
         const row = storage.version_by_id(id);
         if (!row || row.repo_id !== repo.id) throw versionNotFound(versionId);
-        authorize(actor, "read", { kind: "path", repo: repoSlug, path: row.path });
+        authorize(actor, "read", { kind: "path", repo_id: repo.id, path: row.path });
         return toVersionWire(row, repoSlug);
       },
 
       history(actor, repoSlug, path, opts) {
         const repo = resolveRepo(actor, repoSlug, "read");
-        authorize(actor, "read", { kind: "path", repo: repoSlug, path });
+        authorize(actor, "read", { kind: "path", repo_id: repo.id, path });
         const current = storage.version_current(repo.id, path);
         if (!current) throw docNotFound(repoSlug, path);
         const rows = storage.version_history(current.document_id, opts);

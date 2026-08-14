@@ -45,3 +45,9 @@ export const versionNotFound = (versionId: string) =>
 
 export const versionNotInDocument = (versionId: string, repo: string, path: string) =>
   new KernelError("version_not_in_document", { version_id: versionId, repo, path });
+
+// Auth (§8.4). `unauthorized` = no/bad/expired token; `forbidden` = valid
+// token, insufficient scope. Both errors deliberately omit resource details
+// per §8.4 (don't leak existence via forbidden-vs-not-found ambiguity).
+export const unauthorized = () => new KernelError("unauthorized", {});
+export const forbidden = () => new KernelError("forbidden", {});

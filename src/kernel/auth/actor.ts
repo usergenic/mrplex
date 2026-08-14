@@ -32,15 +32,21 @@ export type Actor = {
 export type Action = "read" | "write" | "admin";
 
 /**
- * Authorization target shapes. `move` is used for `docs.put` where the caller
- * moves a doc from one path to another — the design's "both endpoints match
- * write" rule (§8.2) with the system-namespace carve-out applies here.
+ * Authorization target shapes. Targets carry the resolved `repo_id` (not the
+ * slug) because scopes bind ids (§8.2 — repo renames don't break tokens).
+ * The kernel resolves the slug once and reuses the row for both storage and
+ * authorization.
+ *
+ * `move` is used for `docs.put` where the caller moves a doc from one path
+ * to another — the design's "both endpoints match write" rule (§8.2) with
+ * the system-namespace carve-out applies here.
  */
 export type Target =
   | { kind: "server" }
-  | { kind: "repo"; slug: string }
-  | { kind: "path"; repo: string; path: string }
-  | { kind: "move"; repo: string; source: string; destination: string };
+  | { kind: "server_admin" } // admin-gated server op (users.*, repos.create/rename/delete/set_path_config, cross-user token mgmt)
+  | { kind: "repo"; repo_id: number }
+  | { kind: "path"; repo_id: number; path: string }
+  | { kind: "move"; repo_id: number; source: string; destination: string };
 
 /**
  * Kernel-internal system actor. Used for calls the kernel makes on its own

@@ -146,11 +146,7 @@ export function validateConfig(config: PathConfig): void {
   }
 
   // 2. No PATH_SEPARATOR anywhere.
-  for (const list of [
-    config.disallowed_chars,
-    config.system_sigils,
-    config.hidden_sigils,
-  ]) {
+  for (const list of [config.disallowed_chars, config.system_sigils, config.hidden_sigils]) {
     for (const entry of list) {
       if (entry.includes(PATH_SEPARATOR)) {
         throw new ConfigError(
@@ -200,10 +196,7 @@ export function validateConfig(config: PathConfig): void {
  * `repos.set_path_config`. Fields that are set must merge cleanly against
  * the current server config.
  */
-export function validateRepoOverride(
-  override: PathConfigOverride,
-  serverConfig: PathConfig,
-): void {
+export function validateRepoOverride(override: PathConfigOverride, serverConfig: PathConfig): void {
   validateConfig(mergeConfig(serverConfig, override));
 }
 
@@ -225,7 +218,7 @@ export type PathWarning = {
 export function pathWarning(versionId: string, path: string, err: unknown): PathWarning {
   const reason =
     err instanceof KernelError
-      ? (err.data as { reason?: string }).reason ?? err.code
+      ? ((err.data as { reason?: string }).reason ?? err.code)
       : (err as Error).message;
   return { version_id: versionId, path, reason };
 }
