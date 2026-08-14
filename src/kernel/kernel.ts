@@ -26,6 +26,7 @@ import {
   tokenIdString,
 } from "./auth/tokens.js";
 import { deletionPath, pathIsInSystemNamespace } from "./deletion.js";
+import { type UnifiedDiff, runDiff } from "./diff.js";
 import {
   KernelError,
   docNotFound,
@@ -82,6 +83,13 @@ export type Kernel = {
     get(actor: Actor, repo: string, path: string): Version;
     get_version(actor: Actor, repo: string, version_id: string): Version;
     history(actor: Actor, repo: string, path: string, opts?: HistoryOptions): Version[];
+    diff(
+      actor: Actor,
+      repo: string,
+      path: string,
+      from_version_id: string,
+      to_version_id: string,
+    ): UnifiedDiff;
     create(
       actor: Actor,
       repo: string,
@@ -447,6 +455,24 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
         if (!current) throw docNotFound(repoSlug, path);
         const rows = storage.version_history(current.document_id, opts);
         return rows.map((r) => toVersionWire(r, repoSlug));
+      },
+
+      diff(actor, repoSlug, path, fromVersionId, toVersionId) {
+        return runDiff(
+          actor,
+          {
+            repo: repoSlug,
+            path,
+            from_version_id: fromVersionId,
+            to_version_id: toVersionId,
+          },
+          {
+            storage,
+            resolveReadRepo: (a, slug) => resolveRepo(a, slug, "read"),
+            authorizeReadPath: (a, repo_id, p) =>
+              authorize(a, "read", { kind: "path", repo_id, path: p }),
+          },
+        );
       },
 
       create(actor, repoSlug, path, input) {

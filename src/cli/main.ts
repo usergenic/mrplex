@@ -534,6 +534,26 @@ function buildProgram(): Command {
     });
 
   docs
+    .command("diff <repo> <path>")
+    .description("unified diff between two versions of a document (§4.3)")
+    .requiredOption("--from <version-id>", "source version id")
+    .requiredOption("--to <version-id>", "target version id")
+    .action(function (this: Command, repo: string, path: string) {
+      const localOpts = this.opts<{ from: string; to: string }>();
+      withClient(this, async (client, opts) => {
+        const result = await client.docs.diff(repo, path, localOpts.from, localOpts.to);
+        if (opts.json) {
+          process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+        } else {
+          // Raw patch on stdout for `patch -p0`-friendly piping.
+          process.stdout.write(
+            result.patch.endsWith("\n") ? result.patch : `${result.patch}\n`,
+          );
+        }
+      }).catch(reportError);
+    });
+
+  docs
     .command("create <repo> <path>")
     .description("create a new document (fails if the path is taken)")
     .option("--from-file <file>", "read the markdown from a file or '-' for stdin")

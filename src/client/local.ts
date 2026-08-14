@@ -83,6 +83,8 @@ function buildClient(kernel: Kernel, actor: Actor, storage: Storage): KernelClie
       get: (repo, path) => async(() => kernel.docs.get(actor, repo, path)),
       get_version: (repo, vid) => async(() => kernel.docs.get_version(actor, repo, vid)),
       history: (repo, path, opts) => async(() => kernel.docs.history(actor, repo, path, opts)),
+      diff: (repo, path, from, to) =>
+        async(() => kernel.docs.diff(actor, repo, path, from, to)),
       create: (repo, path, input) => async(() => kernel.docs.create(actor, repo, path, input)),
       put: (repo, prev, path, input) =>
         async(() => kernel.docs.put(actor, repo, prev, path, input)),

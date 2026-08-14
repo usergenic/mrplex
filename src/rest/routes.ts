@@ -359,6 +359,35 @@ async function dispatchRepos(
     return;
   }
 
+  // /repos/{repo}/diff/{path...}?from=&to=  — M4 (§6.3)
+  if (segments[2] === "diff") {
+    if (method !== "GET") return methodNotAllowed(res, method, ["GET"]);
+    const pathSegs = segments.slice(3);
+    if (pathSegs.length === 0) return notFound(res);
+    const path = pathSegs.join("/");
+    const from = query.get("from");
+    const to = query.get("to");
+    if (from === null || to === null) {
+      // Missing required query params — 400 with a clear body.
+      writeJson(res, 400, {
+        code: "filter_invalid",
+        data: { reason: "diff requires `from` and `to` query parameters (version ids)" },
+      });
+      return;
+    }
+    const d = kernel.docs.diff(actor, repoSlug, path, from, to);
+    // Content negotiation: Accept: text/plain → raw patch, else JSON.
+    const accept = (req.headers.accept as string | undefined) ?? "application/json";
+    if (accept.includes("text/plain")) {
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "text/plain; charset=utf-8");
+      res.end(d.patch);
+      return;
+    }
+    writeJson(res, 200, d);
+    return;
+  }
+
   notFound(res);
 }
 
