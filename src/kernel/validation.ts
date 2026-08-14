@@ -57,27 +57,17 @@ const pathInvalid = (path: string, segment: string, reason: string) =>
 // -----------------------------------------------------------------------------
 
 function isReservedSegment(segment: string): boolean {
-  return (
-    segment === EMPTY_SEGMENT ||
-    segment === CURRENT_SEGMENT ||
-    segment === PARENT_SEGMENT
-  );
+  return segment === EMPTY_SEGMENT || segment === CURRENT_SEGMENT || segment === PARENT_SEGMENT;
 }
 
-function containsDisallowedChar(
-  segment: string,
-  disallowed: readonly string[],
-): string | null {
+function containsDisallowedChar(segment: string, disallowed: readonly string[]): string | null {
   for (const ch of disallowed) {
     if (segment.includes(ch)) return ch;
   }
   return null;
 }
 
-function startsWithAnySigil(
-  segment: string,
-  sigils: readonly string[],
-): string | null {
+function startsWithAnySigil(segment: string, sigils: readonly string[]): string | null {
   for (const sigil of sigils) {
     if (segment.startsWith(sigil)) return sigil;
   }

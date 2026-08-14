@@ -8,7 +8,7 @@
  */
 
 import { Command, InvalidArgumentError, Option } from "commander";
-import { SYSTEM_ACTOR } from "../kernel/actor.js";
+import { SYSTEM_ACTOR } from "../kernel/auth/actor.js";
 import { KernelError } from "../kernel/errors.js";
 import { createKernel } from "../kernel/kernel.js";
 import type { Kernel } from "../kernel/kernel.js";

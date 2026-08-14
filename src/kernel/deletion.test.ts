@@ -47,9 +47,7 @@ describe("deletionPath", () => {
     expect(deletionPath("#", "foo.md", "v1")).toBe("#deleted/foo-v1.md");
   });
   it("honors a multi-character system sigil", () => {
-    expect(deletionPath("__sys_", "notes/hello.md", "v1")).toBe(
-      "__sys_deleted/notes/hello-v1.md",
-    );
+    expect(deletionPath("__sys_", "notes/hello.md", "v1")).toBe("__sys_deleted/notes/hello-v1.md");
   });
   it("preserves extension terminality for a dotfile", () => {
     expect(deletionPath(":", ".gitignore", "v1")).toBe(":deleted/.gitignore-v1");

@@ -7,6 +7,8 @@ import type {
   RepoRow,
   Storage,
   StorageAdapter,
+  TokenInsertInput,
+  TokenRow,
   UserRow,
   VersionInsertInput,
   VersionRow,
@@ -286,6 +288,95 @@ class SqliteStorage implements Storage {
       )
       .all(...params) as VersionRawRow[];
     return rows.map(hydrateVersion);
+  }
+
+  // Tokens (design §3.2, §8). SQLite has no boolean, so `admin` stores 0/1.
+  // `tokens_by_hash` / `tokens_list` filter out revoked and expired rows here
+  // so the kernel never has to remember.
+  tokens_create(input: TokenInsertInput): TokenRow {
+    return this.db
+      .prepare(
+        `insert into api_tokens
+           (user_id, secret_hash, label, scopes, admin,
+            expires_at, revoked_at, created_at, last_used_at)
+         values (?, ?, ?, ?, ?, ?, null, ?, null)
+         returning id, user_id, secret_hash, label, scopes,
+                   admin, expires_at, revoked_at, created_at, last_used_at`,
+      )
+      .get(
+        input.user_id,
+        input.secret_hash,
+        input.label,
+        input.scopes,
+        input.admin ? 1 : 0,
+        input.expires_at,
+        input.created_at,
+      ) as TokenRow;
+  }
+
+  tokens_by_hash(hash: string): TokenRow | null {
+    // Filter revoked + expired at read time.
+    return (
+      (this.db
+        .prepare(
+          `select id, user_id, secret_hash, label, scopes,
+                  admin, expires_at, revoked_at, created_at, last_used_at
+             from api_tokens
+             where secret_hash = ?
+               and revoked_at is null
+               and (expires_at is null or expires_at > ?)`,
+        )
+        .get(hash, new Date().toISOString()) as TokenRow | undefined) ?? null
+    );
+  }
+
+  tokens_by_id(id: number): TokenRow | null {
+    return (
+      (this.db
+        .prepare(
+          `select id, user_id, secret_hash, label, scopes,
+                  admin, expires_at, revoked_at, created_at, last_used_at
+             from api_tokens where id = ?`,
+        )
+        .get(id) as TokenRow | undefined) ?? null
+    );
+  }
+
+  tokens_list(user_id: number): TokenRow[] {
+    return this.db
+      .prepare(
+        `select id, user_id, secret_hash, label, scopes,
+                admin, expires_at, revoked_at, created_at, last_used_at
+           from api_tokens
+           where user_id = ?
+           order by created_at desc, id desc`,
+      )
+      .all(user_id) as TokenRow[];
+  }
+
+  tokens_revoke(id: number, revoked_at: string): TokenRow | null {
+    const row = this.db
+      .prepare(
+        `update api_tokens set revoked_at = coalesce(revoked_at, ?)
+           where id = ?
+         returning id, user_id, secret_hash, label, scopes,
+                   admin, expires_at, revoked_at, created_at, last_used_at`,
+      )
+      .get(revoked_at, id) as TokenRow | undefined;
+    return row ?? null;
+  }
+
+  tokens_revoke_by_user(user_id: number, revoked_at: string): void {
+    this.db
+      .prepare("update api_tokens set revoked_at = coalesce(revoked_at, ?) where user_id = ?")
+      .run(revoked_at, user_id);
+  }
+
+  tokens_touch_last_used(id: number, when: string): void {
+    // §8.5: best-effort, non-transactional. If we're inside a tx, it'll still
+    // get committed with the rest — that's fine, this is a "cheap enough"
+    // update on the hot auth path.
+    this.db.prepare("update api_tokens set last_used_at = ? where id = ?").run(when, id);
   }
 }
 

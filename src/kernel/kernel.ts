@@ -8,7 +8,8 @@
  */
 
 import type { Storage, VersionRow } from "../storage/types.js";
-import { type Action, type Actor, type Target, authorize } from "./actor.js";
+import type { Action, Actor, Target } from "./auth/actor.js";
+import { authorize } from "./auth/authorize.js";
 import { KernelError, docNotFound, repoNotFound, versionNotFound } from "./errors.js";
 import { decodeVersionId, encodeVersionId } from "./version-id.js";
 import type { Repo, User, Version } from "./wire.js";

@@ -57,6 +57,33 @@ export type HistoryOptions = {
   before?: string; // ISO 8601 UTC
 };
 
+/**
+ * Row shape for api_tokens (see design §3.2 and §8). `scopes` is the JSON
+ * text as stored; parsing to StoredScope[] happens at the kernel layer.
+ */
+export type TokenRow = {
+  id: number;
+  user_id: number;
+  secret_hash: string;
+  label: string | null;
+  scopes: string; // JSON text — kernel parses to StoredScope[]
+  admin: number; // 0 | 1 (SQLite has no native boolean)
+  expires_at: string | null;
+  revoked_at: string | null;
+  created_at: string;
+  last_used_at: string | null;
+};
+
+export type TokenInsertInput = {
+  user_id: number;
+  secret_hash: string;
+  label: string | null;
+  scopes: string; // pre-serialized JSON
+  admin: boolean;
+  expires_at: string | null;
+  created_at: string;
+};
+
 export type Storage = {
   close(): void;
   migrate(): void;
@@ -88,6 +115,18 @@ export type Storage = {
   version_by_id(id: number): VersionRow | null;
   version_current(repo_id: number, path: string): VersionRow | null;
   version_history(document_id: number, opts?: HistoryOptions): VersionRow[];
+
+  // Tokens (design §3.2, §8). All queries return null / empty for
+  // revoked or expired rows — the adapter does the filter so the kernel
+  // never has to remember.
+  tokens_create(input: TokenInsertInput): TokenRow;
+  tokens_by_hash(hash: string): TokenRow | null;
+  tokens_by_id(id: number): TokenRow | null;
+  tokens_list(user_id: number): TokenRow[];
+  tokens_revoke(id: number, revoked_at: string): TokenRow | null;
+  tokens_revoke_by_user(user_id: number, revoked_at: string): void;
+  /** Opportunistic, non-transactional per §8.5. */
+  tokens_touch_last_used(id: number, when: string): void;
 };
 
 export type OpenConfig = {

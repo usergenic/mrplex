@@ -6,7 +6,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { SYSTEM_ACTOR } from "../src/kernel/actor.js";
+import { SYSTEM_ACTOR } from "../src/kernel/auth/actor.js";
 import { KernelError } from "../src/kernel/errors.js";
 import { type Kernel, createKernel } from "../src/kernel/kernel.js";
 import type { Storage } from "../src/storage/types.js";

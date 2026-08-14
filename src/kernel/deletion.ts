@@ -80,10 +80,7 @@ export function deletionPath(
  * (The design-wide primitive lives in validation.pathHasSigilSegment; this
  * shim keeps the naming intent-facing at the call site.)
  */
-export function pathIsInSystemNamespace(
-  path: string,
-  systemSigils: readonly string[],
-): boolean {
+export function pathIsInSystemNamespace(path: string, systemSigils: readonly string[]): boolean {
   if (path === "") return false;
   const segments = path.split(PATH_SEPARATOR);
   for (const segment of segments) {
