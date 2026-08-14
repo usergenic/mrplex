@@ -24,6 +24,7 @@
   "dependencies": {
     "@bufbuild/cel": "^0.6.0",
     "@bufbuild/re2": "^0.6.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "better-sqlite3": "^11.5.0",
     "commander": "^12.1.0",
     "yaml": "^2.6.0"

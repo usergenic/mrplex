@@ -17,6 +17,7 @@ import { dirname, join } from "node:path";
 
 export type CliConfig = {
   database?: string;
+  server?: string;
   token?: string;
 };
 

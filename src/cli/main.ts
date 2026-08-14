@@ -1,23 +1,28 @@
 #!/usr/bin/env node
 /**
- * mrplex CLI (M1 — reads + writes + tokens + bootstrap + config).
+ * mrplex CLI (M3 — reads + writes + tokens + bootstrap + config + serve +
+ * remote mode).
  *
- * Design §7.3 says the CLI is a thin client over MCP; in M1 it talks to the
- * in-process kernel against a local SQLite file. --server support arrives
- * in M3 with the MCP surface.
+ * The CLI is a thin client over the MCP surface (§7.3). When `--server` is
+ * set, commands drive `tools/call` against `<server>/mcp`; otherwise the CLI
+ * opens the local SQLite file and calls the kernel in-process. The
+ * transport seam is `KernelClient` (`src/client/*`).
+ *
+ * Bootstrap and serve deliberately bypass the seam — bootstrap creates the
+ * first token before any auth exists, and serve IS the server.
  */
 
 import { readFileSync } from "node:fs";
 import { Command, InvalidArgumentError, Option } from "commander";
-import type { Actor } from "../kernel/auth/actor.js";
+import type { KernelClient } from "../client/kernel-client.js";
+import { openLocalClient } from "../client/local.js";
+import { openRemoteClient } from "../client/remote-mcp.js";
 import type { ScopeInput } from "../kernel/auth/scope.js";
 import { KernelError } from "../kernel/errors.js";
-import { createKernel } from "../kernel/kernel.js";
-import type { Kernel } from "../kernel/kernel.js";
 import { split as splitFrontmatter } from "../markdown/frontmatter.js";
-import { sqliteAdapter } from "../storage-sqlite/adapter.js";
-import type { Storage } from "../storage/types.js";
-import { resolveCliActor } from "./auth.js";
+import { startMcpStdio } from "../mcp/server.js";
+import { startServer } from "../server/serve.js";
+import { resolveTokenString } from "./auth.js";
 import { type BootstrapError, bootstrap } from "./bootstrap.js";
 import { type CliConfig, loadConfig, saveConfig } from "./config.js";
 import { exitCodeForKernelError } from "./exit-codes.js";
@@ -45,18 +50,7 @@ function parsePositiveInt(value: string, _prev: unknown): number {
 }
 
 /**
- * Parse a --scope value into a ScopeInput.
- *
- *   <slug-or-glob>:<action>=<glob>[|<glob>...][,<action>=<glob>[|<glob>...]]
- *
- * Actions are `read` and `write`. Multiple globs WITHIN one action are
- * `|`-separated (comma would collide with the action separator); multiple
- * actions are comma-separated. Pass --scope multiple times to stack.
- *
- * e.g. `notes:read=**,write=inbox/**`
- *      `team-*:read=**`
- *      `*:read=**,write=**`
- *      `notes:write=drafts/**|!drafts/pinned/**`
+ * Parse a --scope value into a ScopeInput. See M1 for the grammar.
  */
 function parseScope(value: string, prev: ScopeInput[] | undefined): ScopeInput[] {
   const [repoPart, ...capParts] = value.split(":");
@@ -86,7 +80,12 @@ function parseScope(value: string, prev: ScopeInput[] | undefined): ScopeInput[]
   return [...(prev ?? []), scope];
 }
 
-type GlobalOpts = { database?: string; json?: boolean; token?: string };
+type GlobalOpts = {
+  database?: string;
+  json?: boolean;
+  token?: string;
+  server?: string;
+};
 
 function resolveDatabase(opts: GlobalOpts): string {
   const cfg = loadConfig();
@@ -95,27 +94,54 @@ function resolveDatabase(opts: GlobalOpts): string {
   return value.startsWith("sqlite:") || value.startsWith("postgres:") ? value : `sqlite:${value}`;
 }
 
-function openStorage(opts: GlobalOpts): Storage {
-  return sqliteAdapter.open({ database: resolveDatabase(opts) });
+function resolveServer(opts: GlobalOpts): string | undefined {
+  const cfg = loadConfig();
+  const value = opts.server ?? process.env.MRPLEX_SERVER ?? cfg.server;
+  return value;
 }
 
 /**
- * Run a callback with an open storage + kernel + resolved Actor. Handles
- * the whole lifecycle including close-on-throw. Kernel commands go
- * through this.
+ * Open the right KernelClient — remote if `--server` (or MRPLEX_SERVER / config
+ * `server`) is set, otherwise the local in-process client. Enforces the
+ * m3-plan decision that --database and --server are mutually exclusive.
  */
-function withActorAndKernel<T>(
+async function openClient(opts: GlobalOpts): Promise<KernelClient> {
+  const server = resolveServer(opts);
+  const hasExplicitDatabase =
+    opts.database !== undefined || process.env.MRPLEX_DATABASE !== undefined;
+  if (server && hasExplicitDatabase) {
+    const err = new Error("--database and --server are mutually exclusive; pick one");
+    (err as unknown as { code: string }).code = "cli_conflict";
+    throw err;
+  }
+  const secret = resolveTokenString(opts.token);
+  if (secret === null) {
+    throw makeUnauthorized(
+      "no token — set MRPLEX_TOKEN, use --token, or `mrplex config set-token`",
+    );
+  }
+  if (server) {
+    return openRemoteClient({ server, token: secret });
+  }
+  return openLocalClient({ database: resolveDatabase(opts), token: secret });
+}
+
+function makeUnauthorized(reason: string): Error {
+  const err = new Error(`unauthorized: ${reason}`);
+  (err as unknown as { code: string }).code = "unauthorized";
+  return err;
+}
+
+async function withClient<T>(
   cmd: Command,
-  fn: (kernel: Kernel, actor: Actor, opts: GlobalOpts) => T,
-): T {
+  fn: (client: KernelClient, opts: GlobalOpts) => Promise<T>,
+): Promise<T> {
   const opts = cmd.optsWithGlobals<GlobalOpts>();
-  const storage = openStorage(opts);
+  const client = await openClient(opts);
   try {
-    const actor = resolveCliActor(opts.token, storage);
-    const kernel = createKernel(storage);
-    return fn(kernel, actor, opts);
+    return await fn(client, opts);
   } finally {
-    storage.close();
+    await client.close();
   }
 }
 
@@ -134,20 +160,23 @@ function reportError(err: unknown): never {
     process.stderr.write(`${JSON.stringify(payload)}\n`);
     process.exit(exitCodeForKernelError(err.code));
   }
-  // CLI-side unauthorized (bearer resolve failed) → exit family 3.
   const code = (err as { code?: string }).code;
   if (code === "unauthorized") {
     process.stderr.write(`${JSON.stringify({ code, data: {} })}\n`);
     process.exit(3);
   }
+  if (code === "network") {
+    process.stderr.write(`${(err as Error).message}\n`);
+    process.exit(10);
+  }
+  if (code === "cli_conflict") {
+    process.stderr.write(`${(err as Error).message}\n`);
+    process.exit(1);
+  }
   process.stderr.write(`${(err as Error).message}\n`);
   process.exit(1);
 }
 
-/**
- * Read the content of --from-file, or stdin if the arg is "-".
- * Returns the raw file bytes as a UTF-8 string.
- */
 function readFromFile(pathOrDash: string): string {
   if (pathOrDash === "-") {
     return readFileSync(0, "utf8"); // fd 0 = stdin
@@ -155,10 +184,6 @@ function readFromFile(pathOrDash: string): string {
   return readFileSync(pathOrDash, "utf8");
 }
 
-/**
- * Split a markdown file (from disk or stdin) into { frontmatter_raw, body }.
- * Kept CLI-side so submissions travel over the wire byte-verbatim (§3.2).
- */
 function readDocumentInput(fromFile: string | undefined): {
   frontmatter_raw: string;
   body: string;
@@ -169,10 +194,6 @@ function readDocumentInput(fromFile: string | undefined): {
   return splitFrontmatter(readFromFile(fromFile));
 }
 
-/**
- * Print the write result — new version_id on stdout for scripting, envelope
- * summary on stderr for humans. --json overrides to full envelope on stdout.
- */
 function emitVersionWrite(
   result: { version_id: string; repo: string; path: string; author: { user: string } },
   opts: GlobalOpts,
@@ -194,12 +215,17 @@ function emitVersionWrite(
 function buildProgram(): Command {
   const program = new Command()
     .name("mrplex")
-    .description("Markdown Repos, plexed — CLI (M1)")
+    .description("Markdown Repos, plexed — CLI (M3)")
     .version("0.0.0")
     .addOption(
       new Option("--database <url>", "sqlite:./path.db or postgres://…").env("MRPLEX_DATABASE"),
     )
     .addOption(new Option("--token <token>", "bearer token").env("MRPLEX_TOKEN"))
+    .addOption(
+      new Option("--server <url>", "talk to a remote mrplex server (mutex with --database)").env(
+        "MRPLEX_SERVER",
+      ),
+    )
     .option("--json", "emit raw JSON instead of pretty output", false)
     .exitOverride((err) => {
       if (err.exitCode === 0) process.exit(0);
@@ -231,6 +257,60 @@ function buildProgram(): Command {
       }
     });
 
+  // -------- serve --------
+  program
+    .command("serve")
+    .description("start HTTP surfaces (REST + MCP Streamable HTTP) — §7.3")
+    .option("--port <n>", "TCP port (default 8321)", parsePositiveInt)
+    .option("--host <h>", "bind host (default 127.0.0.1)")
+    .option("--mcp-stdio", "also expose MCP over STDIO for the launch token", false)
+    .action(function (this: Command) {
+      const gopts = this.optsWithGlobals<GlobalOpts>();
+      const localOpts = this.opts<{ port?: number; host?: string; mcpStdio: boolean }>();
+      (async () => {
+        try {
+          const database = resolveDatabase(gopts);
+          const handle = await startServer({
+            database,
+            host: localOpts.host,
+            port: localOpts.port,
+          });
+
+          // Optional STDIO — bound to the launch-time token per §6.2.
+          if (localOpts.mcpStdio) {
+            const secret = resolveTokenString(gopts.token);
+            if (secret === null) {
+              process.stderr.write(
+                "mrplex: --mcp-stdio requires a token (--token / MRPLEX_TOKEN / config)\n",
+              );
+              await handle.close();
+              process.exit(3);
+            }
+            try {
+              await startMcpStdio({
+                kernel: handle.kernel,
+                storage: handle.storage,
+                token: secret,
+              });
+            } catch (err) {
+              process.stderr.write(`mrplex: --mcp-stdio failed: ${(err as Error).message}\n`);
+              await handle.close();
+              process.exit(3);
+            }
+          }
+
+          const shutdown = async () => {
+            await handle.close();
+            process.exit(0);
+          };
+          process.on("SIGINT", () => void shutdown());
+          process.on("SIGTERM", () => void shutdown());
+        } catch (err) {
+          reportError(err);
+        }
+      })();
+    });
+
   // -------- config --------
   const cfg = program.command("config").description("local CLI config");
   cfg
@@ -250,6 +330,14 @@ function buildProgram(): Command {
       process.stderr.write("config: token set (chmod 600)\n");
     });
   cfg
+    .command("set-server <url>")
+    .description("write the default --server URL to the CLI config")
+    .action((url: string) => {
+      const c: CliConfig = { ...loadConfig(), server: url };
+      saveConfig(c);
+      process.stderr.write("config: server set\n");
+    });
+  cfg
     .command("show")
     .description("print the current CLI config")
     .action(function (this: Command) {
@@ -259,7 +347,7 @@ function buildProgram(): Command {
         process.stdout.write(`${JSON.stringify(c, null, 2)}\n`);
       } else {
         process.stdout.write(
-          `database: ${c.database ?? "(unset)"}\ntoken:    ${c.token ? "(set)" : "(unset)"}\n`,
+          `database: ${c.database ?? "(unset)"}\nserver:   ${c.server ?? "(unset)"}\ntoken:    ${c.token ? "(set)" : "(unset)"}\n`,
         );
       }
     });
@@ -272,72 +360,54 @@ function buildProgram(): Command {
     .option("--include-system", "include system-namespaced repos (§3.4)", false)
     .action(function (this: Command) {
       const localOpts = this.opts<{ includeSystem: boolean }>();
-      try {
-        const result = withActorAndKernel(this, (kernel, actor) =>
-          kernel.repos.list(actor, { include_system: localOpts.includeSystem }),
-        );
-        emit(result, this.optsWithGlobals(), renderReposTable(result));
-      } catch (err) {
-        reportError(err);
-      }
+      withClient(this, async (client, opts) => {
+        const result = await client.repos.list({ include_system: localOpts.includeSystem });
+        emit(result, opts, renderReposTable(result));
+      }).catch(reportError);
     });
 
   repos
     .command("get <slug>")
     .description("show a repo")
     .action(function (this: Command, slug: string) {
-      try {
-        const result = withActorAndKernel(this, (kernel, actor) => kernel.repos.get(actor, slug));
+      withClient(this, async (client, opts) => {
+        const result = await client.repos.get(slug);
         emit(
           result,
-          this.optsWithGlobals(),
+          opts,
           `${result.repo}  ${result.path_config ? "(custom path_config)" : "(default path_config)"}`,
         );
-      } catch (err) {
-        reportError(err);
-      }
+      }).catch(reportError);
     });
 
   repos
     .command("create <slug>")
     .description("create a new repo (admin)")
     .action(function (this: Command, slug: string) {
-      try {
-        const result = withActorAndKernel(this, (kernel, actor) =>
-          kernel.repos.create(actor, slug),
-        );
-        emit(result, this.optsWithGlobals(), `created repo ${result.repo}`);
-      } catch (err) {
-        reportError(err);
-      }
+      withClient(this, async (client, opts) => {
+        const result = await client.repos.create(slug);
+        emit(result, opts, `created repo ${result.repo}`);
+      }).catch(reportError);
     });
 
   repos
     .command("rename <slug> <new-slug>")
     .description("rename a repo (admin)")
     .action(function (this: Command, slug: string, newSlug: string) {
-      try {
-        const result = withActorAndKernel(this, (kernel, actor) =>
-          kernel.repos.rename(actor, slug, newSlug),
-        );
-        emit(result, this.optsWithGlobals(), `renamed ${slug} → ${result.repo}`);
-      } catch (err) {
-        reportError(err);
-      }
+      withClient(this, async (client, opts) => {
+        const result = await client.repos.rename(slug, newSlug);
+        emit(result, opts, `renamed ${slug} → ${result.repo}`);
+      }).catch(reportError);
     });
 
   repos
     .command("delete <slug>")
     .description("delete a repo — renames slug into the system namespace (admin)")
     .action(function (this: Command, slug: string) {
-      try {
-        const result = withActorAndKernel(this, (kernel, actor) =>
-          kernel.repos.delete(actor, slug),
-        );
-        emit(result, this.optsWithGlobals(), `deleted (now ${result.repo})`);
-      } catch (err) {
-        reportError(err);
-      }
+      withClient(this, async (client, opts) => {
+        const result = await client.repos.delete(slug);
+        emit(result, opts, `deleted (now ${result.repo})`);
+      }).catch(reportError);
     });
 
   repos
@@ -347,21 +417,13 @@ function buildProgram(): Command {
     .option("--clear", "clear the override — inherit from server config", false)
     .action(function (this: Command, slug: string) {
       const localOpts = this.opts<{ fromFile?: string; clear: boolean }>();
-      try {
+      withClient(this, async (client, opts) => {
         const config = localOpts.clear
           ? null
           : (JSON.parse(readFromFile(localOpts.fromFile ?? "-")) as never);
-        const result = withActorAndKernel(this, (kernel, actor) =>
-          kernel.repos.set_path_config(actor, slug, config),
-        );
-        emit(
-          result,
-          this.optsWithGlobals(),
-          `updated ${slug}\nwarnings: ${result.warnings.length}`,
-        );
-      } catch (err) {
-        reportError(err);
-      }
+        const result = await client.repos.set_path_config(slug, config);
+        emit(result, opts, `updated ${slug}\nwarnings: ${result.warnings.length}`);
+      }).catch(reportError);
     });
 
   // -------- users --------
@@ -370,54 +432,40 @@ function buildProgram(): Command {
     .command("list")
     .description("list users")
     .action(function (this: Command) {
-      try {
-        const result = withActorAndKernel(this, (kernel, actor) => kernel.users.list(actor));
-        emit(result, this.optsWithGlobals(), renderUsersTable(result));
-      } catch (err) {
-        reportError(err);
-      }
+      withClient(this, async (client, opts) => {
+        const result = await client.users.list();
+        emit(result, opts, renderUsersTable(result));
+      }).catch(reportError);
     });
 
   users
     .command("create <slug>")
     .description("create a user (admin)")
     .action(function (this: Command, slug: string) {
-      try {
-        const result = withActorAndKernel(this, (kernel, actor) =>
-          kernel.users.create(actor, slug),
-        );
-        emit(result, this.optsWithGlobals(), `created user ${result.user}`);
-      } catch (err) {
-        reportError(err);
-      }
+      withClient(this, async (client, opts) => {
+        const result = await client.users.create(slug);
+        emit(result, opts, `created user ${result.user}`);
+      }).catch(reportError);
     });
 
   users
     .command("rename <slug> <new-slug>")
     .description("rename a user (admin)")
     .action(function (this: Command, slug: string, newSlug: string) {
-      try {
-        const result = withActorAndKernel(this, (kernel, actor) =>
-          kernel.users.rename(actor, slug, newSlug),
-        );
-        emit(result, this.optsWithGlobals(), `renamed ${slug} → ${result.user}`);
-      } catch (err) {
-        reportError(err);
-      }
+      withClient(this, async (client, opts) => {
+        const result = await client.users.rename(slug, newSlug);
+        emit(result, opts, `renamed ${slug} → ${result.user}`);
+      }).catch(reportError);
     });
 
   users
     .command("delete <slug>")
     .description("delete a user — system-namespace rename + revoke tokens (admin)")
     .action(function (this: Command, slug: string) {
-      try {
-        const result = withActorAndKernel(this, (kernel, actor) =>
-          kernel.users.delete(actor, slug),
-        );
-        emit(result, this.optsWithGlobals(), `deleted (now ${result.user})`);
-      } catch (err) {
-        reportError(err);
-      }
+      withClient(this, async (client, opts) => {
+        const result = await client.users.delete(slug);
+        emit(result, opts, `deleted (now ${result.user})`);
+      }).catch(reportError);
     });
 
   // -------- docs --------
@@ -426,28 +474,20 @@ function buildProgram(): Command {
     .command("get <repo> <path>")
     .description("read the current version at <path>")
     .action(function (this: Command, repo: string, path: string) {
-      try {
-        const result = withActorAndKernel(this, (kernel, actor) =>
-          kernel.docs.get(actor, repo, path),
-        );
-        emit(result, this.optsWithGlobals(), renderVersionAsMarkdown(result));
-      } catch (err) {
-        reportError(err);
-      }
+      withClient(this, async (client, opts) => {
+        const result = await client.docs.get(repo, path);
+        emit(result, opts, renderVersionAsMarkdown(result));
+      }).catch(reportError);
     });
 
   docs
     .command("get-version <repo> <version-id>")
     .description("read a specific version by id")
     .action(function (this: Command, repo: string, versionId: string) {
-      try {
-        const result = withActorAndKernel(this, (kernel, actor) =>
-          kernel.docs.get_version(actor, repo, versionId),
-        );
-        emit(result, this.optsWithGlobals(), renderVersionAsMarkdown(result));
-      } catch (err) {
-        reportError(err);
-      }
+      withClient(this, async (client, opts) => {
+        const result = await client.docs.get_version(repo, versionId);
+        emit(result, opts, renderVersionAsMarkdown(result));
+      }).catch(reportError);
     });
 
   docs
@@ -457,17 +497,13 @@ function buildProgram(): Command {
     .option("--before <ts>", "only versions with created_at < <ts>")
     .action(function (this: Command, repo: string, path: string) {
       const localOpts = this.opts<{ limit?: number; before?: string }>();
-      try {
-        const result = withActorAndKernel(this, (kernel, actor) =>
-          kernel.docs.history(actor, repo, path, {
-            limit: localOpts.limit,
-            before: localOpts.before,
-          }),
-        );
-        emit(result, this.optsWithGlobals(), renderHistoryTable(result));
-      } catch (err) {
-        reportError(err);
-      }
+      withClient(this, async (client, opts) => {
+        const result = await client.docs.history(repo, path, {
+          limit: localOpts.limit,
+          before: localOpts.before,
+        });
+        emit(result, opts, renderHistoryTable(result));
+      }).catch(reportError);
     });
 
   docs
@@ -476,15 +512,11 @@ function buildProgram(): Command {
     .option("--from-file <file>", "read the markdown from a file or '-' for stdin")
     .action(function (this: Command, repo: string, path: string) {
       const localOpts = this.opts<{ fromFile?: string }>();
-      try {
+      withClient(this, async (client, opts) => {
         const { frontmatter_raw, body } = readDocumentInput(localOpts.fromFile);
-        const result = withActorAndKernel(this, (kernel, actor) =>
-          kernel.docs.create(actor, repo, path, { frontmatter_raw, body }),
-        );
-        emitVersionWrite(result, this.optsWithGlobals());
-      } catch (err) {
-        reportError(err);
-      }
+        const result = await client.docs.create(repo, path, { frontmatter_raw, body });
+        emitVersionWrite(result, opts);
+      }).catch(reportError);
     });
 
   docs
@@ -494,23 +526,16 @@ function buildProgram(): Command {
     .option("--from-file <file>", "read the markdown from a file or '-' for stdin")
     .action(function (this: Command, repo: string, path: string) {
       const localOpts = this.opts<{ prev: string; fromFile?: string }>();
-      try {
-        const input: {
-          frontmatter_raw?: string;
-          body?: string;
-        } = {};
+      withClient(this, async (client, opts) => {
+        const input: { frontmatter_raw?: string; body?: string } = {};
         if (localOpts.fromFile) {
           const parsed = readDocumentInput(localOpts.fromFile);
           input.frontmatter_raw = parsed.frontmatter_raw;
           input.body = parsed.body;
         }
-        const result = withActorAndKernel(this, (kernel, actor) =>
-          kernel.docs.put(actor, repo, localOpts.prev, path, input),
-        );
-        emitVersionWrite(result, this.optsWithGlobals());
-      } catch (err) {
-        reportError(err);
-      }
+        const result = await client.docs.put(repo, localOpts.prev, path, input);
+        emitVersionWrite(result, opts);
+      }).catch(reportError);
     });
 
   docs
@@ -519,14 +544,10 @@ function buildProgram(): Command {
     .requiredOption("--prev <version-id>", "current version id (from get / history)")
     .action(function (this: Command, _repo: string, _path: string) {
       const localOpts = this.opts<{ prev: string }>();
-      try {
-        const result = withActorAndKernel(this, (kernel, actor) =>
-          kernel.docs.delete(actor, _repo, localOpts.prev),
-        );
-        emitVersionWrite(result, this.optsWithGlobals());
-      } catch (err) {
-        reportError(err);
-      }
+      withClient(this, async (client, opts) => {
+        const result = await client.docs.delete(_repo, localOpts.prev);
+        emitVersionWrite(result, opts);
+      }).catch(reportError);
     });
 
   docs
@@ -535,14 +556,10 @@ function buildProgram(): Command {
     .requiredOption("--prev <version-id>", "current version id (from get / history)")
     .action(function (this: Command, repo: string, _fromPath: string, toPath: string) {
       const localOpts = this.opts<{ prev: string }>();
-      try {
-        const result = withActorAndKernel(this, (kernel, actor) =>
-          kernel.docs.put(actor, repo, localOpts.prev, toPath, {}),
-        );
-        emitVersionWrite(result, this.optsWithGlobals());
-      } catch (err) {
-        reportError(err);
-      }
+      withClient(this, async (client, opts) => {
+        const result = await client.docs.put(repo, localOpts.prev, toPath, {});
+        emitVersionWrite(result, opts);
+      }).catch(reportError);
     });
 
   // -------- query --------
@@ -552,7 +569,6 @@ function buildProgram(): Command {
     .option(
       "--repo <slug-or-glob>",
       "repo slug or glob; repeat the flag to query multiple (default: all in scope)",
-      // Commander collector: accumulate into an array across repeated flags.
       (value: string, prev: string[] | undefined) => [...(prev ?? []), value],
     )
     .option("--filter <expr>", "CEL filter expression")
@@ -569,21 +585,17 @@ function buildProgram(): Command {
         includeHidden: boolean;
         includeSystem: boolean;
       }>();
-      try {
-        const result = withActorAndKernel(this, (kernel, actor) =>
-          kernel.query(actor, {
-            repo: localOpts.repo,
-            filter: localOpts.filter,
-            text: localOpts.text,
-            limit: localOpts.limit,
-            include_hidden: localOpts.includeHidden,
-            include_system: localOpts.includeSystem,
-          }),
-        );
-        emit(result, this.optsWithGlobals(), renderQueryTable(result));
-      } catch (err) {
-        reportError(err);
-      }
+      withClient(this, async (client, opts) => {
+        const result = await client.query({
+          repo: localOpts.repo,
+          filter: localOpts.filter,
+          text: localOpts.text,
+          limit: localOpts.limit,
+          include_hidden: localOpts.includeHidden,
+          include_system: localOpts.includeSystem,
+        });
+        emit(result, opts, renderQueryTable(result));
+      }).catch(reportError);
     });
 
   // -------- tokens --------
@@ -592,9 +604,8 @@ function buildProgram(): Command {
     .command("list")
     .description("list your tokens")
     .action(function (this: Command) {
-      try {
-        const result = withActorAndKernel(this, (kernel, actor) => kernel.tokens.list(actor));
-        // Pretty output: id / label / admin / expires_at
+      withClient(this, async (client, opts) => {
+        const result = await client.tokens.list();
         const pretty =
           result.length === 0
             ? "(no tokens)"
@@ -604,10 +615,8 @@ function buildProgram(): Command {
                     `${t.id}  ${t.admin ? "[admin] " : "        "}${t.label ?? ""}${t.expires_at ? `  expires: ${t.expires_at}` : ""}`,
                 )
                 .join("\n");
-        emit(result, this.optsWithGlobals(), pretty);
-      } catch (err) {
-        reportError(err);
-      }
+        emit(result, opts, pretty);
+      }).catch(reportError);
     });
 
   tokens
@@ -624,40 +633,30 @@ function buildProgram(): Command {
         admin: boolean;
         expires?: string;
       }>();
-      try {
-        const result = withActorAndKernel(this, (kernel, actor) =>
-          kernel.tokens.create(actor, localOpts.label, localOpts.scope, {
-            admin: localOpts.admin,
-            expires_at: localOpts.expires ?? null,
-          }),
-        );
-        const opts = this.optsWithGlobals<GlobalOpts>();
+      withClient(this, async (client, opts) => {
+        const result = await client.tokens.create(localOpts.label, localOpts.scope, {
+          admin: localOpts.admin,
+          expires_at: localOpts.expires ?? null,
+        });
         if (opts.json) {
           process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
         } else {
-          // Plaintext secret on stdout (scriptable); meta on stderr.
           process.stdout.write(`${result.token}\n`);
           process.stderr.write(
-            `created token ${result.meta.id} (${result.meta.label})${result.meta.admin ? " [admin]" : ""}\n`,
+            `created token ${result.meta.id} (${result.meta.label ?? ""})${result.meta.admin ? " [admin]" : ""}\n`,
           );
         }
-      } catch (err) {
-        reportError(err);
-      }
+      }).catch(reportError);
     });
 
   tokens
     .command("revoke <token-id>")
     .description("revoke a token (self, or any if admin)")
     .action(function (this: Command, tokenId: string) {
-      try {
-        const result = withActorAndKernel(this, (kernel, actor) =>
-          kernel.tokens.revoke(actor, tokenId),
-        );
-        emit(result, this.optsWithGlobals(), `revoked ${result.id}`);
-      } catch (err) {
-        reportError(err);
-      }
+      withClient(this, async (client, opts) => {
+        const result = await client.tokens.revoke(tokenId);
+        emit(result, opts, `revoked ${result.id}`);
+      }).catch(reportError);
     });
 
   return program;
