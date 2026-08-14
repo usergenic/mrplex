@@ -6,8 +6,10 @@
  * parts (multi-segment `{path}` params and header-driven dispatch) aren't
  * framework strengths.
  *
- * Every non-2xx response body is `{ code, data }` — verbatim from the
- * kernel error (§6.3). 500s fall back to `{ code: "internal_error" }`.
+ * Every non-2xx response body is `{ code, data }`. Kernel errors carry
+ * their catalog code (§6.3); HTTP-only dispatch outcomes use surface-only
+ * codes (`method_not_allowed`, `no_route`); uncaught throwables fall back
+ * to `{ code: "internal_error" }` on 500.
  */
 
 import { createHash } from "node:crypto";
@@ -19,7 +21,7 @@ import type { Kernel } from "../kernel/kernel.js";
 import type { PathConfigOverride } from "../kernel/path-config.js";
 import type { QuerySpec } from "../kernel/query/query.js";
 import type { Version } from "../kernel/wire.js";
-import { actorFromRequest, extractBearerFromHeader } from "../server/auth.js";
+import { actorFromRequest } from "../server/auth.js";
 import { httpErrorForThrowable } from "../server/http-error.js";
 import type { Storage } from "../storage/types.js";
 import { etagOf, parseIfMatch, parseIfNoneMatch } from "./conditional.js";
@@ -56,8 +58,20 @@ function parseUrl(reqUrl: string): ParsedUrl {
   // Strip leading slash, then split. Empty leading segment (from `/`) is
   // dropped; trailing `/` becomes a trailing empty segment we also drop.
   const raw = path.replace(/^\//, "").replace(/\/$/, "");
-  const segments = raw === "" ? [] : raw.split("/").map((s) => decodeURIComponent(s));
+  // decodeURIComponent throws URIError on malformed input (e.g. "/repos/%E0%A4%A");
+  // treat that as a client-side path_invalid rather than letting it bubble to 500.
+  const segments = raw === "" ? [] : raw.split("/").map(decodeSegment);
   return { segments, query: u.searchParams };
+}
+
+function decodeSegment(s: string): string {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    throw new KernelError("path_invalid", {
+      reason: "malformed percent-encoding in URL segment",
+    });
+  }
 }
 
 // -----------------------------------------------------------------------------
@@ -70,16 +84,31 @@ async function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let total = 0;
+    let capped = false;
     req.on("data", (chunk: Buffer) => {
+      if (capped) return;
       total += chunk.length;
       if (total > MAX_BODY_BYTES) {
-        reject(new Error("request body too large"));
+        capped = true;
+        // Destroy the socket so we don't keep receiving bytes we've decided
+        // to reject — otherwise a hostile client could stream indefinitely.
+        req.destroy();
+        reject(
+          new KernelError("payload_too_large", {
+            reason: `body exceeded ${MAX_BODY_BYTES} bytes`,
+            limit: MAX_BODY_BYTES,
+          }),
+        );
         return;
       }
       chunks.push(chunk);
     });
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-    req.on("error", reject);
+    req.on("end", () => {
+      if (!capped) resolve(Buffer.concat(chunks).toString("utf8"));
+    });
+    req.on("error", (err) => {
+      if (!capped) reject(err);
+    });
   });
 }
 
@@ -88,7 +117,9 @@ function parseJsonBody(raw: string): unknown {
   try {
     return JSON.parse(raw);
   } catch {
-    throw new KernelError("frontmatter_invalid", { reason: "request body is not valid JSON" });
+    // filter_invalid is the general "malformed input" bucket at the wire
+    // layer; distinct from frontmatter_invalid (§4.3), which is YAML-only.
+    throw new KernelError("filter_invalid", { reason: "request body is not valid JSON" });
   }
 }
 
@@ -143,10 +174,10 @@ function writeError(res: ServerResponse, err: unknown): void {
   writeJson(res, httpErr.status, httpErr.body, headers);
 }
 
-/** Missing precondition per m3-plan decision 5. */
+/** Missing precondition per m3-plan decision 5 / design §6.3. */
 function writePreconditionRequired(res: ServerResponse, reason: string): void {
   writeJson(res, 428, {
-    code: "frontmatter_invalid",
+    code: "precondition_required",
     data: { reason },
   });
 }
@@ -220,7 +251,7 @@ async function dispatch(
     return dispatchRepos(req, res, kernel, storage, segments, query, method);
   }
 
-  writeJson(res, 404, { code: "internal_error", data: { reason: "no route" } });
+  notFound(res);
 }
 
 // -----------------------------------------------------------------------------
@@ -363,7 +394,12 @@ async function dispatchDocs(
 
     const ct = chooseDocWriteContentType(req.headers["content-type"] as string | undefined);
     const raw = await readBody(req);
-    let input: { frontmatter?: unknown; frontmatter_raw?: string; body: string };
+    // input.body distinguishes three states:
+    //   • string ("" allowed)   → caller explicitly set the body
+    //   • undefined             → caller omitted body (put: carry over from prev; create: empty)
+    // Non-string values (numbers, objects, null) are a client error — never silently coerced to ""
+    // (previously that could wipe a document's body).
+    let input: { frontmatter?: unknown; frontmatter_raw?: string; body: string | undefined };
     if (ct === "markdown") {
       const parsed = parseMarkdown(raw);
       input = { frontmatter_raw: parsed.frontmatter_raw, body: parsed.body };
@@ -373,11 +409,14 @@ async function dispatchDocs(
         frontmatter_raw?: unknown;
         body?: unknown;
       };
+      if (parsed.body !== undefined && typeof parsed.body !== "string") {
+        throw new KernelError("filter_invalid", { reason: "body must be a string" });
+      }
       input = {
         frontmatter: parsed.frontmatter,
         frontmatter_raw:
           typeof parsed.frontmatter_raw === "string" ? parsed.frontmatter_raw : undefined,
-        body: typeof parsed.body === "string" ? parsed.body : "",
+        body: parsed.body,
       };
     }
 
@@ -386,10 +425,11 @@ async function dispatchDocs(
         writePreconditionRequired(res, "If-None-Match must be '*' for create");
         return;
       }
+      // Create: an omitted body means "empty document" — no prev to carry from.
       const v = kernel.docs.create(actor, repoSlug, path, {
         frontmatter: input.frontmatter as never,
         frontmatter_raw: input.frontmatter_raw,
-        body: input.body,
+        body: input.body ?? "",
       });
       writeJson(res, 201, v, { ETag: etagOf(v.version_id) });
       return;
@@ -399,15 +439,16 @@ async function dispatchDocs(
     if (ifMatch === null || ifMatch.kind === "any") {
       writePreconditionRequired(
         res,
-        "If-Match: * is not supported for docs.put — supply the version_id",
+        "the strict surface requires a specific version_id; If-Match: * is reserved for the WebDAV gateway (§11.1)",
       );
       return;
     }
-    const v = kernel.docs.put(actor, repoSlug, ifMatch.version_id, path, {
-      frontmatter: input.frontmatter as never,
-      frontmatter_raw: input.frontmatter_raw,
-      body: input.body,
-    });
+    // PUT: omitted body → kernel carries over from prev.
+    const putInput: { frontmatter?: never; frontmatter_raw?: string; body?: string } = {};
+    if (input.frontmatter !== undefined) putInput.frontmatter = input.frontmatter as never;
+    if (input.frontmatter_raw !== undefined) putInput.frontmatter_raw = input.frontmatter_raw;
+    if (input.body !== undefined) putInput.body = input.body;
+    const v = kernel.docs.put(actor, repoSlug, ifMatch.version_id, path, putInput);
     writeJson(res, 200, v, { ETag: etagOf(v.version_id) });
     return;
   }
@@ -417,6 +458,18 @@ async function dispatchDocs(
     if (ifMatch === null || ifMatch.kind !== "version") {
       writePreconditionRequired(res, "DELETE requires If-Match: <version_id>");
       return;
+    }
+    // The URL path is authoritative for DELETE — verify the If-Match version
+    // currently lives at (repo, path). If the doc has moved or been deleted
+    // since If-Match was observed, stale_prev with the actual current pointer.
+    // If nothing lives at path at all, kernel.docs.get raises doc_not_found (404).
+    const current = kernel.docs.get(actor, repoSlug, path);
+    if (current.version_id !== ifMatch.version_id) {
+      throw new KernelError("stale_prev", {
+        current_version_id: current.version_id,
+        current_path: current.path,
+        submitted_prev_version_id: ifMatch.version_id,
+      });
     }
     const v = kernel.docs.delete(actor, repoSlug, ifMatch.version_id);
     writeJson(res, 200, v, { ETag: etagOf(v.version_id) });
@@ -605,24 +658,30 @@ async function dispatchQuery(
 
   const results = kernel.query(actor, spec);
   const etag = queryEtag(results);
-  const inm = parseIfNoneMatch(req.headers["if-none-match"] as string | undefined);
-  // For query ETags we intentionally compare the raw value (no `v` prefix)
-  // — writing the check inline so parseIfNoneMatch's version_id-shape check
-  // doesn't reject the query hash.
-  const rawInm = normalizeInmForQuery(req.headers["if-none-match"] as string | undefined);
-  if (rawInm !== null && (rawInm === etag || inm?.kind === "any")) {
+  const inm = parseQueryIfNoneMatch(req.headers["if-none-match"] as string | undefined);
+  if (inm !== null && (inm.kind === "any" || inm.hash === etag)) {
     writeEmpty(res, 304, { ETag: `"${etag}"` });
     return;
   }
   writeJson(res, 200, results, { ETag: `"${etag}"` });
 }
 
-function normalizeInmForQuery(headerValue: string | undefined): string | null {
+/**
+ * Query-ETag If-None-Match parser. Accepts `*`, quoted-hex (`"deadbeef"`),
+ * or a bare hex hash — but not weak validators (`W/"…"`). Distinct from
+ * conditional.ts's parseIfNoneMatch which requires the version_id shape.
+ */
+type QueryIfNoneMatch = { kind: "any" } | { kind: "hash"; hash: string };
+function parseQueryIfNoneMatch(headerValue: string | undefined): QueryIfNoneMatch | null {
   if (!headerValue) return null;
   const t = headerValue.trim();
+  if (t === "") return null;
   if (t.startsWith("W/")) return null;
-  if (t.startsWith('"') && t.endsWith('"') && t.length >= 2) return t.slice(1, -1);
-  return t;
+  if (t === "*") return { kind: "any" };
+  if (t.startsWith('"') && t.endsWith('"') && t.length >= 2) {
+    return { kind: "hash", hash: t.slice(1, -1) };
+  }
+  return { kind: "hash", hash: t };
 }
 
 function readOptionalIntQueryParam(query: URLSearchParams, key: string): number | undefined {
@@ -699,10 +758,7 @@ function parseDocDestination(
   const path = parseDestinationHeader(headerValue);
   if (path === null) return null;
   // Expect the form /repos/{repoSlug}/docs/{...path}
-  const decoded = path
-    .replace(/^\//, "")
-    .split("/")
-    .map((s) => decodeURIComponent(s));
+  const decoded = path.replace(/^\//, "").split("/").map(decodeSegment);
   if (decoded.length < 4) return null;
   if (decoded[0] !== "repos" || decoded[2] !== "docs") return null;
   if (decoded[1] !== repoSlug) {
@@ -717,10 +773,7 @@ function parseDocDestination(
 function parseRepoDestination(headerValue: string | string[] | undefined): string | null {
   const path = parseDestinationHeader(headerValue);
   if (path === null) return null;
-  const decoded = path
-    .replace(/^\//, "")
-    .split("/")
-    .map((s) => decodeURIComponent(s));
+  const decoded = path.replace(/^\//, "").split("/").map(decodeSegment);
   if (decoded.length !== 2 || decoded[0] !== "repos") return null;
   return decoded[1] as string;
 }
@@ -728,10 +781,7 @@ function parseRepoDestination(headerValue: string | string[] | undefined): strin
 function parseUserDestination(headerValue: string | string[] | undefined): string | null {
   const path = parseDestinationHeader(headerValue);
   if (path === null) return null;
-  const decoded = path
-    .replace(/^\//, "")
-    .split("/")
-    .map((s) => decodeURIComponent(s));
+  const decoded = path.replace(/^\//, "").split("/").map(decodeSegment);
   if (decoded.length !== 2 || decoded[0] !== "users") return null;
   return decoded[1] as string;
 }
@@ -740,18 +790,19 @@ function parseUserDestination(headerValue: string | string[] | undefined): strin
 // Small dispatch helpers
 // -----------------------------------------------------------------------------
 
+// method_not_allowed and no_route are surface-only codes (not KernelErrorCodes)
+// — they identify legitimate HTTP dispatch outcomes, not kernel or server
+// bugs. Distinct from `internal_error` (500 fallback for uncaught throwables)
+// so log aggregators can discriminate.
 function methodNotAllowed(res: ServerResponse, method: string, allowed: string[]): void {
   writeJson(
     res,
     405,
-    { code: "internal_error", data: { reason: `method ${method} not allowed` } },
+    { code: "method_not_allowed", data: { method, allowed } },
     { Allow: allowed.join(", ") },
   );
 }
 
 function notFound(res: ServerResponse): void {
-  writeJson(res, 404, { code: "internal_error", data: { reason: "no route" } });
+  writeJson(res, 404, { code: "no_route", data: {} });
 }
-
-// Silence "unused import" — we keep the import for future integrations.
-void extractBearerFromHeader;

@@ -5,7 +5,7 @@
  */
 
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -109,7 +109,7 @@ describe("CLI --server round-trip", () => {
     // Create via remote using --from-file with markdown-with-frontmatter.
     const docPath = join(workDir, "doc.md");
     const original = "---\nstatus: draft\n---\nhello m3\n";
-    require("node:fs").writeFileSync(docPath, original);
+    writeFileSync(docPath, original);
 
     let r = runCli(
       ["--server", baseUrl, "docs", "create", "notes", "hello.md", "--from-file", docPath],
@@ -134,7 +134,7 @@ describe("CLI --server round-trip", () => {
     const env: Record<string, string> = { MRPLEX_TOKEN: rootToken, XDG_CONFIG_HOME: workDir };
     runCli(["--server", baseUrl, "repos", "create", "notes"], env);
     const docPath = join(workDir, "doc.md");
-    require("node:fs").writeFileSync(docPath, "---\nstatus: published\n---\nhi\n");
+    writeFileSync(docPath, "---\nstatus: published\n---\nhi\n");
     runCli(["--server", baseUrl, "docs", "create", "notes", "a.md", "--from-file", docPath], env);
 
     const r = runCli(
@@ -160,14 +160,14 @@ describe("CLI --server round-trip", () => {
     const env: Record<string, string> = { MRPLEX_TOKEN: rootToken, XDG_CONFIG_HOME: workDir };
     runCli(["--server", baseUrl, "repos", "create", "notes"], env);
     const docPath = join(workDir, "doc.md");
-    require("node:fs").writeFileSync(docPath, "one\n");
+    writeFileSync(docPath, "one\n");
     runCli(
       ["--server", baseUrl, "docs", "create", "notes", "hello.md", "--from-file", docPath],
       env,
     );
 
     // Update to v2, then try to put again with v1 — stale.
-    require("node:fs").writeFileSync(docPath, "two\n");
+    writeFileSync(docPath, "two\n");
     runCli(
       [
         "--server",
@@ -184,7 +184,7 @@ describe("CLI --server round-trip", () => {
       env,
     );
 
-    require("node:fs").writeFileSync(docPath, "three\n");
+    writeFileSync(docPath, "three\n");
     const r = runCli(
       [
         "--server",

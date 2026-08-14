@@ -22,7 +22,6 @@ import { KernelError } from "../kernel/errors.js";
 import { split as splitFrontmatter } from "../markdown/frontmatter.js";
 import { startMcpStdio } from "../mcp/server.js";
 import { startServer } from "../server/serve.js";
-import { openAndMigrate } from "../server/serve.js";
 import { resolveTokenString } from "./auth.js";
 import { type BootstrapError, bootstrap } from "./bootstrap.js";
 import { type CliConfig, loadConfig, saveConfig } from "./config.js";
@@ -662,11 +661,6 @@ function buildProgram(): Command {
 
   return program;
 }
-
-// The `openAndMigrate` import above is only used by the serve command
-// (through startServer); reference it to satisfy `noUnusedLocals` under
-// certain tsconfig variants.
-void openAndMigrate;
 
 const program = buildProgram();
 try {

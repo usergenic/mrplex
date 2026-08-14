@@ -86,7 +86,12 @@ export async function startServer(config: ServeConfig): Promise<ServeHandle> {
 
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     const url = req.url ?? "";
-    if (url === "/mcp" || url.startsWith("/mcp?") || url.startsWith("/mcp/")) {
+    // Only /mcp (exact) and /mcp?<query> are routed to the MCP transport.
+    // /mcp/<anything> falls through to REST so future REST routes under the
+    // /mcp namespace (e.g. /mcp/manifest) aren't preempted by transport
+    // framing errors. The SDK's Streamable HTTP transport only speaks at
+    // /mcp itself; sub-paths are not part of its spec.
+    if (url === "/mcp" || url.startsWith("/mcp?")) {
       mcp.handle(req, res).catch((err: unknown) => {
         writeInternalError(res, err);
       });

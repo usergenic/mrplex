@@ -129,7 +129,7 @@ describe("REST docs — conditional writes", () => {
     expect(body.data.current_version_id).toBe("v2");
   });
 
-  it("PUT with no precondition → 428", async () => {
+  it("PUT with no precondition → 428 precondition_required", async () => {
     const url = `${base}/repos/notes/docs/hello.md`;
     const r = await fetch(url, {
       method: "PUT",
@@ -137,6 +137,42 @@ describe("REST docs — conditional writes", () => {
       body: JSON.stringify({ body: "x" }),
     });
     expect(r.status).toBe(428);
+    expect((await readJson<{ code: string }>(r)).code).toBe("precondition_required");
+  });
+
+  it("PUT with a non-string body field → 400 filter_invalid (not silent wipe)", async () => {
+    // Create first.
+    await fetch(`${base}/repos/notes/docs/hello.md`, {
+      method: "PUT",
+      headers: { ...authHeaders(), "Content-Type": "text/markdown", "If-None-Match": "*" },
+      body: "original body\n",
+    });
+    // Try to update with body: 42 (a number). Previously silently coerced to ""
+    // (wiping the body); now must reject.
+    const r = await fetch(`${base}/repos/notes/docs/hello.md`, {
+      method: "PUT",
+      headers: { ...authHeaders(), "Content-Type": "application/json", "If-Match": '"v1"' },
+      body: JSON.stringify({ body: 42 }),
+    });
+    expect(r.status).toBe(400);
+    expect((await readJson<{ code: string }>(r)).code).toBe("filter_invalid");
+  });
+
+  it("PUT with omitted body carries over prev's body (no silent wipe)", async () => {
+    await fetch(`${base}/repos/notes/docs/hello.md`, {
+      method: "PUT",
+      headers: { ...authHeaders(), "Content-Type": "text/markdown", "If-None-Match": "*" },
+      body: "original body\n",
+    });
+    // Update only frontmatter; body key absent — kernel carries over prev.body.
+    const r = await fetch(`${base}/repos/notes/docs/hello.md`, {
+      method: "PUT",
+      headers: { ...authHeaders(), "Content-Type": "application/json", "If-Match": '"v1"' },
+      body: JSON.stringify({ frontmatter: { status: "published" } }),
+    });
+    expect(r.status).toBe(200);
+    const v = await readJson<{ body: string }>(r);
+    expect(v.body).toBe("original body\n");
   });
 
   it("weak ETag validator (W/) is rejected", async () => {
@@ -272,29 +308,43 @@ describe("REST MOVE + DELETE", () => {
     expect(body.code).toBe("path_invalid");
   });
 
-  it("DELETE is idempotent (§4.1)", async () => {
+  it("DELETE succeeds; retry at the same URL returns 404 (doc no longer lives there)", async () => {
     let r = await fetch(`${base}/repos/notes/docs/hello.md`, {
       method: "DELETE",
       headers: { ...authHeaders(), "If-Match": '"v1"' },
     });
     expect(r.status).toBe(200);
     const first = await readJson<{ version_id: string }>(r);
-    const nowVersion = first.version_id; // v2, moved to :deleted/…
+    expect(first.version_id).toBe("v2"); // moved to :deleted/…
 
-    // Second DELETE — passing the trashed version_id as If-Match. §4.1
-    // rule 4 says a delete of an already-deleted doc is a no-op returning
-    // the unchanged version.
+    // Retry the same DELETE at the same URL — the doc no longer lives at
+    // hello.md, so kernel.docs.get raises doc_not_found (404). This is
+    // consistent with RFC 9110 §9.3.5's "DELETE is idempotent — either
+    // deleted or 404" (either return is allowed).
     r = await fetch(`${base}/repos/notes/docs/hello.md`, {
       method: "DELETE",
-      headers: { ...authHeaders(), "If-Match": `"${nowVersion}"` },
+      headers: { ...authHeaders(), "If-Match": '"v2"' },
     });
-    // The path is now under :deleted/... — trying to DELETE at hello.md
-    // won't find a doc, but the kernel semantics of "delete via prev_id"
-    // is what runs. Our REST layer uses the version_id from If-Match,
-    // not the path, so it hits the idempotent no-op.
-    expect(r.status).toBe(200);
-    const second = await readJson<{ version_id: string }>(r);
-    expect(second.version_id).toBe(nowVersion);
+    expect(r.status).toBe(404);
+    expect((await readJson<{ code: string }>(r)).code).toBe("doc_not_found");
+  });
+
+  it("DELETE with stale If-Match → 412 stale_prev", async () => {
+    // Update to v2 first, then try DELETE with v1 — the URL path (hello.md)
+    // is still occupied, but by v2 not v1.
+    await fetch(`${base}/repos/notes/docs/hello.md`, {
+      method: "PUT",
+      headers: { ...authHeaders(), "Content-Type": "text/markdown", "If-Match": '"v1"' },
+      body: "two\n",
+    });
+    const r = await fetch(`${base}/repos/notes/docs/hello.md`, {
+      method: "DELETE",
+      headers: { ...authHeaders(), "If-Match": '"v1"' },
+    });
+    expect(r.status).toBe(412);
+    const body = await readJson<{ code: string; data: { current_version_id: string } }>(r);
+    expect(body.code).toBe("stale_prev");
+    expect(body.data.current_version_id).toBe("v2");
   });
 });
 

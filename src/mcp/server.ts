@@ -115,8 +115,11 @@ function buildMcpServer(kernel: Kernel, getActor: () => Actor): McpLowLevelServe
     const args = (req.params.arguments ?? {}) as Record<string, unknown>;
     const tool = toolByName(name);
     if (!tool) {
+      // Use filter_invalid (a real KernelErrorCode) rather than a fabricated
+      // "internal_error" — clients that rehydrate KernelError from the
+      // in-band payload should always see codes from the stable catalog.
       return toolError({
-        code: "internal_error" as const,
+        code: "filter_invalid",
         data: { reason: `unknown tool: ${name}` },
       });
     }
@@ -130,8 +133,10 @@ function buildMcpServer(kernel: Kernel, getActor: () => Actor): McpLowLevelServe
       if (err instanceof KernelError) {
         return toolError({ code: err.code, data: err.data as Record<string, unknown> });
       }
+      // Non-kernel throwable — surface as filter_invalid too, since a real
+      // internal server error would 500 at the transport, not in-band.
       return toolError({
-        code: "internal_error" as const,
+        code: "filter_invalid",
         data: { reason: (err as Error).message ?? String(err) },
       });
     }

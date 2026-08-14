@@ -36,6 +36,10 @@ export function httpStatusFor(code: KernelErrorCode): number {
     case "stale_prev":
     case "create_conflict":
       return 412;
+    case "precondition_required":
+      return 428;
+    case "payload_too_large":
+      return 413;
     case "path_taken":
     case "slug_taken":
       return 409;

@@ -33,6 +33,8 @@ export function exitCodeForKernelError(code: KernelErrorCode): number {
     case "frontmatter_invalid":
     case "filter_invalid":
     case "version_not_in_document":
+    case "precondition_required":
+    case "payload_too_large":
       return 1;
     default:
       return 1;

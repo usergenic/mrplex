@@ -14,7 +14,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { ScopeInput } from "../kernel/auth/scope.js";
-import { KernelError, type KernelErrorCode } from "../kernel/errors.js";
+import { KernelError, isKernelErrorCode } from "../kernel/errors.js";
 import type { FrontmatterInput } from "../kernel/frontmatter-input.js";
 import type { PathConfigOverride } from "../kernel/path-config.js";
 import type { QuerySpec } from "../kernel/query/query.js";
@@ -79,10 +79,18 @@ function buildRemoteClient(client: Client): KernelClient {
             data?: Record<string, unknown>;
           };
           if (typeof parsed.code === "string") {
-            throw new KernelError(
-              parsed.code as KernelErrorCode,
-              (parsed.data ?? {}) as Record<string, unknown>,
-            );
+            const data = (parsed.data ?? {}) as Record<string, unknown>;
+            // Validate the remote's `code` against the local catalog before
+            // rehydrating — a rogue server (or a version drift) shouldn't be
+            // able to inject unknown codes that break exhaustive switches.
+            if (isKernelErrorCode(parsed.code)) {
+              throw new KernelError(parsed.code, data);
+            }
+            throw new KernelError("filter_invalid", {
+              reason: "remote returned unknown error code",
+              remote_code: parsed.code,
+              remote_data: data,
+            });
           }
         } catch (err) {
           if (err instanceof KernelError) throw err;

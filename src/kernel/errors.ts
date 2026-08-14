@@ -21,7 +21,12 @@ export type KernelErrorCode =
   | "path_taken"
   | "slug_taken"
   | "unauthorized"
-  | "forbidden";
+  | "forbidden"
+  // Surface-emitted; the kernel itself never throws these but they share the
+  // catalog because clients (and the CLI's exit-code families) discriminate
+  // on `code`. M3 added both.
+  | "precondition_required" // REST: PUT/DELETE without If-Match / If-None-Match (§m3-plan decision 5)
+  | "payload_too_large"; // REST: body exceeded MAX_BODY_BYTES
 
 export class KernelError<D = Record<string, unknown>> extends Error {
   constructor(
@@ -32,6 +37,38 @@ export class KernelError<D = Record<string, unknown>> extends Error {
     super(message ?? code);
     this.name = "KernelError";
   }
+}
+
+/**
+ * Runtime set matching KernelErrorCode. Used by the remote MCP client to
+ * validate an incoming `code` string before rehydrating a KernelError —
+ * otherwise a rogue server could inject unknown codes and break clients
+ * that switch exhaustively.
+ */
+export const KERNEL_ERROR_CODES: ReadonlySet<KernelErrorCode> = new Set<KernelErrorCode>([
+  "repo_not_found",
+  "user_not_found",
+  "doc_not_found",
+  "version_not_found",
+  "token_not_found",
+  "version_not_in_document",
+  "slug_invalid",
+  "path_invalid",
+  "frontmatter_invalid",
+  "filter_invalid",
+  "stale_prev",
+  "create_conflict",
+  "path_taken",
+  "slug_taken",
+  "unauthorized",
+  "forbidden",
+  "precondition_required",
+  "payload_too_large",
+]);
+
+/** Type guard — check whether an arbitrary string is a known catalog code. */
+export function isKernelErrorCode(code: string): code is KernelErrorCode {
+  return KERNEL_ERROR_CODES.has(code as KernelErrorCode);
 }
 
 export const repoNotFound = (slug: string) => new KernelError("repo_not_found", { slug });

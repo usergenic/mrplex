@@ -597,8 +597,10 @@ DELETE  /me/tokens/{id}                                      → Token
 - `unauthorized` → **401 Unauthorized**.
 - `forbidden` → **403 Forbidden**.
 - `stale_prev`, `create_conflict` → **412 Precondition Failed**, with the current `version_id` in the `ETag` response header.
+- `precondition_required` → **428 Precondition Required**. Surface-emitted (never by the kernel). Returned when a mutating request omits the `If-Match` / `If-None-Match` header that the strict surface requires — `If-Match: *` is deliberately not accepted for `docs.put` / `docs.delete`; last-writer-wins is reserved for the WebDAV gateway (§11.1).
+- `payload_too_large` → **413 Content Too Large**. Surface-emitted (never by the kernel). Returned when a request body exceeds the server's configured cap.
 - `path_taken`, `slug_taken` → **409 Conflict**.
-- `repo_not_found`, `user_not_found`, `doc_not_found`, `version_not_found` → **404 Not Found**.
+- `repo_not_found`, `user_not_found`, `doc_not_found`, `version_not_found`, `token_not_found` → **404 Not Found**.
 - `version_not_in_document` → **422 Unprocessable Entity**.
 - `slug_invalid`, `path_invalid`, `frontmatter_invalid`, `filter_invalid` → **400 Bad Request**.
 
