@@ -19,6 +19,15 @@ let base: string;
 
 const authHeaders = () => ({ Authorization: `Bearer ${token}` });
 
+/**
+ * Node's undici types response.json() as Promise<unknown>. Tests just want a
+ * bag of fields; annotate at the call site with a shape or fall back to
+ * Record<string, unknown>.
+ */
+async function readJson<T = Record<string, unknown>>(r: Response): Promise<T> {
+  return (await r.json()) as T;
+}
+
 beforeEach(async () => {
   workDir = mkdtempSync(join(tmpdir(), "mrplex-rest-"));
   const dbUrl = `sqlite:${join(workDir, "test.db")}`;
@@ -37,7 +46,7 @@ describe("REST auth", () => {
   it("no token → 401 unauthorized", async () => {
     const r = await fetch(`${base}/repos`);
     expect(r.status).toBe(401);
-    const body = await r.json();
+    const body = await readJson<{ code: string }>(r);
     expect(body.code).toBe("unauthorized");
   });
 
@@ -80,7 +89,7 @@ describe("REST docs — conditional writes", () => {
       body: "second\n",
     });
     expect(r.status).toBe(412);
-    const body = await r.json();
+    const body = await readJson<{ code: string }>(r);
     expect(body.code).toBe("create_conflict");
   });
 
@@ -115,7 +124,7 @@ describe("REST docs — conditional writes", () => {
     });
     expect(r.status).toBe(412);
     expect(r.headers.get("etag")).toBe('"v2"');
-    const body = await r.json();
+    const body = await readJson<{ code: string; data: { current_version_id: string } }>(r);
     expect(body.code).toBe("stale_prev");
     expect(body.data.current_version_id).toBe("v2");
   });
@@ -179,7 +188,7 @@ describe("REST docs — content negotiation", () => {
       headers: { ...authHeaders(), Accept: "application/json" },
     });
     expect(r.status).toBe(200);
-    const body = await r.json();
+    const body = await readJson<{ repo: string; path: string; version_id: string }>(r);
     expect(body.repo).toBe("notes");
     expect(body.path).toBe("hello.md");
     expect(body.version_id).toBe("v1");
@@ -245,7 +254,7 @@ describe("REST MOVE + DELETE", () => {
       },
     });
     expect(r.status).toBe(200);
-    const v = await r.json();
+    const v = await readJson<{ path: string }>(r);
     expect(v.path).toBe("greeting.md");
   });
 
@@ -259,7 +268,7 @@ describe("REST MOVE + DELETE", () => {
       },
     });
     expect(r.status).toBe(400);
-    const body = await r.json();
+    const body = await readJson<{ code: string }>(r);
     expect(body.code).toBe("path_invalid");
   });
 
@@ -269,7 +278,7 @@ describe("REST MOVE + DELETE", () => {
       headers: { ...authHeaders(), "If-Match": '"v1"' },
     });
     expect(r.status).toBe(200);
-    const first = await r.json();
+    const first = await readJson<{ version_id: string }>(r);
     const nowVersion = first.version_id; // v2, moved to :deleted/…
 
     // Second DELETE — passing the trashed version_id as If-Match. §4.1
@@ -284,7 +293,7 @@ describe("REST MOVE + DELETE", () => {
     // is what runs. Our REST layer uses the version_id from If-Match,
     // not the path, so it hits the idempotent no-op.
     expect(r.status).toBe(200);
-    const second = await r.json();
+    const second = await readJson<{ version_id: string }>(r);
     expect(second.version_id).toBe(nowVersion);
   });
 });
@@ -308,7 +317,7 @@ describe("REST query", () => {
     expect(r.status).toBe(200);
     const etag = r.headers.get("etag");
     expect(etag).toBeTruthy();
-    expect((await r.json()).length).toBe(1);
+    expect((await readJson<unknown[]>(r)).length).toBe(1);
     // If-None-Match returns 304
     const r2 = await fetch(`${base}/query?repo=notes`, {
       headers: { ...authHeaders(), "If-None-Match": etag as string },
@@ -323,7 +332,7 @@ describe("REST query", () => {
       body: JSON.stringify({ repo: "notes", filter: 'status == "draft"' }),
     });
     expect(r.status).toBe(200);
-    expect((await r.json()).length).toBe(1);
+    expect((await readJson<unknown[]>(r)).length).toBe(1);
   });
 });
 
@@ -336,7 +345,7 @@ describe("REST error mapping", () => {
     });
     const r = await fetch(`${base}/repos/notes/docs/nope.md`, { headers: authHeaders() });
     expect(r.status).toBe(404);
-    expect((await r.json()).code).toBe("doc_not_found");
+    expect((await readJson<{ code: string }>(r)).code).toBe("doc_not_found");
   });
 
   it("token_not_found → 404 (§5 decision 4)", async () => {
@@ -345,7 +354,7 @@ describe("REST error mapping", () => {
       headers: authHeaders(),
     });
     expect(r.status).toBe(404);
-    expect((await r.json()).code).toBe("token_not_found");
+    expect((await readJson<{ code: string }>(r)).code).toBe("token_not_found");
   });
 
   it("version_not_in_document → 422", async () => {
@@ -357,7 +366,7 @@ describe("REST error mapping", () => {
     // No version v42 exists at all — that comes back as version_not_found (404).
     const r = await fetch(`${base}/repos/notes/versions/v42`, { headers: authHeaders() });
     expect(r.status).toBe(404);
-    expect((await r.json()).code).toBe("version_not_found");
+    expect((await readJson<{ code: string }>(r)).code).toBe("version_not_found");
   });
 
   it("percent-encoded / inside a segment ≠ /: rejected as path_invalid", async () => {
