@@ -25,10 +25,7 @@ const STUB = join(
 
 describe("validateEmbedResponse", () => {
   it("accepts a well-formed response", () => {
-    const r = validateEmbedResponse(
-      { vectors: [[1, 2, 3]], model: "m", dim: 3 },
-      ["hello"],
-    );
+    const r = validateEmbedResponse({ vectors: [[1, 2, 3]], model: "m", dim: 3 }, ["hello"]);
     expect(r.model).toBe("m");
   });
 
@@ -45,17 +42,14 @@ describe("validateEmbedResponse", () => {
   });
 
   it("rejects empty model", () => {
-    expect(() =>
-      validateEmbedResponse({ vectors: [[1]], model: "", dim: 1 }, ["x"]),
-    ).toThrow(/model/);
+    expect(() => validateEmbedResponse({ vectors: [[1]], model: "", dim: 1 }, ["x"])).toThrow(
+      /model/,
+    );
   });
 
   it("rejects non-finite values", () => {
     expect(() =>
-      validateEmbedResponse(
-        { vectors: [[1, Number.NaN, 3]], model: "m", dim: 3 },
-        ["x"],
-      ),
+      validateEmbedResponse({ vectors: [[1, Number.NaN, 3]], model: "m", dim: 3 }, ["x"]),
     ).toThrow(/finite/);
   });
 });

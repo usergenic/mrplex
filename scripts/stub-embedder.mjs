@@ -57,9 +57,7 @@ function embed(chunks) {
     for (let i = 0; i < dim; i++) {
       // Extend the 32-byte digest by hashing again with the lane index.
       const source =
-        i < 32
-          ? digest[i]
-          : createHash("sha256").update(digest).update(String(i)).digest()[i % 32];
+        i < 32 ? digest[i] : createHash("sha256").update(digest).update(String(i)).digest()[i % 32];
       raw[i] = (source - 127.5) / 127.5;
     }
     // L2-normalize to unit length.
@@ -125,6 +123,8 @@ if (has("--http")) {
   });
   console.error(`stub-embedder stdio model=${modelName} dim=${dim}`);
 } else {
-  console.error("usage: stub-embedder.mjs (--http PORT | --stdio) [--dim N] [--model NAME] [--fail-rate F] [--slow-ms MS]");
+  console.error(
+    "usage: stub-embedder.mjs (--http PORT | --stdio) [--dim N] [--model NAME] [--fail-rate F] [--slow-ms MS]",
+  );
   process.exit(2);
 }

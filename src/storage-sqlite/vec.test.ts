@@ -41,14 +41,14 @@ describe("vec: encode/decode", () => {
   });
 
   it("accepts Float32Array input and returns a Float32Array (no aliasing)", () => {
-    const src = Float32Array.from([0.5, -0.25, 3.14159]);
+    const src = Float32Array.from([0.5, -0.25, 0.87543]);
     const enc = encodeVectorBlob(src);
     src[0] = 999; // must not affect the encoded blob
     const dec = decodeVectorBlob(enc);
     expect(dec).toBeInstanceOf(Float32Array);
     expect(dec[0]).toBeCloseTo(0.5, 5);
     expect(dec[1]).toBeCloseTo(-0.25, 5);
-    expect(dec[2]).toBeCloseTo(3.14159, 4);
+    expect(dec[2]).toBeCloseTo(0.87543, 4);
   });
 
   it("throws on BLOB whose length is not a multiple of 4", () => {
@@ -133,9 +133,7 @@ describe("adapter: chunks + vector_search", () => {
   it("empty chunks_upsert wipes prior chunks", () => {
     const { s, v } = seed();
     const e = encodeVectorBlob([1, 0, 0]);
-    s.chunks_upsert(v.id, "m", [
-      { ix: 0, text: "a", text_hash: "h1", model: "m", embedding: e },
-    ]);
+    s.chunks_upsert(v.id, "m", [{ ix: 0, text: "a", text_hash: "h1", model: "m", embedding: e }]);
     s.chunks_upsert(v.id, "m", []);
     expect(s.chunks_by_version(v.id).length).toBe(0);
   });
@@ -192,9 +190,7 @@ describe("adapter: backlog", () => {
       next_retry_at: new Date(Date.now() + 60_000).toISOString(),
     });
     const e = encodeVectorBlob([1, 0]);
-    s.chunks_upsert(v.id, "m", [
-      { ix: 0, text: "a", text_hash: "h1", model: "m", embedding: e },
-    ]);
+    s.chunks_upsert(v.id, "m", [{ ix: 0, text: "a", text_hash: "h1", model: "m", embedding: e }]);
     const status = s.backlog_status(new Date().toISOString());
     expect(status.pending).toBe(1);
     expect(status.due).toBe(0);

@@ -7,8 +7,8 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { sqliteAdapter } from "../storage-sqlite/adapter.js";
 import { createKernel } from "../kernel/kernel.js";
+import { sqliteAdapter } from "../storage-sqlite/adapter.js";
 import type { Storage } from "../storage/types.js";
 import { chunkBody } from "./chunker.js";
 import type { EmbedHook, EmbedResponse } from "./hook.js";
@@ -35,7 +35,13 @@ function fakeHook(dim = 4): { hook: EmbedHook; calls: string[][]; setFail: (b: b
     },
     async close() {},
   };
-  return { hook, calls, setFail: (b) => (failing = b) };
+  return {
+    hook,
+    calls,
+    setFail: (b: boolean) => {
+      failing = b;
+    },
+  };
 }
 
 function bootstrap(storage: Storage) {

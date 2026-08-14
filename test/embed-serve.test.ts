@@ -11,8 +11,8 @@ import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { hashSecret } from "../src/kernel/auth/tokens.js";
 import { bootstrap } from "../src/cli/bootstrap.js";
+import { hashSecret } from "../src/kernel/auth/tokens.js";
 import { startServer } from "../src/server/serve.js";
 import { sqliteAdapter } from "../src/storage-sqlite/adapter.js";
 
@@ -61,9 +61,13 @@ describe("serve + embed worker (end-to-end)", () => {
 
     // Start stub embedder.
     const stubPort = await ephemeralPort();
-    const stub = spawn(process.execPath, ["scripts/stub-embedder.mjs", "--http", String(stubPort), "--dim", "8"], {
-      stdio: ["ignore", "ignore", "pipe"],
-    });
+    const stub = spawn(
+      process.execPath,
+      ["scripts/stub-embedder.mjs", "--http", String(stubPort), "--dim", "8"],
+      {
+        stdio: ["ignore", "ignore", "pipe"],
+      },
+    );
     stubs.push(stub);
     await waitForStubReady(stub);
 

@@ -56,9 +56,7 @@ export function encodeVectorBlob(vector: readonly number[] | Float32Array): Buff
 export function decodeVectorBlob(blob: Buffer | Uint8Array): Float32Array {
   const buf = Buffer.isBuffer(blob) ? blob : Buffer.from(blob);
   if (buf.byteLength % 4 !== 0) {
-    throw new Error(
-      `vec: BLOB length ${buf.byteLength} is not a multiple of 4 (expected float32)`,
-    );
+    throw new Error(`vec: BLOB length ${buf.byteLength} is not a multiple of 4 (expected float32)`);
   }
   const out = new Float32Array(buf.byteLength / 4);
   for (let i = 0; i < out.length; i++) {

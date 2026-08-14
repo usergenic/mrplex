@@ -137,8 +137,7 @@ function buildRemoteClient(client: Client): KernelClient {
           ...(opts?.limit !== undefined && { limit: opts.limit }),
           ...(opts?.before !== undefined && { before: opts.before }),
         }),
-      diff: (repo, path, from, to) =>
-        call<UnifiedDiff>("docs_diff", { repo, path, from, to }),
+      diff: (repo, path, from, to) => call<UnifiedDiff>("docs_diff", { repo, path, from, to }),
       create: (repo, path, input: FrontmatterInput & { body: string }) =>
         call<Version>("docs_create", {
           repo,

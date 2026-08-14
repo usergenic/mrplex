@@ -7,11 +7,11 @@
  * negotiation.
  */
 
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { afterEach, describe, expect, it } from "vitest";
 import { bootstrap } from "../src/cli/bootstrap.js";
 import { startServer } from "../src/server/serve.js";
@@ -26,7 +26,10 @@ async function ephemeralPort(): Promise<number> {
 }
 
 describe("docs.diff — surfaces", () => {
-  const tmpDb = join(tmpdir(), `mrplex-diff-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+  const tmpDb = join(
+    tmpdir(),
+    `mrplex-diff-${Date.now()}-${Math.random().toString(36).slice(2)}.db`,
+  );
   const handles: { close: () => Promise<void> }[] = [];
 
   afterEach(async () => {
@@ -59,29 +62,29 @@ describe("docs.diff — surfaces", () => {
       headers: { ...auth, "Content-Type": "application/json" },
       body: JSON.stringify({ slug: "notes" }),
     });
-    const create = await (
+    const create = (await (
       await fetch(`${base}/repos/notes/docs/a.md`, {
         method: "PUT",
         headers: { ...auth, "Content-Type": "text/markdown", "If-None-Match": "*" },
         body: "hello v1\n",
       })
-    ).json();
-    const v1 = create.version_id as string;
-    const update = await (
+    ).json()) as { version_id: string };
+    const v1 = create.version_id;
+    const update = (await (
       await fetch(`${base}/repos/notes/docs/a.md`, {
         method: "PUT",
         headers: { ...auth, "Content-Type": "text/markdown", "If-Match": v1 },
         body: "hello v2\n",
       })
-    ).json();
-    const v2 = update.version_id as string;
+    ).json()) as { version_id: string };
+    const v2 = update.version_id;
 
     // REST JSON.
-    const jsonDiff = await (
+    const jsonDiff = (await (
       await fetch(`${base}/repos/notes/diff/a.md?from=${v1}&to=${v2}`, {
         headers: { ...auth },
       })
-    ).json();
+    ).json()) as { from_version_id: string; to_version_id: string; patch: string };
     expect(jsonDiff.from_version_id).toBe(v1);
     expect(jsonDiff.to_version_id).toBe(v2);
     expect(jsonDiff.patch).toContain("-hello v1");
@@ -142,27 +145,27 @@ describe("docs.diff — surfaces", () => {
       headers: { ...auth, "Content-Type": "application/json" },
       body: JSON.stringify({ slug: "notes" }),
     });
-    const a = await (
+    const a = (await (
       await fetch(`${base}/repos/notes/docs/a.md`, {
         method: "PUT",
         headers: { ...auth, "Content-Type": "text/markdown", "If-None-Match": "*" },
         body: "aaa\n",
       })
-    ).json();
-    const b = await (
+    ).json()) as { version_id: string };
+    const b = (await (
       await fetch(`${base}/repos/notes/docs/b.md`, {
         method: "PUT",
         headers: { ...auth, "Content-Type": "text/markdown", "If-None-Match": "*" },
         body: "bbb\n",
       })
-    ).json();
+    ).json()) as { version_id: string };
 
     const cross = await fetch(
       `${base}/repos/notes/diff/a.md?from=${b.version_id}&to=${a.version_id}`,
       { headers: { ...auth } },
     );
     expect(cross.status).toBe(422);
-    const body = await cross.json();
+    const body = (await cross.json()) as { code: string };
     expect(body.code).toBe("version_not_in_document");
   }, 20000);
 });

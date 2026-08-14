@@ -23,8 +23,10 @@ export type EmbedConfig =
   | { kind: "none" };
 
 export function resolveEmbedConfig(inputs: EmbedFlagInputs): EmbedConfig {
-  const cfg: CliConfig & { embed_url?: string; embed_cmd?: string } =
-    loadConfig() as CliConfig & { embed_url?: string; embed_cmd?: string };
+  const cfg: CliConfig & { embed_url?: string; embed_cmd?: string } = loadConfig() as CliConfig & {
+    embed_url?: string;
+    embed_cmd?: string;
+  };
   const url = inputs.embed_url ?? process.env.MRPLEX_EMBED_URL ?? cfg.embed_url;
   const cmd = inputs.embed_cmd ?? process.env.MRPLEX_EMBED_CMD ?? cfg.embed_cmd;
   if (url && cmd) {
@@ -54,16 +56,15 @@ export function createHookFromConfig(c: EmbedConfig): EmbedHook | null {
   switch (c.kind) {
     case "http":
       return createHttpEmbedHook({ url: c.url });
-    case "cmd":
+    case "cmd": {
       // The command string is split on whitespace (shell-lite). If a
       // user needs quoted args they can point --embed-cmd at a wrapper
       // script — same rule production sidecar deployments already use.
-      {
-        const parts = c.command.split(/\s+/).filter((p) => p.length > 0);
-        const [command, ...args] = parts;
-        if (!command) throw new Error("--embed-cmd is empty");
-        return createCmdEmbedHook({ command, args });
-      }
+      const parts = c.command.split(/\s+/).filter((p) => p.length > 0);
+      const [command, ...args] = parts;
+      if (!command) throw new Error("--embed-cmd is empty");
+      return createCmdEmbedHook({ command, args });
+    }
     case "none":
       return null;
   }

@@ -10,10 +10,12 @@ See [docs/design.md](docs/design.md) for the full design.
 - **Byte-exact frontmatter.** Writes supply `frontmatter_raw` (verbatim YAML) OR `frontmatter` (structured JSON) — exactly one; the other is derived. Round-trips are byte-exact via the raw form.
 - **Optimistic concurrency.** Every write supplies the `prev_version_id` it observed; a stale prev is rejected with `stale_prev` and the current version returned.
 - **Deletion is a move to a system-namespace path** (`:deleted/…/foo-v45129.md`, extension-aware). Restore is a `docs.put` back to a user-territory path. `docs.delete` is idempotent.
+- **Unified diff** between any two versions of the same document via `docs.diff` — kernel op, `/repos/{repo}/diff/{path}?from=&to=` REST route (JSON envelope or `Accept: text/plain` raw patch), `docs_diff` MCP tool, `mrplex docs diff` CLI. `patch(1)`-applicable output.
 - **CEL filter queries** over frontmatter fields and `$`-prefixed intrinsics (`$path`, `$created_at`, `$body`). `list()` polymorphism handles scalar-or-list frontmatter uniformly.
 - **Full-text search** over document body via SQLite FTS5 (porter+unicode61 tokenizer). Composes with filter via AND.
+- **Semantic rank via embeddings** — pluggable hook (`--embed-url` HTTP or `--embed-cmd` subprocess); mrplex never calls a provider itself. Chunker + backlog worker + brute-force cosine k-NN over `sqlite-vec`; results current-version only, deduped by content hash. Composes with filter/text/scope/sigil-exclusion. No hook configured → `rank_unavailable` (no zero-vector default — silent garbage is worse than a visible gap).
 - **Bearer-token auth** with capability scopes — repo-scoped `read` / `write` path globs (gitignore-style, with negation), admin bit, per-token subset semantics for self-issued tokens.
-- **HTTP surfaces.** Protocol-true MCP server at `/mcp` (Streamable HTTP + optional STDIO), and a resource-oriented REST surface with `If-Match` / `If-None-Match`, content negotiation (`application/json` or `text/markdown`), `MOVE`, and sibling `/versions` / `/history` roots. Query responses carry ETags for `If-None-Match` → 304.
+- **HTTP surfaces.** Protocol-true MCP server at `/mcp` (Streamable HTTP + optional STDIO), and a resource-oriented REST surface with `If-Match` / `If-None-Match`, content negotiation (`application/json` or `text/markdown`), `MOVE`, and sibling `/versions` / `/history` / `/diff` roots. Query responses carry ETags for `If-None-Match` → 304.
 - **`mrplex` CLI** — thin client over MCP. `--database` for local embedded mode against a SQLite file; `--server` for remote mode against a running server. Every command works identically over both transports.
 - **Configurable path policy** — hardcoded defaults → server config → per-repo override. `disallowed_chars`, `system_sigils`, `hidden_sigils`, all with sensible defaults (Obsidian's cross-platform-safe rule).
 - **Bootstrap** — `mrplex bootstrap` mints the root admin token on a fresh database.
@@ -68,7 +70,7 @@ npm run --silent cli -- --database ./mrplex.db tokens create \
     --scope "notes:read=**,write=inbox/**"
 ```
 
-Query — CEL filters + FTS composed:
+Query — CEL filters + FTS + rank composed:
 
 ```bash
 # Filter only
@@ -89,6 +91,22 @@ npm run --silent cli -- --database ./mrplex.db query --repo notes \
 # $-prefixed intrinsics
 npm run --silent cli -- --database ./mrplex.db query --repo notes \
     --filter '$path.startsWith("guides/")'
+
+# Semantic rank (requires an embedding hook — see below)
+npm run --silent cli -- --database ./mrplex.db query --repo notes \
+    --rank 'tiered SaaS pricing'
+
+# All three composed
+npm run --silent cli -- --database ./mrplex.db query --repo notes \
+    --filter 'status == "published"' --text pricing --rank 'subscription fees'
+```
+
+Diff any two versions of a document — history + diff give you the versioned reader:
+
+```bash
+npm run --silent cli -- --database ./mrplex.db docs history notes greetings/hi.md
+npm run --silent cli -- --database ./mrplex.db docs diff notes greetings/hi.md \
+    --from v1 --to v3
 ```
 
 Serve the HTTP surfaces and drive the CLI remotely:
@@ -100,18 +118,52 @@ npm run --silent cli -- --database ./mrplex.db serve --port 8321 &
 # Same commands, now over the network
 npm run --silent cli -- --server http://127.0.0.1:8321 docs get notes greetings/hi.md
 npm run --silent cli -- --server http://127.0.0.1:8321 query --repo notes --filter 'status == "published"'
+npm run --silent cli -- --server http://127.0.0.1:8321 docs diff notes greetings/hi.md --from v1 --to v3
 ```
+
+## Embeddings
+
+mrplex ships **no** embedding provider — you wire one up. Two hook shapes:
+
+```bash
+# HTTP endpoint — server POSTs { chunks: [...] } and expects
+# { vectors: [[...]], model: "…", dim: N }.
+mrplex serve --database ./mrplex.db --embed-url http://127.0.0.1:8399
+
+# Subprocess — one JSON line in / one JSON line out over stdin/stdout.
+mrplex serve --database ./mrplex.db --embed-cmd "path/to/embedder --stdio"
+```
+
+Either flag can also come from `MRPLEX_EMBED_URL` / `MRPLEX_EMBED_CMD` env or CLI config. `--embed-url` and `--embed-cmd` are mutually exclusive.
+
+Backlog + backfill for retrofitting an existing corpus:
+
+```bash
+# Re-chunk + re-embed a repo's current versions that are missing chunks.
+mrplex embed backfill --database ./mrplex.db --repo notes --embed-url http://127.0.0.1:8399
+
+# Inspect the queue — counts, models present, recent errors.
+mrplex embed status --database ./mrplex.db
+```
+
+For dev + tests, `scripts/stub-embedder.mjs` speaks both hook shapes with deterministic hash-projection vectors (and `--fail-rate`, `--slow-ms` for exercising backoff):
+
+```bash
+node scripts/stub-embedder.mjs --http 8399
+```
+
+Writes done while a hook is configured trigger the in-process worker automatically; a hookless server still enqueues each write so a later `embed backfill` doesn't have to walk history. Rank queries with no hook return `rank_unavailable` — there is no zero-vector fallback (design §5.3).
 
 ## Development
 
 ```bash
-npm test          # invariants, kernel suite, writes, admin, auth, query, HTTP surfaces, CLI
+npm test          # invariants, kernel suite, writes, admin, auth, query, rank, diff, chunker, worker, HTTP surfaces, CLI
 npm run typecheck # tsc --noEmit, strict
 npm run lint      # biome check
 npm run build     # emit dist/
 ```
 
-CI runs typecheck + lint + tests on Ubuntu & macOS × Node 20 & 22.
+CI runs typecheck + lint + tests on Ubuntu & macOS × Node 20 & 22. `sqlite-vec` is loaded via better-sqlite3's `loadExtension` on every cell; if a platform gap ever appears, the fallback is computing cosine distance in a JS UDF — invisible above the adapter.
 
 ## License
 

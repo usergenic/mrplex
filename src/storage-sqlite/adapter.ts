@@ -614,9 +614,9 @@ class SqliteStorage implements Storage {
         .get(now) as { n: number }
     ).n;
     const failing = (
-      this.db
-        .prepare("select count(*) as n from embedding_backlog where attempts > 0")
-        .get() as { n: number }
+      this.db.prepare("select count(*) as n from embedding_backlog where attempts > 0").get() as {
+        n: number;
+      }
     ).n;
     const oldestRow = this.db
       .prepare(

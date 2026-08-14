@@ -13,11 +13,7 @@
 
 import { type IncomingMessage, type Server, type ServerResponse, createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import {
-  type EmbedConfig,
-  createHookFromConfig,
-  describeEmbedConfig,
-} from "../embed/config.js";
+import { type EmbedConfig, createHookFromConfig, describeEmbedConfig } from "../embed/config.js";
 import type { EmbedHook } from "../embed/hook.js";
 import { type Worker, createWorker } from "../embed/worker.js";
 import { type Kernel, createKernel } from "../kernel/kernel.js";

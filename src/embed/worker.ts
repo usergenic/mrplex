@@ -19,8 +19,8 @@
  * not just resulting vectors.
  */
 
-import type { BacklogRow, Storage } from "../storage/types.js";
 import { encodeVectorBlob } from "../storage-sqlite/vec.js";
+import type { BacklogRow, Storage } from "../storage/types.js";
 import { chunkBody } from "./chunker.js";
 import type { EmbedHook, EmbedResponse } from "./hook.js";
 
@@ -72,9 +72,7 @@ export function createWorker(opts: WorkerOptions): Worker {
   let stopping = false;
   let currentIteration: Promise<void> | null = null;
 
-  async function processOne(
-    entry: BacklogRow,
-  ): Promise<"processed" | "failed" | "skipped"> {
+  async function processOne(entry: BacklogRow): Promise<"processed" | "failed" | "skipped"> {
     const version = opts.storage.version_by_id(entry.version_id);
     if (!version) {
       // Version was deleted (impossible in v1) — clear the row.
@@ -102,9 +100,7 @@ export function createWorker(opts: WorkerOptions): Worker {
     //    by looking at any existing chunk for this document's prior
     //    version. Fallback: skip dedup for the first embed under a
     //    given model (worker calls the hook for every chunk).
-    const priorChunks = version.prev_id
-      ? opts.storage.chunks_by_version(version.prev_id)
-      : [];
+    const priorChunks = version.prev_id ? opts.storage.chunks_by_version(version.prev_id) : [];
     const priorModel = priorChunks[0]?.model ?? null;
 
     // Split into (reused, needs_hook).

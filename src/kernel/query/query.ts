@@ -66,11 +66,7 @@ export type QueryDeps = {
 /** M2 default when the spec omits limit. */
 export const DEFAULT_QUERY_LIMIT = 50;
 
-export async function runQuery(
-  actor: Actor,
-  spec: QuerySpec,
-  deps: QueryDeps,
-): Promise<Version[]> {
+export async function runQuery(actor: Actor, spec: QuerySpec, deps: QueryDeps): Promise<Version[]> {
   validateSpec(spec);
 
   // 1. Resolve repos the caller can address.
@@ -188,9 +184,7 @@ export async function runQuery(
     });
     // Reorder by rank score.
     const scoreById = new Map(survivors.map((s) => [s.row.id, s.score]));
-    rows.sort(
-      (a, b) => (scoreById.get(a.id) ?? 1) - (scoreById.get(b.id) ?? 1),
-    );
+    rows.sort((a, b) => (scoreById.get(a.id) ?? 1) - (scoreById.get(b.id) ?? 1));
     return rows.slice(0, userLimit).map((row) => {
       const repoSlug = (reposById.get(row.repo_id) as RepoRow).slug;
       return deps.toVersionWire(row, repoSlug);

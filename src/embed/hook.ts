@@ -38,10 +38,7 @@ export type EmbedHook = {
  * unchanged on success; throws a descriptive Error on any violation.
  * Hooks call this before returning so the worker can trust the shape.
  */
-export function validateEmbedResponse(
-  resp: unknown,
-  requested: readonly string[],
-): EmbedResponse {
+export function validateEmbedResponse(resp: unknown, requested: readonly string[]): EmbedResponse {
   if (typeof resp !== "object" || resp === null) {
     throw new Error("embed hook: response is not an object");
   }
@@ -52,7 +49,9 @@ export function validateEmbedResponse(
   }
   const dim = r.dim;
   if (typeof dim !== "number" || !Number.isInteger(dim) || dim <= 0) {
-    throw new Error(`embed hook: response.dim must be a positive integer (got ${JSON.stringify(dim)})`);
+    throw new Error(
+      `embed hook: response.dim must be a positive integer (got ${JSON.stringify(dim)})`,
+    );
   }
   const vectors = r.vectors;
   if (!Array.isArray(vectors)) {
@@ -69,9 +68,7 @@ export function validateEmbedResponse(
       throw new Error(`embed hook: vectors[${i}] is not an array`);
     }
     if (v.length !== dim) {
-      throw new Error(
-        `embed hook: vectors[${i}].length (${v.length}) !== dim (${dim})`,
-      );
+      throw new Error(`embed hook: vectors[${i}].length (${v.length}) !== dim (${dim})`);
     }
     for (let j = 0; j < v.length; j++) {
       if (typeof v[j] !== "number" || !Number.isFinite(v[j])) {

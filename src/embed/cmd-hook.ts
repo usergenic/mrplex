@@ -56,9 +56,7 @@ export function createCmdEmbedHook(opts: CmdHookOptions): EmbedHook {
     });
     proc.stderr.on("data", (chunk: string) => onStderr(chunk));
     proc.on("exit", (code, signal) => {
-      const err = new Error(
-        `embed hook subprocess exited (code=${code} signal=${signal ?? ""})`,
-      );
+      const err = new Error(`embed hook subprocess exited (code=${code} signal=${signal ?? ""})`);
       if (pendingError) {
         const cb = pendingError;
         pending = null;

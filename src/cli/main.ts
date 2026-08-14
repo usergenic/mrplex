@@ -18,11 +18,7 @@ import type { KernelClient } from "../client/kernel-client.js";
 import { openLocalClient } from "../client/local.js";
 import { openRemoteClient } from "../client/remote-mcp.js";
 import { backfillRepo } from "../embed/backfill.js";
-import {
-  createHookFromConfig,
-  describeEmbedConfig,
-  resolveEmbedConfig,
-} from "../embed/config.js";
+import { createHookFromConfig, describeEmbedConfig, resolveEmbedConfig } from "../embed/config.js";
 import { createWorker } from "../embed/worker.js";
 import type { ScopeInput } from "../kernel/auth/scope.js";
 import { KernelError } from "../kernel/errors.js";
@@ -546,9 +542,7 @@ function buildProgram(): Command {
           process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
         } else {
           // Raw patch on stdout for `patch -p0`-friendly piping.
-          process.stdout.write(
-            result.patch.endsWith("\n") ? result.patch : `${result.patch}\n`,
-          );
+          process.stdout.write(result.patch.endsWith("\n") ? result.patch : `${result.patch}\n`);
         }
       }).catch(reportError);
     });
