@@ -53,6 +53,22 @@ class SqliteStorage implements Storage {
     this.db.pragma("synchronous = NORMAL");
     this.db.pragma("foreign_keys = ON");
     this.db.pragma("busy_timeout = 5000");
+    // regexp() user function — used by CEL's matches() via the AST→SQL
+    // compiler (m2-plan §5). Portable to Postgres via ~; we ship a
+    // deterministic JS-backed impl here rather than depend on the SQLite
+    // REGEXP extension.
+    this.db.function(
+      "regexp",
+      { deterministic: true },
+      (pattern: unknown, input: unknown): number => {
+        if (typeof pattern !== "string" || typeof input !== "string") return 0;
+        try {
+          return new RegExp(pattern).test(input) ? 1 : 0;
+        } catch {
+          return 0;
+        }
+      },
+    );
   }
 
   close(): void {
