@@ -296,6 +296,29 @@ describe("docs.delete", () => {
     expect(again.path).toBe(deleted.path);
   });
 
+  it("delete with a STALE trashed-version prev → stale_prev (not no-op)", () => {
+    // Cycle: create → delete → restore → delete-again. Now call delete with
+    // the FIRST trashed version — it's system-namespaced but no longer
+    // current. Must fail stale_prev, not be treated as an already-deleted
+    // no-op.
+    const v1 = kernel.docs.create(actor, "notes", "hello.md", {
+      frontmatter_raw: "",
+      body: "one\n",
+    });
+    const trashed1 = kernel.docs.delete(actor, "notes", v1.version_id);
+    const restored = kernel.docs.put(actor, "notes", trashed1.version_id, "hello.md", {});
+    const trashed2 = kernel.docs.delete(actor, "notes", restored.version_id);
+    // trashed1 is a system-namespaced prev, but no longer current.
+    try {
+      kernel.docs.delete(actor, "notes", trashed1.version_id);
+      throw new Error("expected stale_prev");
+    } catch (err) {
+      expect((err as KernelError).code).toBe("stale_prev");
+      const data = (err as KernelError<{ current_version_id: string }>).data;
+      expect(data.current_version_id).toBe(trashed2.version_id);
+    }
+  });
+
   it("restore: docs.put from a trashed prev back to a user-territory path", () => {
     const v1 = kernel.docs.create(actor, "notes", "hello.md", {
       frontmatter_raw: "",

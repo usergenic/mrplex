@@ -382,15 +382,19 @@ class SqliteStorage implements Storage {
   }
 
   tokens_list(user_id: number): TokenRow[] {
+    // Filter revoked + expired at read time (adapter contract, matching
+    // tokens_by_hash) so the kernel doesn't have to remember.
     return this.db
       .prepare(
         `select id, user_id, secret_hash, label, scopes,
                 admin, expires_at, revoked_at, created_at, last_used_at
            from api_tokens
            where user_id = ?
+             and revoked_at is null
+             and (expires_at is null or expires_at > ?)
            order by created_at desc, id desc`,
       )
-      .all(user_id) as TokenRow[];
+      .all(user_id, new Date().toISOString()) as TokenRow[];
   }
 
   tokens_revoke(id: number, revoked_at: string): TokenRow | null {

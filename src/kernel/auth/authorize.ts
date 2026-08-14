@@ -21,7 +21,6 @@
  */
 
 import { forbidden } from "../errors.js";
-import { HARDCODED_DEFAULTS } from "../path-config.js";
 import type { Action, Actor, Target } from "./actor.js";
 import { moveEndpointsToCheck, scopesGrant, scopesGrantRepo } from "./scope.js";
 
@@ -62,16 +61,10 @@ export function authorize(actor: Actor, action: Action, target: Target): void {
     // a system sigil skips scope check on that endpoint. The kernel emits
     // system-namespace paths on its own behalf (delete/restore).
     //
-    // TODO(WS7): pass repo-effective sigils through the Target so we honor
-    // per-repo overrides. For now, use the hardcoded defaults since that's
-    // what M0 emits, and the deletion path in WS6 is written to use
-    // HARDCODED_DEFAULTS.system_sigils[0] too. When WS7 threads path-config
-    // through, we'll swap this reference for the effective config.
-    const endpoints = moveEndpointsToCheck(
-      target.source,
-      target.destination,
-      HARDCODED_DEFAULTS.system_sigils,
-    );
+    // The move target carries the REPO's effective system_sigils (not the
+    // hardcoded defaults), so a repo that overrode its sigils via
+    // repos.set_path_config still gets a correct carve-out on delete/restore.
+    const endpoints = moveEndpointsToCheck(target.source, target.destination, target.system_sigils);
     for (const path of endpoints) {
       if (!scopesGrant(actor.scopes, "write", target.repo_id, path)) {
         throw forbidden();

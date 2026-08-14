@@ -46,7 +46,19 @@ export type Target =
   | { kind: "server_admin" } // admin-gated server op (users.*, repos.create/rename/delete/set_path_config, cross-user token mgmt)
   | { kind: "repo"; repo_id: number }
   | { kind: "path"; repo_id: number; path: string }
-  | { kind: "move"; repo_id: number; source: string; destination: string };
+  | {
+      kind: "move";
+      repo_id: number;
+      source: string;
+      destination: string;
+      /**
+       * Effective system-sigil prefixes for THIS repo (not the hardcoded
+       * defaults). authorize() uses them to apply the system-namespace
+       * carve-out (§8.2) against a repo that may have overridden its
+       * system_sigils via repos.set_path_config.
+       */
+      system_sigils: readonly string[];
+    };
 
 /**
  * Kernel-internal system actor. Used for calls the kernel makes on its own

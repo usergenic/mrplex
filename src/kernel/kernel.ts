@@ -26,7 +26,14 @@ import {
   tokenIdString,
 } from "./auth/tokens.js";
 import { deletionPath, pathIsInSystemNamespace } from "./deletion.js";
-import { KernelError, docNotFound, repoNotFound, userNotFound, versionNotFound } from "./errors.js";
+import {
+  KernelError,
+  docNotFound,
+  repoNotFound,
+  tokenNotFound,
+  userNotFound,
+  versionNotFound,
+} from "./errors.js";
 import {
   type CanonicalFrontmatter,
   type FrontmatterInput,
@@ -110,9 +117,6 @@ export type KernelConfig = {
   serverPathConfig?: PathConfig;
 };
 
-/** M0-visible system sigils for filtering system-namespaced repo slugs. */
-const SYSTEM_SIGIL_PREFIX = ":";
-
 export function createKernel(config: KernelConfig | Storage): Kernel {
   // Accept a bare Storage for M0 backwards-compat.
   const cfg: KernelConfig =
@@ -195,17 +199,18 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
   }
 
   /**
-   * Short base32 uniquifier for system-namespace slug renames (§3.4).
-   * m1-plan §5 pinned: 6 chars of base32 of randomBytes(4). Enough entropy
-   * that a collision on the same slug-base within a repo/user lifetime is
-   * essentially impossible.
+   * Short hex uniquifier for system-namespace slug renames (§3.4). 3 random
+   * bytes → exactly 6 hex chars → 24 bits of entropy — comfortably beyond
+   * any realistic collision risk within a single repo/user's lifetime
+   * deletion history.
+   *
+   * m1-plan §5 originally said "base32", but Node has no built-in base32
+   * encoder and the value the design cares about is "short, stable,
+   * alphanumeric, enough entropy." Hex satisfies all three with zero
+   * dependencies and is what actually ships.
    */
   function slugUniquifier(): string {
-    // 4 bytes = 32 bits ≈ 7 base32 chars; take the first 6.
-    return randomBytes(4)
-      .toString("base64url")
-      .replace(/[^A-Za-z0-9]/g, "")
-      .slice(0, 6);
+    return randomBytes(3).toString("hex");
   }
 
   function isSlugSystemNamespaced(slug: string): boolean {
@@ -262,9 +267,11 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
       list(actor, opts) {
         authorize(actor, "read", { kind: "server" });
         const includeSystem = opts?.include_system ?? false;
+        // Server-config sigils apply here — slugs live in the server namespace,
+        // not per-repo — matching §3.5.6 (slugs validated against server config).
         return storage
           .repos_list()
-          .filter((r) => includeSystem || !r.slug.startsWith(SYSTEM_SIGIL_PREFIX))
+          .filter((r) => includeSystem || !isSlugSystemNamespaced(r.slug))
           .map(toRepoWire);
       },
       get(actor, slug) {
@@ -446,14 +453,16 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
         // source === destination — that still fires scopesGrant on the same
         // path twice, harmless). The move target lets the system-namespace
         // carve-out apply for restore (source is system, dest is user).
+        const putCfg = repoEffectiveConfig(repo);
         authorize(actor, "write", {
           kind: "move",
           repo_id: repo.id,
           source: prev.path,
           destination: destPath,
+          system_sigils: putCfg.system_sigils,
         });
 
-        validatePath(destPath, repoEffectiveConfig(repo));
+        validatePath(destPath, putCfg);
         const canon = canonicalizeOrCarry(input, prev);
         const body = input.body ?? prev.body;
 
@@ -511,15 +520,34 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
         const prev = storage.version_by_id(prevId);
         if (!prev || prev.repo_id !== repo.id) throw versionNotFound(prevVersionId);
 
-        // Idempotency (design §4.1 rule 4): if prev is already in the system
-        // namespace, this is a no-op — return the current version unchanged.
         const cfg = repoEffectiveConfig(repo);
+
+        // Verify prev is STILL the current version of its document. Only
+        // then can we short-circuit the "already deleted" idempotent case.
+        // A prev that is system-namespaced but no longer current means the
+        // document has since gone through delete → restore → delete cycles
+        // and this call is stale — stale_prev, not a no-op.
+        const currentAtPrevPath = storage.version_current(repo.id, prev.path);
+        if (!currentAtPrevPath || currentAtPrevPath.id !== prev.id) {
+          const docCurrent =
+            currentAtPrevPath ?? storage.version_history(prev.document_id, { limit: 1 })[0] ?? null;
+          throw new KernelError("stale_prev", {
+            current_version_id: docCurrent ? encodeVersionId(docCurrent.id) : null,
+            current_path: docCurrent
+              ? currentPathForStaleError(actor, repo.id, docCurrent.path)
+              : null,
+            submitted_prev_version_id: prevVersionId,
+          });
+        }
+
+        // prev IS current. Idempotency (design §4.1 rule 4): if the current
+        // version's path is under a system sigil, the doc is already
+        // deleted — no-op, return unchanged.
         if (pathIsInSystemNamespace(prev.path, cfg.system_sigils)) {
           return toVersionWire(prev, repoSlug);
         }
 
-        // Compute the deletion path FIRST so we can authorize the move.
-        // Uses the canonical sigil (§3.5.4 — set for input, first for output).
+        // Compute the deletion path (§3.5.4 — set for input, first for output).
         const destPath = deletionPath(
           cfg.system_sigils[0] as string,
           prev.path,
@@ -531,6 +559,7 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
           repo_id: repo.id,
           source: prev.path,
           destination: destPath,
+          system_sigils: cfg.system_sigils,
         });
 
         // NOTE the destPath's segment starts with a system sigil, which
@@ -538,6 +567,8 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
         // kernel emitting on its own behalf (design §4.1 rule 4).
 
         return storage.tx(() => {
+          // Re-check prev is still current inside the tx to close the race
+          // window between the pre-check above and the insert.
           const current = storage.version_current(repo.id, prev.path);
           if (!current || current.id !== prev.id) {
             const docCurrent =
@@ -570,11 +601,9 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
     tokens: {
       list(actor) {
         // A user always sees their own tokens (design §8.2 self-token
-        // management). Admin listing across users is `[OPEN]`.
-        return storage
-          .tokens_list(actor.user_id)
-          .filter((t) => t.revoked_at === null)
-          .map(tokenRowToWire);
+        // management). Admin listing across users is `[OPEN]`. Adapter
+        // already filters revoked + expired.
+        return storage.tokens_list(actor.user_id).map(tokenRowToWire);
       },
       create(actor, label, scopeInputs, opts) {
         const admin = opts?.admin ?? false;
@@ -599,13 +628,9 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
       },
       revoke(actor, tokenId) {
         const id = decodeTokenId(tokenId);
-        if (id === null) {
-          throw new KernelError("version_not_found", { token_id: tokenId });
-        }
+        if (id === null) throw tokenNotFound(tokenId);
         const row = storage.tokens_by_id(id);
-        if (!row) {
-          throw new KernelError("version_not_found", { token_id: tokenId });
-        }
+        if (!row) throw tokenNotFound(tokenId);
         // Self-revoke is always allowed. Cross-user revoke requires admin.
         if (row.user_id !== actor.user_id && !actor.admin) {
           throw new KernelError("forbidden", {});

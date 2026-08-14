@@ -18,6 +18,7 @@ export function exitCodeForKernelError(code: KernelErrorCode): number {
     case "user_not_found":
     case "doc_not_found":
     case "version_not_found":
+    case "token_not_found":
       return 4;
     case "stale_prev":
     case "create_conflict":

@@ -46,11 +46,16 @@ function parsePositiveInt(value: string, _prev: unknown): number {
 /**
  * Parse a --scope value into a ScopeInput.
  *
- *   <slug-or-glob>:read=<glob>[,<glob>...],write=<glob>[,<glob>...]
+ *   <slug-or-glob>:<action>=<glob>[|<glob>...][,<action>=<glob>[|<glob>...]]
+ *
+ * Actions are `read` and `write`. Multiple globs WITHIN one action are
+ * `|`-separated (comma would collide with the action separator); multiple
+ * actions are comma-separated. Pass --scope multiple times to stack.
  *
  * e.g. `notes:read=**,write=inbox/**`
  *      `team-*:read=**`
  *      `*:read=**,write=**`
+ *      `notes:write=drafts/**|!drafts/pinned/**`
  */
 function parseScope(value: string, prev: ScopeInput[] | undefined): ScopeInput[] {
   const [repoPart, ...capParts] = value.split(":");

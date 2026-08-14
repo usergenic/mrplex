@@ -27,6 +27,7 @@ describe("authorize — admin short-circuit", () => {
         repo_id: 1,
         source: "a.md",
         destination: "b.md",
+        system_sigils: [":"],
       }),
     ).not.toThrow();
   });
@@ -121,6 +122,7 @@ describe("authorize — move + system-namespace carve-out", () => {
         repo_id: 1,
         source: "a.md",
         destination: "b.md",
+        system_sigils: [":"],
       }),
     ).not.toThrow();
   });
@@ -132,6 +134,7 @@ describe("authorize — move + system-namespace carve-out", () => {
         repo_id: 1,
         source: "notes/a.md",
         destination: "elsewhere.md",
+        system_sigils: [":"],
       }),
     );
   });
@@ -145,6 +148,7 @@ describe("authorize — move + system-namespace carve-out", () => {
         repo_id: 1,
         source: "notes/a.md",
         destination: ":deleted/notes/a-v1.md",
+        system_sigils: [":"],
       }),
     ).not.toThrow();
   });
@@ -156,6 +160,7 @@ describe("authorize — move + system-namespace carve-out", () => {
         repo_id: 1,
         source: "elsewhere.md",
         destination: ":deleted/elsewhere-v1.md",
+        system_sigils: [":"],
       }),
     );
   });
@@ -167,6 +172,7 @@ describe("authorize — move + system-namespace carve-out", () => {
         repo_id: 1,
         source: ":deleted/notes/a-v1.md",
         destination: "notes/restored.md",
+        system_sigils: [":"],
       }),
     ).not.toThrow();
     expectForbidden(() =>
@@ -175,6 +181,7 @@ describe("authorize — move + system-namespace carve-out", () => {
         repo_id: 1,
         source: ":deleted/elsewhere-v1.md",
         destination: "elsewhere.md",
+        system_sigils: [":"],
       }),
     );
   });
@@ -186,6 +193,7 @@ describe("authorize — move + system-namespace carve-out", () => {
         repo_id: 1,
         source: "a.md",
         destination: "b.md",
+        system_sigils: [":"],
       }),
     );
   });
