@@ -108,6 +108,14 @@ class SqliteStorage implements Storage {
     return row;
   }
 
+  users_rename(id: number, new_slug: string): UserRow {
+    const row = this.db
+      .prepare("update users set slug = ? where id = ? returning id, slug, created_at")
+      .get(new_slug, id) as UserRow | undefined;
+    if (!row) throw new Error(`users_rename: user ${id} not found`);
+    return row;
+  }
+
   users_by_slug(slug: string): UserRow | null {
     return (
       (this.db.prepare("select id, slug, created_at from users where slug = ?").get(slug) as
@@ -136,6 +144,24 @@ class SqliteStorage implements Storage {
         "insert into repos(slug, created_at) values (?, ?) returning id, slug, path_config, created_at",
       )
       .get(input.slug, input.created_at) as RepoRow;
+    return row;
+  }
+
+  repos_rename(id: number, new_slug: string): RepoRow {
+    const row = this.db
+      .prepare("update repos set slug = ? where id = ? returning id, slug, path_config, created_at")
+      .get(new_slug, id) as RepoRow | undefined;
+    if (!row) throw new Error(`repos_rename: repo ${id} not found`);
+    return row;
+  }
+
+  repos_set_path_config(id: number, path_config: string | null): RepoRow {
+    const row = this.db
+      .prepare(
+        "update repos set path_config = ? where id = ? returning id, slug, path_config, created_at",
+      )
+      .get(path_config, id) as RepoRow | undefined;
+    if (!row) throw new Error(`repos_set_path_config: repo ${id} not found`);
     return row;
   }
 
@@ -247,6 +273,19 @@ class SqliteStorage implements Storage {
       )
       .get(repo_id, path) as VersionRawRow | undefined;
     return row ? hydrateVersion(row) : null;
+  }
+
+  versions_live_by_repo(repo_id: number): VersionRow[] {
+    const rows = this.db
+      .prepare(
+        `select id, document_id, repo_id, prev_id, next_id, path,
+                frontmatter_raw, frontmatter, body, author_id, created_at
+         from versions
+         where repo_id = ? and next_id is null
+         order by path`,
+      )
+      .all(repo_id) as VersionRawRow[];
+    return rows.map(hydrateVersion);
   }
 
   version_history(document_id: number, opts?: HistoryOptions): VersionRow[] {

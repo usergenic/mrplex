@@ -7,13 +7,26 @@
  * frontmatter canonicalization, and real `authorize()` on every op.
  */
 
-import type { RepoRow, Storage, VersionRow } from "../storage/types.js";
-import type { Action, Actor, Target } from "./auth/actor.js";
+import { randomBytes } from "node:crypto";
+import type { RepoRow, Storage, TokenRow, VersionRow } from "../storage/types.js";
+import type { Action, Actor, StoredScope, Target } from "./auth/actor.js";
 import { authorize } from "./auth/authorize.js";
-import { scopesGrant } from "./auth/scope.js";
-import { pathIsInSystemNamespace } from "./deletion.js";
-import { deletionPath } from "./deletion.js";
-import { KernelError, docNotFound, repoNotFound, versionNotFound } from "./errors.js";
+import {
+  type ScopeInput,
+  assertAdminSubset,
+  assertChildScopeSubset,
+  resolveScopeInputs,
+  scopesGrant,
+} from "./auth/scope.js";
+import {
+  generateSecret,
+  hashSecret,
+  parseStoredScopes,
+  serializeStoredScopes,
+  tokenIdString,
+} from "./auth/tokens.js";
+import { deletionPath, pathIsInSystemNamespace } from "./deletion.js";
+import { KernelError, docNotFound, repoNotFound, userNotFound, versionNotFound } from "./errors.js";
 import {
   type CanonicalFrontmatter,
   type FrontmatterInput,
@@ -22,22 +35,40 @@ import {
 import {
   HARDCODED_DEFAULTS,
   type PathConfig,
+  type PathConfigOverride,
   effectivePathConfig,
   parseRepoOverride,
+  pathWarning,
+  validateRepoOverride,
 } from "./path-config.js";
-import { validatePath } from "./validation.js";
+import { validatePath, validateSlug } from "./validation.js";
 import { decodeVersionId, encodeVersionId } from "./version-id.js";
-import type { Repo, User, Version } from "./wire.js";
+import type { PathWarning, Repo, Scope, Token, User, Version } from "./wire.js";
 
 export type HistoryOptions = { limit?: number; before?: string };
+
+export type SetPathConfigResult = { repo: Repo; warnings: PathWarning[] };
+
+export type TokenCreateResult = { token: string; meta: Token };
 
 export type Kernel = {
   repos: {
     list(actor: Actor, opts?: { include_system?: boolean }): Repo[];
     get(actor: Actor, slug: string): Repo;
+    create(actor: Actor, slug: string): Repo;
+    rename(actor: Actor, slug: string, new_slug: string): Repo;
+    delete(actor: Actor, slug: string): Repo;
+    set_path_config(
+      actor: Actor,
+      slug: string,
+      config: PathConfigOverride | null,
+    ): SetPathConfigResult;
   };
   users: {
     list(actor: Actor): User[];
+    create(actor: Actor, slug: string): User;
+    rename(actor: Actor, slug: string, new_slug: string): User;
+    delete(actor: Actor, slug: string): User;
   };
   docs: {
     get(actor: Actor, repo: string, path: string): Version;
@@ -57,6 +88,16 @@ export type Kernel = {
       input: Partial<FrontmatterInput> & { body?: string },
     ): Version;
     delete(actor: Actor, repo: string, prev_version_id: string): Version;
+  };
+  tokens: {
+    list(actor: Actor): Token[];
+    create(
+      actor: Actor,
+      label: string | null,
+      scopes: ScopeInput[],
+      opts?: { admin?: boolean; expires_at?: string | null },
+    ): TokenCreateResult;
+    revoke(actor: Actor, token_id: string): Token;
   };
 };
 
@@ -153,6 +194,69 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
     return canonicalizeFrontmatter(input as FrontmatterInput);
   }
 
+  /**
+   * Short base32 uniquifier for system-namespace slug renames (§3.4).
+   * m1-plan §5 pinned: 6 chars of base32 of randomBytes(4). Enough entropy
+   * that a collision on the same slug-base within a repo/user lifetime is
+   * essentially impossible.
+   */
+  function slugUniquifier(): string {
+    // 4 bytes = 32 bits ≈ 7 base32 chars; take the first 6.
+    return randomBytes(4)
+      .toString("base64url")
+      .replace(/[^A-Za-z0-9]/g, "")
+      .slice(0, 6);
+  }
+
+  function isSlugSystemNamespaced(slug: string): boolean {
+    return serverPathConfig.system_sigils.some((sigil) => slug.startsWith(sigil));
+  }
+
+  function slugCollisionError(slug: string): KernelError {
+    return new KernelError("slug_taken", { slug });
+  }
+
+  /**
+   * Translate StoredScope[] → wire Scope[]. Requires storage to look up
+   * current slugs for the bound repo ids. A repo id whose row no longer
+   * exists is silently dropped (rename-friendly per §8.2's "tokens.list
+   * renders bound repos by their current slugs").
+   */
+  function scopesToWire(scopes: StoredScope[]): Scope[] {
+    return scopes.map((s) => {
+      if (s.repos === "*") {
+        return { repos: "*", read: s.read, write: s.write };
+      }
+      const slugs: string[] = [];
+      for (const id of s.repos) {
+        const row = storage.repos_by_id(id);
+        if (row) slugs.push(row.slug);
+      }
+      slugs.sort();
+      return { repos: slugs, read: s.read, write: s.write };
+    });
+  }
+
+  function tokenRowToWire(row: TokenRow): Token {
+    return {
+      id: tokenIdString(row),
+      label: row.label,
+      admin: row.admin === 1,
+      scopes: scopesToWire(parseStoredScopes(row.scopes)),
+      expires_at: row.expires_at,
+      created_at: row.created_at,
+      last_used_at: row.last_used_at,
+    };
+  }
+
+  function decodeTokenId(tokenId: string): number | null {
+    const m = tokenId.match(/^t(\d+)$/);
+    if (!m || !m[1]) return null;
+    const n = Number.parseInt(m[1], 10);
+    if (!Number.isSafeInteger(n) || n <= 0) return null;
+    return n;
+  }
+
   return {
     repos: {
       list(actor, opts) {
@@ -166,12 +270,109 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
       get(actor, slug) {
         return toRepoWire(resolveRepo(actor, slug, "read"));
       },
+      create(actor, slug) {
+        authorize(actor, "admin", { kind: "server_admin" });
+        validateSlug(slug, serverPathConfig);
+        if (storage.repos_by_slug(slug)) throw slugCollisionError(slug);
+        const row = storage.repos_create({ slug, created_at: new Date().toISOString() });
+        return toRepoWire(row);
+      },
+      rename(actor, slug, new_slug) {
+        authorize(actor, "admin", { kind: "server_admin" });
+        const repo = storage.repos_by_slug(slug);
+        if (!repo) throw repoNotFound(slug);
+        if (new_slug === slug) return toRepoWire(repo);
+        validateSlug(new_slug, serverPathConfig);
+        if (storage.repos_by_slug(new_slug)) throw slugCollisionError(new_slug);
+        return toRepoWire(storage.repos_rename(repo.id, new_slug));
+      },
+      delete(actor, slug) {
+        authorize(actor, "admin", { kind: "server_admin" });
+        const repo = storage.repos_by_slug(slug);
+        if (!repo) throw repoNotFound(slug);
+        // Idempotent (§3.4): already system-namespaced → no-op.
+        if (isSlugSystemNamespaced(repo.slug)) return toRepoWire(repo);
+        // Rename the slug into the system namespace with a uniquifier so
+        // multiple deletions of same-basename repos don't collide.
+        const sigil = serverPathConfig.system_sigils[0] as string;
+        // Try a few times in the (astronomically unlikely) event of a
+        // uniquifier collision.
+        for (let attempt = 0; attempt < 5; attempt++) {
+          const newSlug = `${sigil}deleted-${repo.slug}-${slugUniquifier()}`;
+          if (storage.repos_by_slug(newSlug)) continue;
+          return toRepoWire(storage.repos_rename(repo.id, newSlug));
+        }
+        throw new Error("repos.delete: uniquifier collision (retries exhausted)");
+      },
+      set_path_config(actor, slug, config) {
+        authorize(actor, "admin", { kind: "server_admin" });
+        const repo = storage.repos_by_slug(slug);
+        if (!repo) throw repoNotFound(slug);
+        if (config !== null) {
+          validateRepoOverride(config, serverPathConfig);
+        }
+        const configJson = config === null ? null : JSON.stringify(config);
+        const updated = storage.repos_set_path_config(repo.id, configJson);
+        // Advisory warnings (§3.5.3): scan the repo's live paths against the
+        // new effective config and collect any that no longer validate.
+        // Rides the partial-index on (repo_id, path) where next_id is null,
+        // so it's O(live-set) per repo.
+        const newEffective = effectivePathConfig(serverPathConfig, config);
+        const warnings: PathWarning[] = [];
+        // Skip trashed docs — those live under system sigils and were emitted
+        // by the kernel; user-visible warnings should be about user-territory
+        // paths only.
+        for (const version of storage.versions_live_by_repo(repo.id)) {
+          if (pathIsInSystemNamespace(version.path, newEffective.system_sigils)) {
+            continue;
+          }
+          try {
+            validatePath(version.path, newEffective);
+          } catch (err) {
+            warnings.push(pathWarning(encodeVersionId(version.id), version.path, err));
+          }
+        }
+        return { repo: toRepoWire(updated), warnings };
+      },
     },
 
     users: {
       list(actor) {
         authorize(actor, "read", { kind: "server" });
         return storage.users_list().map((u) => ({ user: u.slug }));
+      },
+      create(actor, slug) {
+        authorize(actor, "admin", { kind: "server_admin" });
+        validateSlug(slug, serverPathConfig);
+        if (storage.users_by_slug(slug)) throw new KernelError("slug_taken", { slug });
+        const row = storage.users_create({ slug, created_at: new Date().toISOString() });
+        return { user: row.slug };
+      },
+      rename(actor, slug, new_slug) {
+        authorize(actor, "admin", { kind: "server_admin" });
+        const user = storage.users_by_slug(slug);
+        if (!user) throw userNotFound(slug);
+        if (new_slug === slug) return { user: user.slug };
+        validateSlug(new_slug, serverPathConfig);
+        if (storage.users_by_slug(new_slug)) throw slugCollisionError(new_slug);
+        const updated = storage.users_rename(user.id, new_slug);
+        return { user: updated.slug };
+      },
+      delete(actor, slug) {
+        authorize(actor, "admin", { kind: "server_admin" });
+        const user = storage.users_by_slug(slug);
+        if (!user) throw userNotFound(slug);
+        if (isSlugSystemNamespaced(user.slug)) return { user: user.slug };
+        const sigil = serverPathConfig.system_sigils[0] as string;
+        for (let attempt = 0; attempt < 5; attempt++) {
+          const newSlug = `${sigil}deleted-${user.slug}-${slugUniquifier()}`;
+          if (storage.users_by_slug(newSlug)) continue;
+          // Revoke all their tokens as part of the same conceptual op (§3.4).
+          storage.tokens_revoke_by_user(user.id, new Date().toISOString());
+          const updated = storage.users_rename(user.id, newSlug);
+          return { user: updated.slug };
+        }
+        throw new Error("users.delete: uniquifier collision (retries exhausted)");
       },
     },
 
@@ -363,6 +564,54 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
           });
           return toVersionWire(inserted, repoSlug);
         });
+      },
+    },
+
+    tokens: {
+      list(actor) {
+        // A user always sees their own tokens (design §8.2 self-token
+        // management). Admin listing across users is `[OPEN]`.
+        return storage
+          .tokens_list(actor.user_id)
+          .filter((t) => t.revoked_at === null)
+          .map(tokenRowToWire);
+      },
+      create(actor, label, scopeInputs, opts) {
+        const admin = opts?.admin ?? false;
+        assertAdminSubset(actor.admin, admin);
+        const resolvedScopes = resolveScopeInputs(scopeInputs, storage);
+        // Child scopes must be a subset of parent's — unless parent is
+        // admin, which can mint anything.
+        if (!actor.admin) {
+          assertChildScopeSubset(actor.scopes, resolvedScopes);
+        }
+        const secret = generateSecret();
+        const row = storage.tokens_create({
+          user_id: actor.user_id,
+          secret_hash: hashSecret(secret),
+          label,
+          scopes: serializeStoredScopes(resolvedScopes),
+          admin,
+          expires_at: opts?.expires_at ?? null,
+          created_at: new Date().toISOString(),
+        });
+        return { token: secret, meta: tokenRowToWire(row) };
+      },
+      revoke(actor, tokenId) {
+        const id = decodeTokenId(tokenId);
+        if (id === null) {
+          throw new KernelError("version_not_found", { token_id: tokenId });
+        }
+        const row = storage.tokens_by_id(id);
+        if (!row) {
+          throw new KernelError("version_not_found", { token_id: tokenId });
+        }
+        // Self-revoke is always allowed. Cross-user revoke requires admin.
+        if (row.user_id !== actor.user_id && !actor.admin) {
+          throw new KernelError("forbidden", {});
+        }
+        const revoked = storage.tokens_revoke(id, new Date().toISOString());
+        return tokenRowToWire(revoked ?? row);
       },
     },
   };

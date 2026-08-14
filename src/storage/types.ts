@@ -93,11 +93,14 @@ export type Storage = {
 
   users_list(): UserRow[];
   users_create(input: { slug: string; created_at: string }): UserRow;
+  users_rename(id: number, new_slug: string): UserRow;
   users_by_slug(slug: string): UserRow | null;
   users_by_id(id: number): UserRow | null;
 
   repos_list(): RepoRow[];
   repos_create(input: { slug: string; created_at: string }): RepoRow;
+  repos_rename(id: number, new_slug: string): RepoRow;
+  repos_set_path_config(id: number, path_config: string | null): RepoRow;
   repos_by_slug(slug: string): RepoRow | null;
   repos_by_id(id: number): RepoRow | null;
 
@@ -115,6 +118,14 @@ export type Storage = {
   version_by_id(id: number): VersionRow | null;
   version_current(repo_id: number, path: string): VersionRow | null;
   version_history(document_id: number, opts?: HistoryOptions): VersionRow[];
+
+  /**
+   * All currently-live versions in a repo (i.e. rows where next_id IS NULL).
+   * Used by `repos.set_path_config` to produce the advisory PathWarning[]
+   * scan (§3.5.3). Riding the partial-index on (repo_id, path) where
+   * next_id is null, so O(live-set) per repo.
+   */
+  versions_live_by_repo(repo_id: number): VersionRow[];
 
   // Tokens (design §3.2, §8). All queries return null / empty for
   // revoked or expired rows — the adapter does the filter so the kernel
