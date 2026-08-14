@@ -2,7 +2,21 @@
 
 *Markdown Repos, plexed.* A queryable, versioned store for Markdown documents with YAML frontmatter.
 
-**Status:** M2 (query) in progress. CEL filter + FTS + `mrplex query`. See [docs/design.md](docs/design.md) for the full design and [docs/m2-plan.md](docs/m2-plan.md) for the milestone plan.
+See [docs/design.md](docs/design.md) for the full design.
+
+## Features
+
+- **Versioned Markdown store.** Every write inserts a new version; nothing is overwritten; any past state is addressable. `docs.put` handles both in-place update and move (path may differ from the previous version).
+- **Byte-exact frontmatter.** Writes supply `frontmatter_raw` (verbatim YAML) OR `frontmatter` (structured JSON) — exactly one; the other is derived. Round-trips are byte-exact via the raw form.
+- **Optimistic concurrency.** Every write supplies the `prev_version_id` it observed; a stale prev is rejected with `stale_prev` and the current version returned.
+- **Deletion is a move to a system-namespace path** (`:deleted/…/foo-v45129.md`, extension-aware). Restore is a `docs.put` back to a user-territory path. `docs.delete` is idempotent.
+- **CEL filter queries** over frontmatter fields and `$`-prefixed intrinsics (`$path`, `$created_at`, `$body`). `list()` polymorphism handles scalar-or-list frontmatter uniformly.
+- **Full-text search** over document body via SQLite FTS5 (porter+unicode61 tokenizer). Composes with filter via AND.
+- **Bearer-token auth** with capability scopes — repo-scoped `read` / `write` path globs (gitignore-style, with negation), admin bit, per-token subset semantics for self-issued tokens.
+- **HTTP surfaces.** Protocol-true MCP server at `/mcp` (Streamable HTTP + optional STDIO), and a resource-oriented REST surface with `If-Match` / `If-None-Match`, content negotiation (`application/json` or `text/markdown`), `MOVE`, and sibling `/versions` / `/history` roots. Query responses carry ETags for `If-None-Match` → 304.
+- **`mrplex` CLI** — thin client over MCP. `--database` for local embedded mode against a SQLite file; `--server` for remote mode against a running server. Every command works identically over both transports.
+- **Configurable path policy** — hardcoded defaults → server config → per-repo override. `disallowed_chars`, `system_sigils`, `hidden_sigils`, all with sensible defaults (Obsidian's cross-platform-safe rule).
+- **Bootstrap** — `mrplex bootstrap` mints the root admin token on a fresh database.
 
 ## Quickstart
 
@@ -13,7 +27,7 @@ npm install
 Bootstrap a fresh database — this mints the root admin token exactly once:
 
 ```bash
-export TOK=$(npm run --silent cli -- --database ./m1.db bootstrap)
+export TOK=$(npm run --silent cli -- --database ./mrplex.db bootstrap)
 export MRPLEX_TOKEN="$TOK"
 ```
 
@@ -21,15 +35,15 @@ Create a user + repo, then walk a doc through its lifecycle:
 
 ```bash
 # Admin ops.
-npm run --silent cli -- --database ./m1.db users create alice
-npm run --silent cli -- --database ./m1.db repos create notes
+npm run --silent cli -- --database ./mrplex.db users create alice
+npm run --silent cli -- --database ./mrplex.db repos create notes
 
 # create → update → move → delete → restore
 V=$(printf '%s\n' '---' 'title: Hello' '---' '' 'body v1' | \
-    npm run --silent cli -- --database ./m1.db --json docs create notes hello.md --from-file - \
+    npm run --silent cli -- --database ./mrplex.db --json docs create notes hello.md --from-file - \
     | jq -r .version_id)
 
-V=$(npm run --silent cli -- --database ./m1.db --json docs put notes hello.md --prev "$V" \
+V=$(npm run --silent cli -- --database ./mrplex.db --json docs put notes hello.md --prev "$V" \
     --from-file - <<'EOF' | jq -r .version_id
 ---
 title: Hello
@@ -38,18 +52,18 @@ body v2
 EOF
 )
 
-V=$(npm run --silent cli -- --database ./m1.db --json docs mv notes hello.md greetings/hi.md --prev "$V" | jq -r .version_id)
-V=$(npm run --silent cli -- --database ./m1.db --json docs delete notes greetings/hi.md --prev "$V" | jq -r .version_id)
-V=$(npm run --silent cli -- --database ./m1.db --json docs put notes greetings/hi.md --prev "$V" | jq -r .version_id)
+V=$(npm run --silent cli -- --database ./mrplex.db --json docs mv notes hello.md greetings/hi.md --prev "$V" | jq -r .version_id)
+V=$(npm run --silent cli -- --database ./mrplex.db --json docs delete notes greetings/hi.md --prev "$V" | jq -r .version_id)
+V=$(npm run --silent cli -- --database ./mrplex.db --json docs put notes greetings/hi.md --prev "$V" | jq -r .version_id)
 
 # History now has 5 versions in reverse chain order:
-npm run --silent cli -- --database ./m1.db docs history notes greetings/hi.md
+npm run --silent cli -- --database ./mrplex.db docs history notes greetings/hi.md
 ```
 
 Mint a scoped token for an agent:
 
 ```bash
-npm run --silent cli -- --database ./m1.db tokens create \
+npm run --silent cli -- --database ./mrplex.db tokens create \
     --label "obsidian-plugin" \
     --scope "notes:read=**,write=inbox/**"
 ```
@@ -58,51 +72,40 @@ Query — CEL filters + FTS composed:
 
 ```bash
 # Filter only
-npm run --silent cli -- --database ./m1.db query --repo notes \
+npm run --silent cli -- --database ./mrplex.db query --repo notes \
     --filter 'status == "published"'
 
 # Text only (FTS5, porter-stemmed)
-npm run --silent cli -- --database ./m1.db query --repo notes --text 'welcome OR intro'
+npm run --silent cli -- --database ./mrplex.db query --repo notes --text 'welcome OR intro'
 
 # Filter + text composed
-npm run --silent cli -- --database ./m1.db query --repo notes \
+npm run --silent cli -- --database ./mrplex.db query --repo notes \
     --filter '"pricing" in list(tags)' --text pricing
 
 # Polymorphic frontmatter — matches tags: pricing AND tags: [pricing, saas]
-npm run --silent cli -- --database ./m1.db query --repo notes \
+npm run --silent cli -- --database ./mrplex.db query --repo notes \
     --filter '"pricing" in list(tags)'
 
 # $-prefixed intrinsics
-npm run --silent cli -- --database ./m1.db query --repo notes \
+npm run --silent cli -- --database ./mrplex.db query --repo notes \
     --filter '$path.startsWith("guides/")'
 ```
 
-## What's in M2
+Serve the HTTP surfaces and drive the CLI remotely:
 
-- **CEL filter** via **`@bufbuild/cel`** (TypeScript-native; supersedes the design's `cel-go`/WASM choice — see [docs/design.md](docs/design.md) §7.1 for the rationale). Full CEL parser emitting the canonical protobuf `ParsedExpr` AST; the AST→SQL compiler is portable if we ever swap the parser.
-- **`$`-prefixed intrinsics** — `$path`, `$created_at`, `$body`. Introduced via a small string-aware preprocessor that mangles `$foo` before the parser sees it; no grammar patch.
-- **`list()` polymorphism** — `"pricing" in list(tags)`, `size(list(tags))`, `list(tags).all(...)`, `list(tags).exists(...)` all handle scalar-or-list frontmatter shapes (§5.2).
-- **FTS via SQLite FTS5** — external-content virtual table on `versions.body` with AFTER INSERT/DELETE triggers; porter+unicode61 tokenizer. Restricted to current versions at query time.
-- **`kernel.query(spec, actor)`** — composes filter + text + scope filter (§8.2, silently drops out-of-scope rows) + default sigil exclusion + ordering + limit. `rank` reserved for M4.
-- **`mrplex query` CLI** with `--repo` / `--filter` / `--text` / `--limit` / `--include-hidden` / `--include-system` and `--json` scripting mode.
+```bash
+# Start the server (REST + MCP Streamable HTTP on :8321 by default)
+npm run --silent cli -- --database ./mrplex.db serve --port 8321 &
 
-## What's in M1
-
-- **Kernel write surface** — `docs.create` / `put` / `delete` with `prev_version_id` enforcement, the "one verb several intents" folding (update / move / restore), the extension-aware deletion path (`:deleted/…/foo-v45129.md`), idempotent deletes, and `stale_prev` with `current_path` redacted for callers outside read scope.
-- **Repo & user writes** — `create` / `rename` / `delete` / `set_path_config` (admin-gated). Delete is a system-namespace slug rename with a 6-char base32 uniquifier; `users.delete` also revokes all the user's tokens.
-- **Path config layering** — hardcoded defaults → server config → per-repo override (replace-not-merge). Startup invariants enforced (prefix-shadowing rejected, hidden sigils can't contain disallowed chars, sigil lists must be non-empty).
-- **Slug + path validation** — segment-level rules from §3.5.3 / §3.5.6, called on every write.
-- **Frontmatter duality** — writes supply `frontmatter_raw` (verbatim YAML) OR `frontmatter` (structured JSON) — exactly one; the other is derived. Round-trip is byte-exact via the raw form.
-- **Bearer-token auth** — SHA-256-hashed secrets (`mrplex_<base64url>`), `admin` boolean, scope grammar with gitignore-style path globs and negation, system-namespace carve-out for delete/restore moves, verbatim child-scope subset check for self-token creation.
-- **Bootstrap** — `mrplex bootstrap` mints the root admin token on a fresh database, refuses on any non-empty database.
-- **CLI** — full command catalog with `--token` / `MRPLEX_TOKEN` / config-file precedence, per-family exit codes (1 validation, 2 concurrency, 3 auth, 4 not-found, 10 transport), `--json` mode for scripting.
-
-Not in M2: HTTP surfaces (M3), embeddings + `rank` mode (M4), Postgres (M5), WebDAV/point-in-time/graph (§11).
+# Same commands, now over the network
+npm run --silent cli -- --server http://127.0.0.1:8321 docs get notes greetings/hi.md
+npm run --silent cli -- --server http://127.0.0.1:8321 query --repo notes --filter 'status == "published"'
+```
 
 ## Development
 
 ```bash
-npm test          # 384 tests: invariants, kernel suite, writes, admin, auth, query, CLI
+npm test          # invariants, kernel suite, writes, admin, auth, query, HTTP surfaces, CLI
 npm run typecheck # tsc --noEmit, strict
 npm run lint      # biome check
 npm run build     # emit dist/
