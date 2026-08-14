@@ -50,7 +50,7 @@ export type ToolHandler = (
   kernel: Kernel,
   actor: Actor,
   args: Record<string, unknown>,
-) => ToolResult;
+) => ToolResult | Promise<ToolResult>;
 
 export type ToolEntry = {
   name: string;
@@ -473,15 +473,19 @@ export const TOOL_REGISTRY: ToolEntry[] = [
         },
         filter: { type: "string" },
         text: { type: "string" },
-        rank: { type: "string", description: "Deferred to M4 — currently returns filter_invalid." },
+        rank: {
+          type: "string",
+          description:
+            "Semantic rank via embeddings (§5.1). Requires an embed hook; else rank_unavailable.",
+        },
         limit: { type: "integer", minimum: 0 },
         include_hidden: { type: "boolean" },
         include_system: { type: "boolean" },
       },
     },
-    handler: (kernel, actor, args) => {
+    handler: async (kernel, actor, args) => {
       const spec = args as QuerySpec;
-      const rows = kernel.query(actor, spec);
+      const rows = await kernel.query(actor, spec);
       return { structured: wrapList(rows), text: renderVersionList(rows) };
     },
   },

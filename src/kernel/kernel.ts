@@ -107,7 +107,14 @@ export type Kernel = {
     ): TokenCreateResult;
     revoke(actor: Actor, token_id: string): Token;
   };
-  query(actor: Actor, spec: QuerySpec): Version[];
+  /**
+   * Query is async because the `rank` mode (M4) calls the embed hook to
+   * turn the query string into a vector — an I/O boundary. Filter-only
+   * and text-only queries complete synchronously inside this promise
+   * (a microtask), so the async signature is honesty about the rank
+   * path, not overhead on the common case.
+   */
+  query(actor: Actor, spec: QuerySpec): Promise<Version[]>;
 };
 
 export type KernelConfig = {
@@ -129,6 +136,21 @@ export type KernelConfig = {
    * backlog_enqueue is one cheap UPSERT and doesn't throw.
    */
   onVersionCommitted?: (version_id: number) => void;
+  /**
+   * M4 read-time embed: called with a single rank-query string to
+   * produce the vector to search against (§5.1, m4-plan WS4).
+   *
+   * The kernel calls this ONLY when `rank` is present in a QuerySpec.
+   * Absent → `rank_unavailable`. Errors here also surface as
+   * `rank_unavailable` (data carries the cause) — a rank query can't
+   * defer like a write can.
+   *
+   * Must return the batch's contract-validated response (same shape
+   * the write-side hook returns). The kernel selects results by the
+   * response's `model`, not by any persisted "current model" (§5
+   * decision 9).
+   */
+  queryEmbed?: (rank: string) => Promise<{ vector: number[]; model: string; dim: number }>;
 };
 
 export function createKernel(config: KernelConfig | Storage): Kernel {
@@ -140,6 +162,7 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
   const storage = cfg.storage;
   const serverPathConfig = cfg.serverPathConfig ?? HARDCODED_DEFAULTS;
   const onVersionCommitted = cfg.onVersionCommitted;
+  const queryEmbed = cfg.queryEmbed;
 
   // Author lookup — cheap and hot, so cache within a kernel instance.
   const userCache = new Map<number, User>();
@@ -661,7 +684,7 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
       },
     },
 
-    query(actor: Actor, spec: QuerySpec): Version[] {
+    async query(actor: Actor, spec: QuerySpec): Promise<Version[]> {
       // Server-level read authorization — the QuerySpec.repo field + scope
       // enforcement inside runQuery() do the fine-grained filtering.
       authorize(actor, "read", { kind: "server" });
@@ -669,6 +692,7 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
         storage,
         serverPathConfig,
         toVersionWire,
+        queryEmbed,
       });
     },
   };

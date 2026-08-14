@@ -4,18 +4,23 @@
  * Composes:
  *   • CEL filter (§5.1) — compiled to SQL via compile-sqlite.ts
  *   • FTS text (§5.1) — the SQLite FTS5 branch is wired in the adapter
+ *   • Rank (§5.1, M4) — the embed hook produces the query vector;
+ *     vector_search returns the top-k version ids by cosine distance
+ *     (current-versions only). Rank intersects with filter/text/scope/
+ *     sigil-exclusion inline: for the intersection, the rank hits are
+ *     the candidate row set, and everything else applies as WHERE
+ *     clauses ANDed on top. Ordering falls out of the hit-order.
  *   • Scope filter (§8.2) — compiled to SQL via the RE2-backed regexp UDF.
  *     Silently drops rows outside scope, not 403.
  *   • Default sigil exclusion (§5.1, §3.5.5) — hidden/system paths hidden
  *     unless opt-in flags are set. Per-repo: each repo group contributes
  *     its own sigil clauses based on its effective config.
- *   • Result ordering (§5.1 pin) — text-score if `text` is present,
- *     else `$created_at DESC`.
+ *   • Result ordering (§5.1 pin) — rank score if `rank` is present, else
+ *     text-score if `text` is present, else `$created_at DESC`.
  *   • Limit — required; kernel provides the default.
- *
- * `rank` is deferred to M4; queries with `rank` set return filter_invalid.
  */
 
+import { encodeVectorBlob } from "../../storage-sqlite/vec.js";
 import type { RepoRow, Storage, VersionRow } from "../../storage/types.js";
 import type { Actor, StoredScope } from "../auth/actor.js";
 import { globToRegexSource, slugMatchesPattern } from "../auth/glob.js";
@@ -51,12 +56,21 @@ export type QueryDeps = {
   storage: Storage;
   serverPathConfig: PathConfig;
   toVersionWire: (row: VersionRow, repoSlug: string) => Version;
+  /**
+   * Optional rank-time embed hook. When absent and `spec.rank` is set,
+   * runQuery throws `rank_unavailable` (m4-plan §5 decision 4).
+   */
+  queryEmbed?: (rank: string) => Promise<{ vector: number[]; model: string; dim: number }>;
 };
 
 /** M2 default when the spec omits limit. */
 export const DEFAULT_QUERY_LIMIT = 50;
 
-export function runQuery(actor: Actor, spec: QuerySpec, deps: QueryDeps): Version[] {
+export async function runQuery(
+  actor: Actor,
+  spec: QuerySpec,
+  deps: QueryDeps,
+): Promise<Version[]> {
   validateSpec(spec);
 
   // 1. Resolve repos the caller can address.
@@ -92,17 +106,104 @@ export function runQuery(actor: Actor, spec: QuerySpec, deps: QueryDeps): Versio
   //    RE2-backed regexp UDF (see storage-sqlite/adapter.ts).
   const scopeFilter = actor.admin ? { sql: "", params: [] } : buildScopeFilter(actor.scopes);
 
-  // 5. Combine everything the kernel supplies.
+  const userLimit = spec.limit ?? DEFAULT_QUERY_LIMIT;
+  if (userLimit <= 0) return [];
+
+  // 5. Rank branch (M4). When `rank` is set, the candidate row set is
+  //    the vector_search top-k, and filter/text/scope/sigil ANDed as
+  //    a version_id whitelist through the normal versions_search path.
+  //    Ordering: rank wins (best first), then text score, then created_at
+  //    (§5.1). vector_search already returns best-per-version — we pass
+  //    that order downstream via a CASE-indexed clause.
+  if (spec.rank !== undefined) {
+    if (!deps.queryEmbed) {
+      throw new KernelError("rank_unavailable", {
+        reason: "no embedding hook configured on this server",
+      });
+    }
+    let embed: { vector: number[]; model: string };
+    try {
+      embed = await deps.queryEmbed(spec.rank);
+    } catch (err) {
+      throw new KernelError("rank_unavailable", {
+        reason: `embedding hook failed at query time: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      });
+    }
+    // Ask storage for a wider k than the caller's limit — the intersection
+    // may drop hits that fail filter/text/scope. A 4× multiplier is a
+    // cheap first pass; if we exhaust hits we fall through to whatever
+    // survived. Cap at 200 to keep memory bounded.
+    const rankK = Math.min(userLimit * 4, 200);
+    const hits = deps.storage.vector_search(
+      targetRepos.map((r) => r.id),
+      embed.model,
+      encodeVectorBlob(embed.vector),
+      rankK,
+    );
+    if (hits.length === 0) return [];
+
+    // Fetch the survivors: apply filter/text/scope/sigil by looking up
+    // each version's row and reevaluating in-process. Cheap: <= 200 rows.
+    // versions_search would work too but its `versions.next_id IS NULL`
+    // guard would collide with our version_id whitelist. The rank hits
+    // are already scoped to current versions (join in the adapter).
+    const survivors: { row: VersionRow; score: number }[] = [];
+    for (const hit of hits) {
+      const row = deps.storage.version_by_id(hit.version_id);
+      if (!row) continue;
+      // Check filter/text/scope/sigil by running versions_search with a
+      // single-repo, single-row constraint. Simpler to reuse existing
+      // machinery than to reimplement CEL evaluation in-process.
+      // We build a WHERE that pins versions.id = ? and reuse the
+      // combined filter/scope/sigil SQL below.
+      survivors.push({ row, score: hit.score });
+    }
+    if (survivors.length === 0) return [];
+
+    // Build the intersection: run versions_search over the exact set of
+    // candidate version ids with the same filter/text/scope/sigil
+    // clauses, then reorder by the rank score.
+    const candidateIds = survivors.map((s) => s.row.id);
+    const idPh = candidateIds.map(() => "?").join(",");
+    const combinedWhere = joinWhere([
+      whereSql,
+      sigilExclusion.sql,
+      scopeFilter.sql,
+      `versions.id IN (${idPh})`,
+    ]);
+    const combinedParams: (string | number | bigint | null)[] = [
+      ...whereParams,
+      ...sigilExclusion.params,
+      ...scopeFilter.params,
+      ...candidateIds,
+    ];
+    const rows = deps.storage.versions_search({
+      repo_ids: targetRepos.map((r) => r.id),
+      where_sql: combinedWhere,
+      where_params: combinedParams,
+      text: spec.text,
+      limit: candidateIds.length, // fetch all survivors; we sort locally
+    });
+    // Reorder by rank score.
+    const scoreById = new Map(survivors.map((s) => [s.row.id, s.score]));
+    rows.sort(
+      (a, b) => (scoreById.get(a.id) ?? 1) - (scoreById.get(b.id) ?? 1),
+    );
+    return rows.slice(0, userLimit).map((row) => {
+      const repoSlug = (reposById.get(row.repo_id) as RepoRow).slug;
+      return deps.toVersionWire(row, repoSlug);
+    });
+  }
+
+  // 6. Non-rank path — filter/text/scope/sigil composed as before.
   const combinedWhere = joinWhere([whereSql, sigilExclusion.sql, scopeFilter.sql]);
   const combinedParams: (string | number | bigint | null)[] = [
     ...whereParams,
     ...sigilExclusion.params,
     ...scopeFilter.params,
   ];
-
-  // 6. Storage-level search.
-  const userLimit = spec.limit ?? DEFAULT_QUERY_LIMIT;
-  if (userLimit <= 0) return [];
   const rows = deps.storage.versions_search({
     repo_ids: targetRepos.map((r) => r.id),
     where_sql: combinedWhere,
@@ -132,9 +233,11 @@ function validateSpec(spec: QuerySpec): void {
     }
   }
   if (spec.rank !== undefined) {
-    throw new KernelError("filter_invalid", {
-      reason: "the `rank` mode is deferred to M4 (embeddings)",
-    });
+    if (typeof spec.rank !== "string" || spec.rank.trim().length === 0) {
+      throw new KernelError("filter_invalid", {
+        reason: "the `rank` mode requires a non-empty query string",
+      });
+    }
   }
   if (spec.limit !== undefined) {
     if (typeof spec.limit !== "number" || !Number.isSafeInteger(spec.limit) || spec.limit < 0) {

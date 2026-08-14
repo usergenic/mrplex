@@ -112,6 +112,10 @@ function resolveServer(opts: GlobalOpts): string | undefined {
  * Open the right KernelClient — remote if `--server` (or MRPLEX_SERVER / config
  * `server`) is set, otherwise the local in-process client. Enforces the
  * m3-plan decision that --database and --server are mutually exclusive.
+ *
+ * In local mode we also resolve an embed hook (from --embed-url/--embed-cmd
+ * or env/config) — needed for CLI-local rank queries and for backlog
+ * enqueue on writes done through the CLI.
  */
 async function openClient(opts: GlobalOpts): Promise<KernelClient> {
   const server = resolveServer(opts);
@@ -131,7 +135,9 @@ async function openClient(opts: GlobalOpts): Promise<KernelClient> {
   if (server) {
     return openRemoteClient({ server, token: secret });
   }
-  return openLocalClient({ database: resolveDatabase(opts), token: secret });
+  const embedCfg = resolveEmbedConfig({});
+  const embed = createHookFromConfig(embedCfg);
+  return openLocalClient({ database: resolveDatabase(opts), token: secret, embed });
 }
 
 function makeUnauthorized(reason: string): Error {
@@ -586,7 +592,7 @@ function buildProgram(): Command {
   // -------- query --------
   program
     .command("query")
-    .description("search documents — CEL filter + FTS text (design §5)")
+    .description("search documents — CEL filter + FTS text + rank (design §5)")
     .option(
       "--repo <slug-or-glob>",
       "repo slug or glob; repeat the flag to query multiple (default: all in scope)",
@@ -594,6 +600,7 @@ function buildProgram(): Command {
     )
     .option("--filter <expr>", "CEL filter expression")
     .option("--text <query>", "FTS5 query over body")
+    .option("--rank <query>", "semantic rank via embeddings (§5.1); requires an embed hook")
     .option("--limit <n>", "max results (positive integer; default 50)", parsePositiveInt)
     .option("--include-hidden", "surface .-prefixed paths", false)
     .option("--include-system", "surface :-prefixed (deleted, etc.) paths", false)
@@ -602,6 +609,7 @@ function buildProgram(): Command {
         repo?: string[];
         filter?: string;
         text?: string;
+        rank?: string;
         limit?: number;
         includeHidden: boolean;
         includeSystem: boolean;
@@ -611,6 +619,7 @@ function buildProgram(): Command {
           repo: localOpts.repo,
           filter: localOpts.filter,
           text: localOpts.text,
+          rank: localOpts.rank,
           limit: localOpts.limit,
           include_hidden: localOpts.includeHidden,
           include_system: localOpts.includeSystem,

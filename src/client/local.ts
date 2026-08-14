@@ -8,6 +8,7 @@
  * WS5 acceptance).
  */
 
+import type { EmbedHook } from "../embed/hook.js";
 import type { Actor } from "../kernel/auth/actor.js";
 import { resolveActor } from "../kernel/auth/tokens.js";
 import { KernelError } from "../kernel/errors.js";
@@ -22,6 +23,12 @@ export type LocalClientConfig = {
   database: string;
   /** Bearer secret. */
   token: string;
+  /**
+   * Optional embed hook for rank queries in embedded-CLI mode. Also
+   * enables write-time backlog enqueue so writes done via the local
+   * client contribute to backlog like serve's do.
+   */
+  embed?: EmbedHook | null;
 };
 
 /**
@@ -36,7 +43,20 @@ export function openLocalClient(config: LocalClientConfig): KernelClient {
     storage.close();
     throw new KernelError("unauthorized", {});
   }
-  const kernel = createKernel(storage);
+  const hook = config.embed ?? null;
+  const kernel = createKernel({
+    storage,
+    // Enqueue is unconditional (m4-plan §5 decision 5), matching serve.
+    onVersionCommitted: (versionId) => storage.backlog_enqueue(versionId),
+    queryEmbed: hook
+      ? async (rank: string) => {
+          const resp = await hook.embed([rank]);
+          const vector = resp.vectors[0];
+          if (!vector) throw new Error("embed hook returned no vector for query string");
+          return { vector, model: resp.model, dim: resp.dim };
+        }
+      : undefined,
+  });
   return buildClient(kernel, actor, storage);
 }
 
@@ -74,7 +94,7 @@ function buildClient(kernel: Kernel, actor: Actor, storage: Storage): KernelClie
         async(() => kernel.tokens.create(actor, label, scopes, opts)),
       revoke: (id) => async(() => kernel.tokens.revoke(actor, id)),
     },
-    query: (spec) => async(() => kernel.query(actor, spec)),
+    query: (spec) => kernel.query(actor, spec),
     close: async () => {
       if (closed) return;
       closed = true;

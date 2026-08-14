@@ -104,6 +104,16 @@ export async function startServer(config: ServeConfig): Promise<ServeHandle> {
     storage,
     serverPathConfig: config.serverPathConfig ?? HARDCODED_DEFAULTS,
     onVersionCommitted: (versionId) => storage.backlog_enqueue(versionId),
+    queryEmbed: hook
+      ? async (rank: string) => {
+          const resp = await hook.embed([rank]);
+          const vector = resp.vectors[0];
+          if (!vector) {
+            throw new Error("embed hook returned no vector for query string");
+          }
+          return { vector, model: resp.model, dim: resp.dim };
+        }
+      : undefined,
   });
   const worker = hook ? createWorker({ storage, hook }) : null;
 

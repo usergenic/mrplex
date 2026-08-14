@@ -124,7 +124,7 @@ function buildMcpServer(kernel: Kernel, getActor: () => Actor): McpLowLevelServe
       });
     }
     try {
-      const result = tool.handler(kernel, getActor(), args);
+      const result = await tool.handler(kernel, getActor(), args);
       return {
         content: [{ type: "text" as const, text: result.text }],
         structuredContent: result.structured,

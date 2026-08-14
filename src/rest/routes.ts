@@ -656,7 +656,7 @@ async function dispatchQuery(
     return methodNotAllowed(res, method, ["GET", "POST"]);
   }
 
-  const results = kernel.query(actor, spec);
+  const results = await kernel.query(actor, spec);
   const etag = queryEtag(results);
   const inm = parseQueryIfNoneMatch(req.headers["if-none-match"] as string | undefined);
   if (inm !== null && (inm.kind === "any" || inm.hash === etag)) {
