@@ -23,6 +23,7 @@ import { type CliConfig, loadConfig, saveConfig } from "./config.js";
 import { exitCodeForKernelError } from "./exit-codes.js";
 import {
   renderHistoryTable,
+  renderQueryTable,
   renderReposTable,
   renderUsersTable,
   renderVersionAsMarkdown,
@@ -539,6 +540,45 @@ function buildProgram(): Command {
           kernel.docs.put(actor, repo, localOpts.prev, toPath, {}),
         );
         emitVersionWrite(result, this.optsWithGlobals());
+      } catch (err) {
+        reportError(err);
+      }
+    });
+
+  // -------- query --------
+  program
+    .command("query")
+    .description("search documents — CEL filter + FTS text (design §5)")
+    .option(
+      "--repo <slug-or-glob>",
+      "repo slug or glob, comma-separated for multiple (default: all in scope)",
+    )
+    .option("--filter <expr>", "CEL filter expression")
+    .option("--text <query>", "FTS5 query over body")
+    .option("--limit <n>", "max results (positive integer; default 50)", parsePositiveInt)
+    .option("--include-hidden", "surface .-prefixed paths", false)
+    .option("--include-system", "surface :-prefixed (deleted, etc.) paths", false)
+    .action(function (this: Command) {
+      const localOpts = this.opts<{
+        repo?: string;
+        filter?: string;
+        text?: string;
+        limit?: number;
+        includeHidden: boolean;
+        includeSystem: boolean;
+      }>();
+      try {
+        const result = withActorAndKernel(this, (kernel, actor) =>
+          kernel.query(actor, {
+            repo: localOpts.repo?.includes(",") ? localOpts.repo.split(",") : localOpts.repo,
+            filter: localOpts.filter,
+            text: localOpts.text,
+            limit: localOpts.limit,
+            include_hidden: localOpts.includeHidden,
+            include_system: localOpts.includeSystem,
+          }),
+        );
+        emit(result, this.optsWithGlobals(), renderQueryTable(result));
       } catch (err) {
         reportError(err);
       }

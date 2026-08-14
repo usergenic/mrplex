@@ -2,7 +2,7 @@
 
 *Markdown Repos, plexed.* A queryable, versioned store for Markdown documents with YAML frontmatter.
 
-**Status:** M1 (writes + auth) in progress. Kernel writes, bearer-token auth, and a full CLI ship in this milestone. See [docs/design.md](docs/design.md) for the full design and [docs/m1-plan.md](docs/m1-plan.md) for the milestone plan.
+**Status:** M2 (query) in progress. CEL filter + FTS + `mrplex query`. See [docs/design.md](docs/design.md) for the full design and [docs/m2-plan.md](docs/m2-plan.md) for the milestone plan.
 
 ## Quickstart
 
@@ -54,6 +54,38 @@ npm run --silent cli -- --database ./m1.db tokens create \
     --scope "notes:read=**,write=inbox/**"
 ```
 
+Query — CEL filters + FTS composed:
+
+```bash
+# Filter only
+npm run --silent cli -- --database ./m1.db query --repo notes \
+    --filter 'status == "published"'
+
+# Text only (FTS5, porter-stemmed)
+npm run --silent cli -- --database ./m1.db query --repo notes --text 'welcome OR intro'
+
+# Filter + text composed
+npm run --silent cli -- --database ./m1.db query --repo notes \
+    --filter '"pricing" in list(tags)' --text pricing
+
+# Polymorphic frontmatter — matches tags: pricing AND tags: [pricing, saas]
+npm run --silent cli -- --database ./m1.db query --repo notes \
+    --filter '"pricing" in list(tags)'
+
+# $-prefixed intrinsics
+npm run --silent cli -- --database ./m1.db query --repo notes \
+    --filter '$path.startsWith("guides/")'
+```
+
+## What's in M2
+
+- **CEL filter** via **`@bufbuild/cel`** (TypeScript-native; supersedes the design's `cel-go`/WASM choice — see [docs/design.md](docs/design.md) §7.1 for the rationale). Full CEL parser emitting the canonical protobuf `ParsedExpr` AST; the AST→SQL compiler is portable if we ever swap the parser.
+- **`$`-prefixed intrinsics** — `$path`, `$created_at`, `$body`. Introduced via a small string-aware preprocessor that mangles `$foo` before the parser sees it; no grammar patch.
+- **`list()` polymorphism** — `"pricing" in list(tags)`, `size(list(tags))`, `list(tags).all(...)`, `list(tags).exists(...)` all handle scalar-or-list frontmatter shapes (§5.2).
+- **FTS via SQLite FTS5** — external-content virtual table on `versions.body` with AFTER INSERT/DELETE triggers; porter+unicode61 tokenizer. Restricted to current versions at query time.
+- **`kernel.query(spec, actor)`** — composes filter + text + scope filter (§8.2, silently drops out-of-scope rows) + default sigil exclusion + ordering + limit. `rank` reserved for M4.
+- **`mrplex query` CLI** with `--repo` / `--filter` / `--text` / `--limit` / `--include-hidden` / `--include-system` and `--json` scripting mode.
+
 ## What's in M1
 
 - **Kernel write surface** — `docs.create` / `put` / `delete` with `prev_version_id` enforcement, the "one verb several intents" folding (update / move / restore), the extension-aware deletion path (`:deleted/…/foo-v45129.md`), idempotent deletes, and `stale_prev` with `current_path` redacted for callers outside read scope.
@@ -65,12 +97,12 @@ npm run --silent cli -- --database ./m1.db tokens create \
 - **Bootstrap** — `mrplex bootstrap` mints the root admin token on a fresh database, refuses on any non-empty database.
 - **CLI** — full command catalog with `--token` / `MRPLEX_TOKEN` / config-file precedence, per-family exit codes (1 validation, 2 concurrency, 3 auth, 4 not-found, 10 transport), `--json` mode for scripting.
 
-Not in M1: HTTP surfaces (M3), query/CEL/FTS (M2), embeddings (M4), Postgres (M5), WebDAV/point-in-time/graph (§11).
+Not in M2: HTTP surfaces (M3), embeddings + `rank` mode (M4), Postgres (M5), WebDAV/point-in-time/graph (§11).
 
 ## Development
 
 ```bash
-npm test          # 309 tests: invariants, kernel suite, writes, admin, auth, path-config, cli
+npm test          # 384 tests: invariants, kernel suite, writes, admin, auth, query, CLI
 npm run typecheck # tsc --noEmit, strict
 npm run lint      # biome check
 npm run build     # emit dist/

@@ -12,6 +12,7 @@ import type {
   UserRow,
   VersionInsertInput,
   VersionRow,
+  VersionsSearchInput,
 } from "../storage/types.js";
 import { migrate } from "./migrations/index.js";
 
@@ -311,6 +312,43 @@ class SqliteStorage implements Storage {
     // require explicit calls (or that back FTS with an auxiliary process)
     // have a place to hook in — see design §7.2.2 "What an adapter is NOT
     // required to provide."
+  }
+
+  versions_search(input: VersionsSearchInput): VersionRow[] {
+    if (input.repo_ids.length === 0) return [];
+    const repoPh = input.repo_ids.map(() => "?").join(",");
+    const clauses: string[] = ["versions.next_id IS NULL", `versions.repo_id IN (${repoPh})`];
+    const params: unknown[] = [...input.repo_ids];
+    if (input.where_sql.trim().length > 0) {
+      clauses.push(`(${input.where_sql})`);
+      params.push(...input.where_params);
+    }
+    let sql: string;
+    if (input.text !== undefined) {
+      clauses.push("versions.id = fts_docs.rowid");
+      clauses.push("fts_docs MATCH ?");
+      params.push(input.text);
+      sql = `SELECT versions.id, versions.document_id, versions.repo_id,
+                    versions.prev_id, versions.next_id, versions.path,
+                    versions.frontmatter_raw, versions.frontmatter,
+                    versions.body, versions.author_id, versions.created_at
+             FROM versions, fts_docs
+             WHERE ${clauses.join(" AND ")}
+             ORDER BY bm25(fts_docs)
+             LIMIT ?`;
+    } else {
+      sql = `SELECT versions.id, versions.document_id, versions.repo_id,
+                    versions.prev_id, versions.next_id, versions.path,
+                    versions.frontmatter_raw, versions.frontmatter,
+                    versions.body, versions.author_id, versions.created_at
+             FROM versions
+             WHERE ${clauses.join(" AND ")}
+             ORDER BY versions.created_at DESC, versions.id DESC
+             LIMIT ?`;
+    }
+    params.push(input.limit);
+    const rows = this.db.prepare(sql).all(...params) as VersionRawRow[];
+    return rows.map(hydrateVersion);
   }
 
   fts_search(repo_ids: readonly number[], query: string): { version_id: number; score: number }[] {

@@ -23,6 +23,12 @@ export function renderUsersTable(users: User[]): string {
   );
 }
 
+export function renderQueryTable(versions: Version[]): string {
+  if (versions.length === 0) return "(no results)";
+  const rows = versions.map((v) => [v.repo, v.path, v.version_id, v.author.user, v.created_at]);
+  return renderTable(["REPO", "PATH", "VERSION", "AUTHOR", "CREATED_AT"], rows);
+}
+
 export function renderHistoryTable(versions: Version[]): string {
   if (versions.length === 0) return "(no history)";
   const rows = versions.map((v) => [
