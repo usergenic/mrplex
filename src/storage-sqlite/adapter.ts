@@ -58,6 +58,19 @@ class SqliteStorage implements Storage {
     // compiler (m2-plan §5). Portable to Postgres via ~; we ship a
     // deterministic JS-backed impl here rather than depend on the SQLite
     // REGEXP extension.
+    //
+    // ReDoS note: this uses JS RegExp, which is a backtracking engine and
+    // can be attacked with catastrophic patterns like `(a+)+b`. In v1 the
+    // SQLite adapter is only used for personal / single-user deployments
+    // (design §7.1: "Local, embedded" + "zo.computer personal server"),
+    // where a bad regex is a self-DoS the user can kill. When we grow into
+    // shared-tenancy on SQLite (unlikely — the design steers those onto
+    // Postgres), swap this for RE2JS (linear-time) — it's already a
+    // transitive dep via @bufbuild/cel's @bufbuild/re2, so the change is
+    // ~5 lines and adds nothing to the install. M5's Postgres branch will
+    // use the native `~` operator, whose regex engine is far less prone to
+    // catastrophic backtracking, with `statement_timeout` as the standard
+    // deployment-level mitigation.
     this.db.function(
       "regexp",
       { deterministic: true },
