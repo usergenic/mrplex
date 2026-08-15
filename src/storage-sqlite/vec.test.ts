@@ -172,4 +172,24 @@ describe("adapter: backlog", () => {
     const rows = await s.backlog_dequeue(new Date().toISOString(), 10);
     expect(rows.length).toBe(0); // not due
   });
+
+  it("backlog_status summarizes counts + models", async () => {
+    const { s, v } = await seed();
+    await s.backlog_enqueue(v.id);
+    await s.backlog_retain({
+      version_id: v.id,
+      attempts: 2,
+      last_error: "e",
+      next_retry_at: new Date(Date.now() + 60_000).toISOString(),
+    });
+    await s.chunks_upsert(v.id, "m", [
+      { ix: 0, text: "a", text_hash: "h1", model: "m", embedding: [1, 0] },
+    ]);
+    const status = await s.backlog_status(new Date().toISOString());
+    expect(status.pending).toBe(1);
+    expect(status.due).toBe(0);
+    expect(status.failing).toBe(1);
+    expect(status.models).toEqual([{ model: "m", chunk_count: 1 }]);
+    expect(status.recent_errors.length).toBe(1);
+  });
 });
