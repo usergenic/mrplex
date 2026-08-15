@@ -20,7 +20,6 @@
  *   • Limit — required; kernel provides the default.
  */
 
-import { encodeVectorBlob } from "../../storage-sqlite/vec.js";
 import type { RepoRow, Storage, VersionRow } from "../../storage/types.js";
 import type { Actor, StoredScope } from "../auth/actor.js";
 import { globToRegexSource, slugMatchesPattern } from "../auth/glob.js";
@@ -117,7 +116,7 @@ export async function runQuery(actor: Actor, spec: QuerySpec, deps: QueryDeps): 
         reason: "no embedding hook configured on this server",
       });
     }
-    let embed: { vector: number[]; model: string };
+    let embed: { vector: number[]; model: string; dim: number };
     try {
       embed = await deps.queryEmbed(spec.rank);
     } catch (err) {
@@ -127,6 +126,15 @@ export async function runQuery(actor: Actor, spec: QuerySpec, deps: QueryDeps): 
         }`,
       });
     }
+    // Validate the hook's shape at the query boundary — a misbehaving
+    // hook (or a wrapper that skipped validateEmbedResponse) shouldn't
+    // reach vec_distance_cosine and surface as a generic UDF error.
+    if (embed.vector.length !== embed.dim) {
+      throw new KernelError("rank_unavailable", {
+        reason: `embedding hook returned vector.length ${embed.vector.length} != dim ${embed.dim}`,
+      });
+    }
+
     // Ask storage for a wider k than the caller's limit — the intersection
     // may drop hits that fail filter/text/scope. A 4× multiplier is a
     // cheap first pass; if we exhaust hits we fall through to whatever
@@ -135,33 +143,18 @@ export async function runQuery(actor: Actor, spec: QuerySpec, deps: QueryDeps): 
     const hits = deps.storage.vector_search(
       targetRepos.map((r) => r.id),
       embed.model,
-      encodeVectorBlob(embed.vector),
+      embed.vector,
       rankK,
     );
     if (hits.length === 0) return [];
 
-    // Fetch the survivors: apply filter/text/scope/sigil by looking up
-    // each version's row and reevaluating in-process. Cheap: <= 200 rows.
-    // versions_search would work too but its `versions.next_id IS NULL`
-    // guard would collide with our version_id whitelist. The rank hits
-    // are already scoped to current versions (join in the adapter).
-    const survivors: { row: VersionRow; score: number }[] = [];
-    for (const hit of hits) {
-      const row = deps.storage.version_by_id(hit.version_id);
-      if (!row) continue;
-      // Check filter/text/scope/sigil by running versions_search with a
-      // single-repo, single-row constraint. Simpler to reuse existing
-      // machinery than to reimplement CEL evaluation in-process.
-      // We build a WHERE that pins versions.id = ? and reuse the
-      // combined filter/scope/sigil SQL below.
-      survivors.push({ row, score: hit.score });
-    }
-    if (survivors.length === 0) return [];
-
-    // Build the intersection: run versions_search over the exact set of
-    // candidate version ids with the same filter/text/scope/sigil
-    // clauses, then reorder by the rank score.
-    const candidateIds = survivors.map((s) => s.row.id);
+    // Apply filter/text/scope/sigil to the rank hits by running
+    // versions_search restricted to the hit ids and reordering by the
+    // rank score locally. versions_search's `next_id IS NULL` predicate
+    // ANDs with our whitelist (vector_search already scoped to current
+    // versions via its own join) — no conflict.
+    const candidateIds = hits.map((h) => h.version_id);
+    const scoreById = new Map(hits.map((h) => [h.version_id, h.score]));
     const idPh = candidateIds.map(() => "?").join(",");
     const combinedWhere = joinWhere([
       whereSql,
@@ -182,8 +175,7 @@ export async function runQuery(actor: Actor, spec: QuerySpec, deps: QueryDeps): 
       text: spec.text,
       limit: candidateIds.length, // fetch all survivors; we sort locally
     });
-    // Reorder by rank score.
-    const scoreById = new Map(survivors.map((s) => [s.row.id, s.score]));
+    // Reorder by rank score (best-first).
     rows.sort((a, b) => (scoreById.get(a.id) ?? 1) - (scoreById.get(b.id) ?? 1));
     return rows.slice(0, userLimit).map((row) => {
       const repoSlug = (reposById.get(row.repo_id) as RepoRow).slug;

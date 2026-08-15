@@ -19,7 +19,6 @@
  * not just resulting vectors.
  */
 
-import { encodeVectorBlob } from "../storage-sqlite/vec.js";
 import type { BacklogRow, Storage } from "../storage/types.js";
 import { chunkBody } from "./chunker.js";
 import type { EmbedHook, EmbedResponse } from "./hook.js";
@@ -86,24 +85,25 @@ export function createWorker(opts: WorkerOptions): Worker {
     }
     const chunks = chunkBody(version.body);
     if (chunks.length === 0) {
-      // Empty body: legal state, no embedding needed. Also wipe any
-      // prior chunks under any model (the caller's chunks_upsert with
-      // empty array handles that, but we skip the empty-model call
-      // since we don't know which model applies).
+      // Empty body: legal state, no embedding needed. Wipe any prior
+      // chunks so a doc edited FROM non-empty TO empty doesn't leave
+      // stale vectors that keep it rankable (Copilot #2).
+      // chunks_upsert with an empty list is a documented "delete all"
+      // for the version (see storage-sqlite/adapter.ts). Model string
+      // is unused on the empty path but required by the signature.
+      opts.storage.chunks_upsert(entry.version_id, "", []);
       opts.storage.backlog_delete(entry.version_id);
       return "processed";
     }
 
-    // 1. Dedup lookup: check which hashes we already have vectors for.
-    //    We don't know the model yet — chunks_by_hash is per-model —
-    //    but the strategy is: probe the "most recently used" model
-    //    by looking at any existing chunk for this document's prior
-    //    version. Fallback: skip dedup for the first embed under a
-    //    given model (worker calls the hook for every chunk).
+    // 1. Dedup lookup: check which hashes we already have vectors for
+    //    under the model the prior version was embedded under. If the
+    //    prior version was under a different model than the hook is
+    //    about to return, we throw the reuse away below.
     const priorChunks = version.prev_id ? opts.storage.chunks_by_version(version.prev_id) : [];
     const priorModel = priorChunks[0]?.model ?? null;
 
-    // Split into (reused, needs_hook).
+    // Build the reuse map — hash → embedding — scoped to prior model.
     const reuseByHash = new Map<string, Buffer>();
     if (priorModel !== null) {
       const hashes = chunks.map((c) => c.text_hash);
@@ -111,15 +111,28 @@ export function createWorker(opts: WorkerOptions): Worker {
       for (const r of rows) reuseByHash.set(r.text_hash, r.embedding);
     }
 
-    const needHookIx: number[] = [];
+    // Which chunk indexes still need the hook? Compute once; we may
+    // rebuild it after a model-change re-embed below.
+    let needHookIx: number[] = [];
     for (let i = 0; i < chunks.length; i++) {
       const c = chunks[i];
       if (c === undefined) continue;
-      if (!reuseByHash.has(c.text_hash)) {
-        needHookIx.push(i);
-      }
+      if (!reuseByHash.has(c.text_hash)) needHookIx.push(i);
     }
 
+    // Guard: helper for backoff-retain. Local closure so we can call it
+    // from both hook-call paths without duplicating the arithmetic.
+    const retain = (err: unknown, attempts: number) => {
+      const delay = Math.min(baseMs * 2 ** (attempts - 1), capMs);
+      opts.storage.backlog_retain({
+        version_id: entry.version_id,
+        attempts,
+        last_error: String(err instanceof Error ? err.message : err).slice(0, 500),
+        next_retry_at: new Date(Date.now() + delay).toISOString(),
+      });
+    };
+
+    // 2. First hook call (only the not-yet-reused chunks).
     let resp: EmbedResponse | null = null;
     if (needHookIx.length > 0) {
       const texts = needHookIx.map((i) => (chunks[i] as { text: string }).text);
@@ -127,87 +140,75 @@ export function createWorker(opts: WorkerOptions): Worker {
       try {
         resp = await opts.hook.embed(texts);
       } catch (err) {
-        // Retain with backoff.
-        const attempts = entry.attempts + 1;
-        const delay = Math.min(baseMs * 2 ** (attempts - 1), capMs);
-        const next = new Date(Date.now() + delay).toISOString();
-        opts.storage.backlog_retain({
-          version_id: entry.version_id,
-          attempts,
-          last_error: String(err instanceof Error ? err.message : err).slice(0, 500),
-          next_retry_at: next,
-        });
+        retain(err, entry.attempts + 1);
         return "failed";
       }
     }
 
-    // Model: hook response wins if we called it; otherwise reuse-only
-    // uses the prior model.
-    const model = resp?.model ?? priorModel;
-    if (model === null) {
-      // Unreachable in practice — needHookIx.length would be > 0
-      // when priorModel is null. Defensive assertion.
-      opts.storage.backlog_retain({
-        version_id: entry.version_id,
-        attempts: entry.attempts + 1,
-        last_error: "internal: no model resolvable for chunks",
-        next_retry_at: new Date(Date.now() + baseMs).toISOString(),
-      });
-      return "failed";
-    }
-
-    // If the hook returned a different model than prior, we can't reuse
-    // prior-model vectors: they belong to a different model. Re-call
-    // the hook for everything.
+    // 3. If the hook returned a NEW model — different from priorModel —
+    //    the prior-model reuse vectors don't apply. Throw the reuse
+    //    away, re-call the hook for EVERY chunk, and rebuild needHookIx
+    //    so the assembly loop below finds every chunk's vector in the
+    //    fresh response. (Regression fix for the review's model-change
+    //    bug: previously needHookIx stayed at the original subset,
+    //    which broke assembly for any chunk that was originally reused.)
     let effectiveReuse = reuseByHash;
     if (resp && priorModel !== null && resp.model !== priorModel) {
       log(
         `[embed] model changed (${priorModel} → ${resp.model}); re-embedding version ${entry.version_id}`,
       );
       effectiveReuse = new Map();
+      needHookIx = chunks.map((_c, i) => i);
       const texts = chunks.map((c) => c.text);
+      opts.onHookCall?.(texts.length);
       try {
-        opts.onHookCall?.(texts.length);
         resp = await opts.hook.embed(texts);
       } catch (err) {
-        const attempts = entry.attempts + 1;
-        const delay = Math.min(baseMs * 2 ** (attempts - 1), capMs);
-        opts.storage.backlog_retain({
-          version_id: entry.version_id,
-          attempts,
-          last_error: String(err instanceof Error ? err.message : err).slice(0, 500),
-          next_retry_at: new Date(Date.now() + delay).toISOString(),
-        });
+        retain(err, entry.attempts + 1);
         return "failed";
       }
     }
 
-    // Assemble the upsert batch. Order matches chunks[].
+    // Model: hook response wins if we called it; otherwise (all-reuse
+    // path) the prior model applies.
+    const model = resp?.model ?? priorModel;
+    if (model === null) {
+      // Unreachable — needHookIx.length > 0 when priorModel is null, so
+      // resp would be set. Defensive.
+      retain(new Error("internal: no model resolvable for chunks"), entry.attempts + 1);
+      return "failed";
+    }
+
+    // 4. Assemble the upsert batch. Every chunk is either reused (hash
+    //    in effectiveReuse) or freshly embedded (index in needHookIx).
+    //    Build a chunk-index → vector-blob map so both cases resolve in
+    //    O(1) without an indexOf scan.
+    const vectorByIx = new Map<number, readonly number[]>();
+    if (resp) {
+      for (let j = 0; j < needHookIx.length; j++) {
+        const i = needHookIx[j] as number;
+        const vec = resp.vectors[j];
+        if (!vec) {
+          retain(new Error("internal: response vector missing"), entry.attempts + 1);
+          return "failed";
+        }
+        vectorByIx.set(i, vec);
+      }
+    }
+
     const upsertChunks = chunks.map((c, i) => {
+      const fresh = vectorByIx.get(i);
+      if (fresh) {
+        return { ix: c.ix, text: c.text, text_hash: c.text_hash, model, embedding: fresh };
+      }
       const reused = effectiveReuse.get(c.text_hash);
-      if (reused) {
-        return {
-          ix: c.ix,
-          text: c.text,
-          text_hash: c.text_hash,
-          model,
-          embedding: reused,
-        };
+      if (!reused) {
+        // Defensive — every chunk should be covered by fresh OR reuse.
+        throw new Error(
+          `worker: internal — chunk ${i} of version ${entry.version_id} has no vector`,
+        );
       }
-      // We just embedded it; find its slot in the hook response.
-      const respIx = needHookIx.indexOf(i);
-      if (respIx < 0 || !resp) {
-        throw new Error("worker: internal — chunk missing from both reuse and response");
-      }
-      const vec = resp.vectors[respIx];
-      if (!vec) throw new Error("worker: internal — response vector missing");
-      return {
-        ix: c.ix,
-        text: c.text,
-        text_hash: c.text_hash,
-        model,
-        embedding: encodeVectorBlob(vec),
-      };
+      return { ix: c.ix, text: c.text, text_hash: c.text_hash, model, embedding: reused };
     });
 
     try {
@@ -215,13 +216,7 @@ export function createWorker(opts: WorkerOptions): Worker {
       opts.storage.backlog_delete(entry.version_id);
       return "processed";
     } catch (err) {
-      const attempts = entry.attempts + 1;
-      opts.storage.backlog_retain({
-        version_id: entry.version_id,
-        attempts,
-        last_error: String(err instanceof Error ? err.message : err).slice(0, 500),
-        next_retry_at: new Date(Date.now() + baseMs).toISOString(),
-      });
+      retain(err, entry.attempts + 1);
       return "failed";
     }
   }

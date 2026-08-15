@@ -57,10 +57,15 @@ export function openLocalClient(config: LocalClientConfig): KernelClient {
         }
       : undefined,
   });
-  return buildClient(kernel, actor, storage);
+  return buildClient(kernel, actor, storage, hook);
 }
 
-function buildClient(kernel: Kernel, actor: Actor, storage: Storage): KernelClient {
+function buildClient(
+  kernel: Kernel,
+  actor: Actor,
+  storage: Storage,
+  hook: EmbedHook | null,
+): KernelClient {
   let closed = false;
   const async = <T>(fn: () => T): Promise<T> => Promise.resolve().then(fn);
 
@@ -99,6 +104,16 @@ function buildClient(kernel: Kernel, actor: Actor, storage: Storage): KernelClie
     close: async () => {
       if (closed) return;
       closed = true;
+      // Close the hook first — a subprocess hook needs to reap its
+      // child before we drop the storage handle; the child could
+      // otherwise outlive the CLI invocation.
+      if (hook) {
+        try {
+          await hook.close();
+        } catch {
+          /* best-effort */
+        }
+      }
       storage.close();
     },
   };

@@ -60,28 +60,6 @@ function normalizeDatabase(url: string): string {
 }
 
 /**
- * Open storage, migrate, create the kernel. Split out so tests can inject a
- * pre-built kernel if they want to bypass the sqlite adapter.
- */
-export function openAndMigrate(
-  database: string,
-  serverPathConfig?: PathConfig,
-  onVersionCommitted?: (version_id: number) => void,
-): {
-  storage: Storage;
-  kernel: Kernel;
-} {
-  const storage = sqliteAdapter.open({ database: normalizeDatabase(database) });
-  storage.migrate();
-  const kernel = createKernel({
-    storage,
-    serverPathConfig: serverPathConfig ?? HARDCODED_DEFAULTS,
-    onVersionCommitted,
-  });
-  return { storage, kernel };
-}
-
-/**
  * Start a fully-wired mrplex server. Returns once the socket is listening.
  * Never throws for a merely-empty database — bootstrap is a separate step.
  */

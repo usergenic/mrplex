@@ -21,7 +21,7 @@ import type {
   VersionsSearchInput,
 } from "../storage/types.js";
 import { migrate } from "./migrations/index.js";
-import { loadSqliteVec } from "./vec.js";
+import { encodeVectorBlob, loadSqliteVec } from "./vec.js";
 
 type VersionRawRow = {
   id: number;
@@ -450,13 +450,19 @@ class SqliteStorage implements Storage {
       });
       return;
     }
-    // Refuse mixed-dim writes within one call (§5.3, m4-plan §1). We
-    // don't try to validate against previous writes for this model
-    // globally — a first-write-of-a-new-model call gets to pin the dim,
-    // and the worker's config chose the model.
-    const dim = chunks[0]?.embedding.byteLength;
+    // Normalize each embedding to a Buffer (BLOB) at the adapter
+    // boundary — callers pass either number[] (fresh from the hook) or
+    // Buffer (reused via chunks_by_hash). Storing the encoded form once
+    // per row is cheap; keeping the API surface backend-agnostic means
+    // the kernel never imports storage-sqlite/vec.js.
+    const encoded = chunks.map((c) => ({
+      ...c,
+      embedding: Buffer.isBuffer(c.embedding) ? c.embedding : encodeVectorBlob(c.embedding),
+    }));
+    // Refuse mixed-dim writes within one call (§5.3, m4-plan §1).
+    const dim = encoded[0]?.embedding.byteLength;
     if (dim === undefined) throw new Error("chunks_upsert: unreachable");
-    for (const c of chunks) {
+    for (const c of encoded) {
       if (c.embedding.byteLength !== dim) {
         throw new Error(
           `chunks_upsert: mixed embedding dimensions in one batch (${c.embedding.byteLength} vs ${dim})`,
@@ -473,7 +479,7 @@ class SqliteStorage implements Storage {
       const insert = this.db.prepare(
         "insert into chunks(version_id, ix, text, text_hash, model, embedding) values (?, ?, ?, ?, ?, ?)",
       );
-      for (const c of chunks) {
+      for (const c of encoded) {
         insert.run(version_id, c.ix, c.text, c.text_hash, c.model, c.embedding);
       }
     });
@@ -526,32 +532,48 @@ class SqliteStorage implements Storage {
   vector_search(
     repo_ids: readonly number[],
     model: string,
-    embedding: Buffer,
+    embedding: readonly number[],
     k: number,
   ): VectorSearchHit[] {
     if (repo_ids.length === 0 || k <= 0) return [];
-    // Brute-force scan over current-version chunks matching model.
-    // sqlite-vec's vec_distance_cosine returns 0 = identical → order asc.
-    // We collapse to best chunk per version in one pass via GROUP BY.
-    // §7.2.1 pins this at brute-force for SQLite; M5's pgvector adapter
-    // gets HNSW/IVFFlat.
+    // Encode the query vector at the adapter boundary (m4-plan §7.2.2 —
+    // adapter owns serialization). Kernel callers pass number[].
+    const queryBlob = encodeVectorBlob(embedding);
+    // Brute-force scan over current-version chunks matching model
+    // (§7.2.1 pins SQLite at brute-force in v1; M5's pgvector adapter
+    // gets HNSW/IVFFlat).
+    //
+    // We collapse to best chunk per version via ROW_NUMBER() rather than
+    // MIN(...) + bare columns. SQLite does support the bare-column-with-
+    // MIN convention, but the pairing (chunk_ix, score) is exactly the
+    // claim we need to prove correct — using ROW_NUMBER makes that
+    // pairing explicit rather than relying on a dialect-specific rule
+    // that Postgres won't share when M5 lands.
     const repoPh = repo_ids.map(() => "?").join(",");
     const rows = this.db
       .prepare(
-        `select chunks.version_id as version_id,
-                chunks.ix as chunk_ix,
-                min(vec_distance_cosine(chunks.embedding, ?)) as score
-           from chunks
-           join versions on versions.id = chunks.version_id
-           where chunks.model = ?
-             and chunks.embedding is not null
-             and versions.next_id is null
-             and versions.repo_id in (${repoPh})
-           group by chunks.version_id
+        `with scored as (
+           select chunks.version_id as version_id,
+                  chunks.ix as chunk_ix,
+                  vec_distance_cosine(chunks.embedding, ?) as score,
+                  row_number() over (
+                    partition by chunks.version_id
+                    order by vec_distance_cosine(chunks.embedding, ?) asc, chunks.ix asc
+                  ) as rn
+             from chunks
+             join versions on versions.id = chunks.version_id
+             where chunks.model = ?
+               and chunks.embedding is not null
+               and versions.next_id is null
+               and versions.repo_id in (${repoPh})
+         )
+         select version_id, chunk_ix, score
+           from scored
+           where rn = 1
            order by score asc
            limit ?`,
       )
-      .all(embedding, model, ...repo_ids, k) as VectorSearchHit[];
+      .all(queryBlob, queryBlob, model, ...repo_ids, k) as VectorSearchHit[];
     return rows;
   }
 

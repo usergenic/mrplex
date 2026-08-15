@@ -35,11 +35,9 @@ export async function backfillRepo(
   const live = storage.versions_live_by_repo(repo.id);
   let enqueued = 0;
   for (const version of live) {
-    // Skip system-namespaced paths (:deleted/...) — those have no
-    // reason to be searchable, and their bodies rarely change.
-    // Actually — no: system namespace exclusion is at query time, not
-    // storage time. Chunks exist for every current version, deleted
-    // or not. The query default excludes them.
+    // Every current version is a candidate — sigil exclusion is a
+    // query-time concern (§5.1), not a storage one, so :deleted/…
+    // rows get chunks too and are filtered out when queried.
     const existing = storage.chunks_by_version(version.id);
     if (existing.length === 0) {
       storage.backlog_enqueue(version.id);

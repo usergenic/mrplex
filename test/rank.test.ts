@@ -15,7 +15,6 @@ import { chunkBody } from "../src/embed/chunker.js";
 import { KernelError } from "../src/kernel/errors.js";
 import { createKernel } from "../src/kernel/kernel.js";
 import { sqliteAdapter } from "../src/storage-sqlite/adapter.js";
-import { encodeVectorBlob } from "../src/storage-sqlite/vec.js";
 import type { Storage } from "../src/storage/types.js";
 
 // A tiny 3-dim "corpus" — each doc is embedded as a fixed unit vector so
@@ -47,12 +46,12 @@ function seedWithVectors(
     // are multiple chunks, subsequent ones are duplicates (fine for
     // brute-force top-k which picks the min distance).
     const model = c.model ?? "test-3d";
-    const upsertChunks = chunks.map((chunk, i) => ({
+    const upsertChunks = chunks.map((chunk) => ({
       ix: chunk.ix,
       text: chunk.text,
       text_hash: chunk.text_hash,
       model,
-      embedding: encodeVectorBlob(i === 0 ? c.vector : c.vector),
+      embedding: c.vector,
     }));
     // Decode the version_id back to a storage id.
     const numericId = Number.parseInt(v.version_id.replace(/^v/, ""), 10);
@@ -155,7 +154,7 @@ describe("query — rank", () => {
         text: c.text,
         text_hash: c.text_hash,
         model: "test-3d",
-        embedding: encodeVectorBlob([1, 0, 0]),
+        embedding: [1, 0, 0],
       })),
     );
     // Delete → :deleted/…
@@ -169,7 +168,7 @@ describe("query — rank", () => {
         text: "hello world",
         text_hash: "same",
         model: "test-3d",
-        embedding: encodeVectorBlob([1, 0, 0]),
+        embedding: [1, 0, 0],
       },
     ]);
     // Default rank → nothing (path under :deleted/).

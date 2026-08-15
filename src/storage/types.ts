@@ -87,8 +87,15 @@ export type ChunkUpsertInput = {
   text: string;
   text_hash: string;
   model: string;
-  /** Little-endian float32 BLOB. See storage-sqlite/vec.ts. */
-  embedding: Buffer;
+  /**
+   * Query vector as plain JS numbers. The adapter owns the on-disk
+   * representation (float32 vs float64, endianness, etc.); kernel and
+   * worker code stays backend-agnostic.
+   *
+   * When reusing a dedup-hit vector, callers pass a `Buffer` directly —
+   * the adapter round-trips it back to storage without re-encoding.
+   */
+  embedding: readonly number[] | Buffer;
 };
 
 export type VectorSearchHit = {
@@ -250,13 +257,16 @@ export type Storage = {
    * `model`. §7.2.1 pins SQLite at brute-force in v1 — indexed ANN
    * arrives with M5's pgvector adapter.
    *
-   * `k` limits distinct-version results, not chunk hits. The adapter is
-   * responsible for the version-collapse (best chunk per version).
+   * `k` limits distinct-version results, not chunk hits. The adapter
+   * owns the version-collapse (best chunk per version) AND the vector
+   * serialization (float32 vs float64, LE vs BE, etc.). Kernel callers
+   * pass a plain JS number array — no dialect-specific encoding leaks
+   * into the query layer.
    */
   vector_search(
     repo_ids: readonly number[],
     model: string,
-    embedding: Buffer,
+    embedding: readonly number[],
     k: number,
   ): VectorSearchHit[];
 

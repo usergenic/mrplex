@@ -69,19 +69,35 @@ describe("adapter: chunks + vector_search", () => {
     ]);
 
     // Query for x-axis — chunk 0 must win with distance ≈ 0.
-    const hits = s.vector_search([r.id], "m", encodeVectorBlob([1, 0, 0]), 3);
+    const hits = s.vector_search([r.id], "m", [1, 0, 0], 3);
     expect(hits.length).toBe(1); // only one version has chunks
     expect(hits[0]?.version_id).toBe(v.id);
     expect(hits[0]?.chunk_ix).toBe(0);
     expect(hits[0]?.score).toBeCloseTo(0, 5);
   });
 
+  it("returns the chunk_ix of the winning chunk (not an arbitrary one)", () => {
+    // Regression for the bare-column MIN() pitfall: with three chunks
+    // in one version and a query aimed at chunk 2, we must get ix=2
+    // back, not ix=0/1.
+    const { s, r, v } = seed();
+    s.chunks_upsert(v.id, "m", [
+      { ix: 0, text: "far", text_hash: "h1", model: "m", embedding: encodeVectorBlob([1, 0, 0]) },
+      { ix: 1, text: "mid", text_hash: "h2", model: "m", embedding: encodeVectorBlob([0, 1, 0]) },
+      { ix: 2, text: "hit", text_hash: "h3", model: "m", embedding: encodeVectorBlob([0, 0, 1]) },
+    ]);
+    const hits = s.vector_search([r.id], "m", [0, 0, 1], 5);
+    expect(hits.length).toBe(1);
+    expect(hits[0]?.chunk_ix).toBe(2);
+    expect(hits[0]?.score).toBeCloseTo(0, 5);
+  });
+
   it("filters vector_search to current-version chunks only", () => {
     const { s, r, u, v } = seed();
     const now = new Date().toISOString();
-    const e = encodeVectorBlob([1, 0, 0]);
+    const vec = [1, 0, 0];
     s.chunks_upsert(v.id, "m", [
-      { ix: 0, text: "old", text_hash: "h_old", model: "m", embedding: e },
+      { ix: 0, text: "old", text_hash: "h_old", model: "m", embedding: vec },
     ]);
     // Advance the version chain — v is no longer current.
     const v2 = s.version_insert({
@@ -96,12 +112,12 @@ describe("adapter: chunks + vector_search", () => {
       created_at: now,
     });
     // v2 has no chunks yet — the old chunks on v must NOT surface.
-    expect(s.vector_search([r.id], "m", e, 5).length).toBe(0);
+    expect(s.vector_search([r.id], "m", vec, 5).length).toBe(0);
     // After embedding v2, we see v2's chunk.
     s.chunks_upsert(v2.id, "m", [
-      { ix: 0, text: "new", text_hash: "h_new", model: "m", embedding: e },
+      { ix: 0, text: "new", text_hash: "h_new", model: "m", embedding: vec },
     ]);
-    const hits = s.vector_search([r.id], "m", e, 5);
+    const hits = s.vector_search([r.id], "m", vec, 5);
     expect(hits.length).toBe(1);
     expect(hits[0]?.version_id).toBe(v2.id);
   });

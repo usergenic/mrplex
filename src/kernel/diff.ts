@@ -22,7 +22,6 @@ import { createTwoFilesPatch } from "diff";
 import { join as joinFrontmatter } from "../markdown/frontmatter.js";
 import type { Storage, VersionRow } from "../storage/types.js";
 import type { Actor } from "./auth/actor.js";
-import { authorize } from "./auth/authorize.js";
 import { KernelError, docNotFound, versionNotFound, versionNotInDocument } from "./errors.js";
 import { decodeVersionId } from "./version-id.js";
 

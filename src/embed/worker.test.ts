@@ -167,6 +167,111 @@ describe("worker: end-to-end", () => {
     expect(calls[0]?.[0]).toBe("v4");
   });
 
+  it("model change re-embeds every chunk (regression: mixed reuse + new model)", async () => {
+    // Regression for the PR-review "model-change re-embed" bug: when
+    // priorModel is set, some chunks are reuse-eligible, some aren't,
+    // and the hook returns a NEW model — the worker used to leave
+    // `needHookIx` at the original subset, then throw "internal —
+    // chunk missing" for any originally-reused chunk during assembly.
+    //
+    // To hit the mixed-reuse case we need multiple chunks, so we
+    // exceed the chunker's greedy-pack cap: two blocks each ≥ half
+    // the cap → two chunks. v1 = [A, B]; v2 = [A, C] — chunk A is
+    // reuse-eligible, chunk C forces a hook call.
+    const A = "A".repeat(1500);
+    const B = "B".repeat(1500);
+    const C = "C".repeat(1500);
+    const bodyV1 = `${A}\n\n${B}`;
+    const bodyV2 = `${A}\n\n${C}`;
+
+    const s = sqliteAdapter.open({ database: "sqlite::memory:" });
+    const { repo, actor } = bootstrap(s);
+    let model = "model-a";
+    const calls: { model: string; count: number }[] = [];
+    const hook: EmbedHook = {
+      label: "swappable",
+      async embed(chunks) {
+        calls.push({ model, count: chunks.length });
+        const vectors = chunks.map((_c, i) =>
+          Array.from({ length: 4 }, (_, j) => (i + j + 1) / 10),
+        );
+        return { vectors, model, dim: 4 };
+      },
+      async close() {},
+    };
+    const worker = createWorker({ storage: s, hook });
+    const kernel = createKernel({
+      storage: s,
+      onVersionCommitted: (id) => s.backlog_enqueue(id),
+    });
+    const v1 = kernel.docs.create(actor, repo.slug, "a.md", {
+      body: bodyV1,
+      frontmatter_raw: "",
+    });
+    await worker.drainOnce();
+    expect(calls.length).toBe(1);
+    expect(calls[0]?.model).toBe("model-a");
+    expect(calls[0]?.count).toBe(2); // both chunks embedded fresh
+
+    // Swap the model behind the hook. v2 keeps chunk A (reuse-eligible
+    // under model-a) but changes B → C (forces a hook call).
+    model = "model-b";
+    kernel.docs.put(actor, repo.slug, v1.version_id, "a.md", {
+      body: bodyV2,
+      frontmatter_raw: "",
+    });
+    // Without the fix, drainOnce throws internally and the row is
+    // retained with an "internal — chunk missing" error. With the fix,
+    // the worker detects the model change, re-embeds both chunks, and
+    // writes them under model-b.
+    await worker.drainOnce();
+
+    expect(s.backlog_dequeue(new Date().toISOString(), 10).length).toBe(0);
+    const numericId = Number.parseInt(
+      kernel.docs.get(actor, repo.slug, "a.md").version_id.replace(/^v/, ""),
+      10,
+    );
+    const finalChunks = s.chunks_by_version(numericId);
+    expect(finalChunks.length).toBe(2);
+    for (const c of finalChunks) expect(c.model).toBe("model-b");
+    // Two hook calls total: the first for the new chunk (C), the second
+    // (the re-embed) for both chunks under model-b.
+    expect(calls.length).toBe(3);
+    expect(calls[1]?.count).toBe(1); // just C
+    expect(calls[2]?.count).toBe(2); // both, re-embedded
+  });
+
+  it("editing to empty body wipes stale chunks (regression)", async () => {
+    // A doc edited from non-empty to empty must not leave stale
+    // vectors — otherwise it stays rankable despite having no
+    // chunkable content.
+    const s = sqliteAdapter.open({ database: "sqlite::memory:" });
+    const { repo, actor } = bootstrap(s);
+    const { hook } = fakeHook();
+    const worker = createWorker({ storage: s, hook });
+    const kernel = createKernel({
+      storage: s,
+      onVersionCommitted: (id) => s.backlog_enqueue(id),
+    });
+    const v1 = kernel.docs.create(actor, repo.slug, "a.md", {
+      body: "hello world",
+      frontmatter_raw: "",
+    });
+    await worker.drainOnce();
+    const idBefore = Number.parseInt(v1.version_id.replace(/^v/, ""), 10);
+    expect(s.chunks_by_version(idBefore).length).toBeGreaterThan(0);
+
+    const v2 = kernel.docs.put(actor, repo.slug, v1.version_id, "a.md", {
+      body: "",
+      frontmatter_raw: "",
+    });
+    await worker.drainOnce();
+    const idAfter = Number.parseInt(v2.version_id.replace(/^v/, ""), 10);
+    expect(s.chunks_by_version(idAfter).length).toBe(0);
+    // And the backlog was cleared.
+    expect(s.backlog_dequeue(new Date().toISOString(), 10).length).toBe(0);
+  });
+
   it("hook failure retains the entry with exponential backoff", async () => {
     const s = sqliteAdapter.open({ database: "sqlite::memory:" });
     const { repo, actor } = bootstrap(s);
