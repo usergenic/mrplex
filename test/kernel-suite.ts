@@ -13,7 +13,13 @@ import type { Storage } from "../src/storage/types.js";
 
 export type AdapterFactory = {
   name: string;
-  open: () => Promise<Storage>;
+  /**
+   * Returns a live Storage plus an optional teardown that the suite
+   * runs after each test. Teardown owns any per-test resources the
+   * adapter allocates outside the Storage instance (e.g. the PG
+   * harness drops its per-test schema here).
+   */
+  open: () => Promise<{ storage: Storage; teardown?: () => Promise<void> }>;
 };
 
 const T = (sec: number): string => new Date(Date.UTC(2026, 7, 13, 0, 0, sec)).toISOString();
@@ -22,9 +28,12 @@ export function runKernelSuite(factory: AdapterFactory): void {
   describe(`kernel [${factory.name}]`, () => {
     let storage: Storage;
     let kernel: Kernel;
+    let teardown: (() => Promise<void>) | undefined;
 
     beforeEach(async () => {
-      storage = await factory.open();
+      const opened = await factory.open();
+      storage = opened.storage;
+      teardown = opened.teardown;
       kernel = createKernel(storage);
 
       const alice = await storage.users_create({ slug: "alice", created_at: T(0) });
@@ -84,7 +93,8 @@ export function runKernelSuite(factory: AdapterFactory): void {
     });
 
     afterEach(async () => {
-      await storage.close();
+      if (teardown) await teardown();
+      else await storage.close();
     });
 
     describe("repos.list", () => {

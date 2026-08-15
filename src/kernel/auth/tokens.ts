@@ -71,11 +71,11 @@ export async function resolveActor(secret: string, storage: Storage): Promise<Ac
     admin: row.admin,
     token_id: row.id,
   };
-  try {
-    await storage.tokens_touch_last_used(row.id, new Date().toISOString());
-  } catch {
-    // Best-effort per §8.5; auth still succeeds.
-  }
+  // Fire-and-forget per §8.5. Awaiting would add a write to every auth
+  // resolve — noticeable under Postgres — and failures already don't
+  // change the outcome. Attach a `.catch` so an unhandled-rejection
+  // warning never escapes.
+  void storage.tokens_touch_last_used(row.id, new Date().toISOString()).catch(() => {});
   return actor;
 }
 

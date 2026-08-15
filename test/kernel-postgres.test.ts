@@ -10,17 +10,14 @@ import { runKernelSuite } from "./kernel-suite.js";
 import { PG_URL, openTestPostgres } from "./pg-harness.js";
 
 if (PG_URL) {
-  const factories: {
-    storage: Awaited<ReturnType<typeof openTestPostgres>>["storage"] | null;
-    cleanup: (() => Promise<void>) | null;
-  }[] = [];
-
   runKernelSuite({
     name: "postgres",
+    // Each test gets a fresh schema; teardown drops it (with cascade)
+    // so long-running runs don't leave orphan mrplex_test_* schemas
+    // behind in the shared database.
     open: async () => {
       const h = await openTestPostgres();
-      factories.push({ storage: h.storage, cleanup: h.cleanup });
-      return h.storage;
+      return { storage: h.storage, teardown: h.cleanup };
     },
   });
 } else {

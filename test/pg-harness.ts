@@ -2,19 +2,19 @@
  * Postgres test harness (m5-plan WS7).
  *
  * Reads `MRPLEX_TEST_POSTGRES_URL` (a `postgres://…` connection URL for
- * a database the test suite may create/drop schemas in). If the env var
- * is unset, `openTestPostgres` returns null and callers should skip
- * their PG-dependent tests via `describe.skipIf(!ENV)`.
+ * a database the test suite may create/drop schemas in). Callers should
+ * gate `openTestPostgres` on the exported `PG_URL` — the function
+ * throws when the env var is unset, so calling it unconditionally is a
+ * loud error rather than a silent skip.
  *
  * Each caller gets a fresh throwaway schema `mrplex_test_<random>` and
  * a Storage backed by it. `search_path` is set on the pool so the
- * `vector` extension type resolves; the schema is dropped-cascade on
- * close.
+ * `vector` extension type resolves; the schema is dropped-cascade by
+ * the returned `cleanup()`.
  */
 
-import { AsyncLocalStorage } from "node:async_hooks";
 import { randomBytes } from "node:crypto";
-import { Client, Pool, type PoolClient } from "pg";
+import { Client } from "pg";
 import { postgresAdapter } from "../src/storage-postgres/adapter.js";
 import type { Storage } from "../src/storage/types.js";
 
@@ -71,9 +71,3 @@ function withSearchPath(url: string, schema: string): string {
   const encoded = encodeURIComponent(optionsValue);
   return url.includes("?") ? `${url}&options=${encoded}` : `${url}?options=${encoded}`;
 }
-
-// Silence unused imports — kept for downstream tests that want direct
-// pool access.
-void AsyncLocalStorage;
-void Pool;
-export type _PoolClient = PoolClient;

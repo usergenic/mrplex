@@ -141,6 +141,13 @@ describe("resolveActor (SQLite backed)", () => {
     const { secret, row } = await issueToken();
     expect((await storage.tokens_by_id(row.id))?.last_used_at).toBeNull();
     await resolveActor(secret, storage);
+    // Touch is fire-and-forget (§8.5) — wait for it to land. Poll rather
+    // than a fixed sleep so the test isn't slower than it needs to be.
+    for (let i = 0; i < 50; i++) {
+      const row2 = await storage.tokens_by_id(row.id);
+      if (row2?.last_used_at !== null && row2?.last_used_at !== undefined) break;
+      await new Promise((r) => setTimeout(r, 5));
+    }
     const after = await storage.tokens_by_id(row.id);
     expect(after?.last_used_at).not.toBeNull();
   });
