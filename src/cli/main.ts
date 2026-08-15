@@ -25,7 +25,7 @@ import { KernelError } from "../kernel/errors.js";
 import { split as splitFrontmatter } from "../markdown/frontmatter.js";
 import { startMcpStdio } from "../mcp/server.js";
 import { startServer } from "../server/serve.js";
-import { sqliteAdapter } from "../storage-sqlite/adapter.js";
+import { normalizeDatabaseUrl, openStorage } from "../storage/registry.js";
 import { resolveTokenString } from "./auth.js";
 import { type BootstrapError, bootstrap } from "./bootstrap.js";
 import { type CliConfig, loadConfig, saveConfig } from "./config.js";
@@ -95,7 +95,7 @@ function resolveDatabase(opts: GlobalOpts): string {
   const cfg = loadConfig();
   const value =
     opts.database ?? process.env.MRPLEX_DATABASE ?? cfg.database ?? "sqlite:./mrplex.db";
-  return value.startsWith("sqlite:") || value.startsWith("postgres:") ? value : `sqlite:${value}`;
+  return normalizeDatabaseUrl(value);
 }
 
 function resolveServer(opts: GlobalOpts): string | undefined {
@@ -679,7 +679,7 @@ function buildProgram(): Command {
             process.exit(1);
             return;
           }
-          const storage = await sqliteAdapter.open({ database: resolveDatabase(gopts) });
+          const storage = await openStorage(resolveDatabase(gopts));
           const worker = createWorker({ storage, hook });
           try {
             const report = await backfillRepo(storage, localOpts.repo, worker, (m) =>
@@ -710,7 +710,7 @@ function buildProgram(): Command {
       const gopts = this.optsWithGlobals<GlobalOpts>();
       (async () => {
         try {
-          const storage = await sqliteAdapter.open({ database: resolveDatabase(gopts) });
+          const storage = await openStorage(resolveDatabase(gopts));
           try {
             const now = new Date().toISOString();
             const status = await storage.backlog_status(now);

@@ -12,7 +12,7 @@ import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { split } from "../src/markdown/frontmatter.js";
 import { parse as parseFrontmatter } from "../src/markdown/frontmatter.js";
-import { sqliteAdapter } from "../src/storage-sqlite/adapter.js";
+import { normalizeDatabaseUrl, openStorage } from "../src/storage/registry.js";
 import type { Storage } from "../src/storage/types.js";
 
 const HERE = fileURLToPath(new URL(".", import.meta.url));
@@ -22,7 +22,7 @@ function parseArgs(argv: string[]): { database: string } {
   const idx = argv.indexOf("--database");
   const value = idx !== -1 ? argv[idx + 1] : undefined;
   const database = value ?? process.env.MRPLEX_DATABASE ?? "sqlite:./mrplex.db";
-  return { database: database.startsWith("sqlite:") ? database : `sqlite:${database}` };
+  return { database: normalizeDatabaseUrl(database) };
 }
 
 function walkMarkdown(dir: string, out: string[] = []): string[] {
@@ -50,7 +50,7 @@ function isoAt(offsetSec: number): string {
 async function main(): Promise<void> {
   const args = parseArgs(process.argv);
   console.error(`seed: opening ${args.database}`);
-  const storage = await sqliteAdapter.open({ database: args.database });
+  const storage = await openStorage(args.database);
   try {
     await assertSeedable(storage);
     let clock = 0;

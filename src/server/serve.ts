@@ -20,7 +20,7 @@ import { type Kernel, createKernel } from "../kernel/kernel.js";
 import { HARDCODED_DEFAULTS, type PathConfig } from "../kernel/path-config.js";
 import { mountMcpStreamableHttp } from "../mcp/server.js";
 import { mountRestSurface } from "../rest/routes.js";
-import { sqliteAdapter } from "../storage-sqlite/adapter.js";
+import { openStorage } from "../storage/registry.js";
 import type { Storage } from "../storage/types.js";
 
 export type ServeConfig = {
@@ -54,11 +54,6 @@ export type ServeHandle = {
   close: () => Promise<void>;
 };
 
-function normalizeDatabase(url: string): string {
-  if (url.startsWith("sqlite:") || url.startsWith("postgres:")) return url;
-  return `sqlite:${url}`;
-}
-
 /**
  * Start a fully-wired mrplex server. Returns once the socket is listening.
  * Never throws for a merely-empty database — bootstrap is a separate step.
@@ -70,10 +65,7 @@ export async function startServer(config: ServeConfig): Promise<ServeHandle> {
   // Enqueue is unconditional whether or not a hook is configured
   // (m4-plan §5 decision 5) — a hookless deployment still records the
   // backlog so a later `embed backfill` doesn't have to walk history.
-  const storage: Storage = await sqliteAdapter.open({
-    database: normalizeDatabase(config.database),
-  });
-  await storage.migrate();
+  const storage: Storage = await openStorage(config.database);
   const kernel = createKernel({
     storage,
     serverPathConfig: config.serverPathConfig ?? HARDCODED_DEFAULTS,

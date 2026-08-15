@@ -23,3 +23,43 @@ jobs:
       - run: npm run typecheck
       - run: npm run lint
       - run: npm test
+
+  ci-postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: mrplex
+          POSTGRES_PASSWORD: mrplex
+          POSTGRES_DB: mrplex
+        options: >-
+          --health-cmd "pg_isready -U mrplex"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+        ports:
+          - 5432:5432
+    env:
+      MRPLEX_TEST_POSTGRES_URL: postgres://mrplex:mrplex@localhost:5432/mrplex
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # Fail loudly (not skip) if env is set but DB is unreachable.
+      - name: verify postgres reachable
+        run: |
+          for i in $(seq 1 30); do
+            if PGPASSWORD=mrplex psql -h localhost -U mrplex -d mrplex -c 'select 1' > /dev/null 2>&1; then
+              echo "postgres reachable"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "postgres unreachable after 60s"
+          exit 1
+      - run: npm run typecheck
+      - run: npm test

@@ -11,7 +11,7 @@ import { resolveActor } from "../kernel/auth/tokens.js";
 import { KernelError } from "../kernel/errors.js";
 import type { Kernel } from "../kernel/kernel.js";
 import { createKernel } from "../kernel/kernel.js";
-import { sqliteAdapter } from "../storage-sqlite/adapter.js";
+import { openStorage } from "../storage/registry.js";
 import type { Storage } from "../storage/types.js";
 import type { KernelClient } from "./kernel-client.js";
 
@@ -34,7 +34,7 @@ export type LocalClientConfig = {
  * code 3.
  */
 export async function openLocalClient(config: LocalClientConfig): Promise<KernelClient> {
-  const storage: Storage = await sqliteAdapter.open({ database: config.database });
+  const storage: Storage = await openStorage(config.database);
   const actor = await resolveActor(config.token, storage);
   if (!actor) {
     await storage.close();

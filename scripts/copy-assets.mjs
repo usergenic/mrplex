@@ -21,6 +21,11 @@ const ASSETS = [
     to: "dist/storage-sqlite/migrations",
     extensions: [".sql"],
   },
+  {
+    from: "src/storage-postgres/migrations",
+    to: "dist/storage-postgres/migrations",
+    extensions: [".sql"],
+  },
 ];
 
 for (const asset of ASSETS) {

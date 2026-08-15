@@ -10,7 +10,7 @@
  */
 
 import { generateSecret, hashSecret } from "../kernel/auth/tokens.js";
-import { sqliteAdapter } from "../storage-sqlite/adapter.js";
+import { openStorage } from "../storage/registry.js";
 
 const BOOTSTRAP_USER_SLUG = "system";
 const BOOTSTRAP_LABEL = "root";
@@ -36,7 +36,7 @@ export class BootstrapError extends Error {
  * admin token. Returns the plaintext secret.
  */
 export async function bootstrap(database: string): Promise<BootstrapResult> {
-  const storage = await sqliteAdapter.open({ database });
+  const storage = await openStorage(database);
   try {
     const users = await storage.users_list();
     if (users.length > 0) {
