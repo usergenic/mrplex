@@ -12,11 +12,12 @@ See [docs/design.md](docs/design.md) for the full design.
 - **Deletion is a move to a system-namespace path** (`:deleted/…/foo-v45129.md`, extension-aware). Restore is a `docs.put` back to a user-territory path. `docs.delete` is idempotent.
 - **Unified diff** between any two versions of the same document via `docs.diff` — kernel op, `/repos/{repo}/diff/{path}?from=&to=` REST route (JSON envelope or `Accept: text/plain` raw patch), `docs_diff` MCP tool, `mrplex docs diff` CLI. `patch(1)`-applicable output.
 - **CEL filter queries** over frontmatter fields and `$`-prefixed intrinsics (`$path`, `$created_at`, `$body`). `list()` polymorphism handles scalar-or-list frontmatter uniformly.
-- **Full-text search** over document body via SQLite FTS5 (porter+unicode61 tokenizer). Composes with filter via AND.
+- **Full-text search** over document body — SQLite FTS5 (porter+unicode61) or Postgres `websearch_to_tsquery`. Composes with filter via AND. Portable syntax subset across both engines: bare terms and quoted phrases.
 - **Semantic rank via embeddings** — pluggable hook (`--embed-url` HTTP or `--embed-cmd` subprocess); mrplex never calls a provider itself. Chunker + backlog worker + brute-force cosine k-NN over `sqlite-vec`; results current-version only, deduped by content hash. Composes with filter/text/scope/sigil-exclusion. No hook configured → `rank_unavailable` (no zero-vector default — silent garbage is worse than a visible gap).
 - **Bearer-token auth** with capability scopes — repo-scoped `read` / `write` path globs (gitignore-style, with negation), admin bit, per-token subset semantics for self-issued tokens.
 - **HTTP surfaces.** Protocol-true MCP server at `/mcp` (Streamable HTTP + optional STDIO), and a resource-oriented REST surface with `If-Match` / `If-None-Match`, content negotiation (`application/json` or `text/markdown`), `MOVE`, and sibling `/versions` / `/history` / `/diff` roots. Query responses carry ETags for `If-None-Match` → 304.
-- **`mrplex` CLI** — thin client over MCP. `--database` for local embedded mode against a SQLite file; `--server` for remote mode against a running server. Every command works identically over both transports.
+- **`mrplex` CLI** — thin client over MCP. `--database` for local embedded mode; `--server` for remote mode against a running server. Every command works identically over both transports.
+- **Two v1 storage adapters — SQLite and Postgres+pgvector.** `--database sqlite:./mrplex.db` (bare path defaults to sqlite) or `--database postgres://user:pw@host:5432/db`. Both pass the same kernel test suite.
 - **Configurable path policy** — hardcoded defaults → server config → per-repo override. `disallowed_chars`, `system_sigils`, `hidden_sigils`, all with sensible defaults (Obsidian's cross-platform-safe rule).
 - **Bootstrap** — `mrplex bootstrap` mints the root admin token on a fresh database.
 
@@ -163,7 +164,23 @@ npm run lint      # biome check
 npm run build     # emit dist/
 ```
 
-CI runs typecheck + lint + tests on Ubuntu & macOS × Node 20 & 22. `sqlite-vec` is loaded via better-sqlite3's `loadExtension` on every cell; if a platform gap ever appears, the fallback is computing cosine distance in a JS UDF — invisible above the adapter.
+CI runs typecheck + lint + tests on Ubuntu & macOS × Node 20 & 22, plus a `ci-postgres` job that spins up a `pgvector/pgvector:pg17` service and runs the shared kernel suite against a live Postgres. `sqlite-vec` is loaded via better-sqlite3's `loadExtension` on every cell; if a platform gap ever appears, the fallback is computing cosine distance in a JS UDF — invisible above the adapter.
+
+### Postgres locally
+
+```bash
+# Start a throwaway Postgres+pgvector.
+docker compose -f docker-compose.test.yml up -d
+
+# Bootstrap + serve against it.
+mrplex bootstrap --database postgres://mrplex:mrplex@localhost:5432/mrplex
+mrplex serve --database postgres://mrplex:mrplex@localhost:5432/mrplex
+
+# Run the parity suite against the live PG (adds ~16 kernel tests).
+MRPLEX_TEST_POSTGRES_URL=postgres://mrplex:mrplex@localhost:5432/mrplex npm test
+```
+
+The adapter passes any `postgres://…` URL through unchanged, so `sslmode`, `application_name`, and other libpq options work as expected. The `vector` extension is required in the target database (create it once as `create extension if not exists vector;`).
 
 ## License
 
