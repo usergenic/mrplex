@@ -19,11 +19,7 @@ const ADAPTERS: readonly StorageAdapter[] = [sqliteAdapter, postgresAdapter];
  * through unchanged.
  */
 export function normalizeDatabaseUrl(url: string): string {
-  if (
-    url.startsWith("sqlite:") ||
-    url.startsWith("postgres:") ||
-    url.startsWith("postgresql:")
-  ) {
+  if (url.startsWith("sqlite:") || url.startsWith("postgres:") || url.startsWith("postgresql:")) {
     return url;
   }
   return `sqlite:${url}`;

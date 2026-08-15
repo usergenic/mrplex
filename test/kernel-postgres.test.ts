@@ -6,8 +6,8 @@
  */
 
 import { describe } from "vitest";
-import { PG_URL, openTestPostgres } from "./pg-harness.js";
 import { runKernelSuite } from "./kernel-suite.js";
+import { PG_URL, openTestPostgres } from "./pg-harness.js";
 
 if (PG_URL) {
   const factories: {

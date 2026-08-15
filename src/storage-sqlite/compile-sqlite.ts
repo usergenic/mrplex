@@ -13,8 +13,8 @@
  */
 
 import { globToRegexSource } from "../kernel/auth/glob.js";
+import type { ScopeGroup, SearchPlan, SigilExclusion } from "../storage/search-plan.js";
 import { compileFilter } from "./compile-filter.js";
-import type { SearchPlan, ScopeGroup, SigilExclusion } from "../storage/search-plan.js";
 
 export type CompiledSql = {
   sql: string;

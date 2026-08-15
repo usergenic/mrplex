@@ -91,9 +91,9 @@ describe("repos.create/rename/delete", () => {
     // list default hides system-namespaced repos.
     expect((await kernel.repos.list(admin)).map((r) => r.repo)).not.toContain(deleted.repo);
     // include_system surfaces it.
-    expect(
-      (await kernel.repos.list(admin, { include_system: true })).map((r) => r.repo),
-    ).toContain(deleted.repo);
+    expect((await kernel.repos.list(admin, { include_system: true })).map((r) => r.repo)).toContain(
+      deleted.repo,
+    );
     // The old slug is now free — a fresh repo can claim it.
     const fresh = await kernel.repos.create(admin, "notes");
     expect(fresh.repo).toBe("notes");

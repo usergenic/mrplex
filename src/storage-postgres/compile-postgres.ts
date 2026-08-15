@@ -16,10 +16,10 @@
  */
 
 import { globToRegexSource } from "../kernel/auth/glob.js";
+import { KernelError } from "../kernel/errors.js";
 import type { CelExpr } from "../kernel/query/ast.js";
 import { unwrapConstant, unwrapListHint } from "../kernel/query/ast.js";
 import { INTRINSIC_PREFIX } from "../kernel/query/cel-parse.js";
-import { KernelError } from "../kernel/errors.js";
 import type { ScopeGroup, SearchPlan, SigilExclusion } from "../storage/search-plan.js";
 
 export type CompiledSql = {
@@ -63,9 +63,7 @@ export function compileSearchPlan(plan: SearchPlan): CompiledSql {
   // allow_all: no clause.
 
   if (plan.candidate_ids && plan.candidate_ids.length > 0) {
-    clauses.push(
-      `versions.id = ANY(${b.push(plan.candidate_ids)}::bigint[])`,
-    );
+    clauses.push(`versions.id = ANY(${b.push(plan.candidate_ids)}::bigint[])`);
   }
 
   const cols = `versions.id, versions.document_id, versions.repo_id,
@@ -352,8 +350,7 @@ function compileCall(expr: CelExpr, b: Builder): string {
       return compileEndsWith(target, args[0] as CelExpr, b);
     if (fn === "contains" && args.length === 1)
       return compileContains(target, args[0] as CelExpr, b);
-    if (fn === "matches" && args.length === 1)
-      return compileMatches(target, args[0] as CelExpr, b);
+    if (fn === "matches" && args.length === 1) return compileMatches(target, args[0] as CelExpr, b);
   }
 
   throw new KernelError("filter_invalid", {

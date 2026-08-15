@@ -9,10 +9,10 @@
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { sqliteAdapter } from "./adapter.js";
-import type { Storage, UserRow } from "../storage/types.js";
 import { KernelError } from "../kernel/errors.js";
 import { parseCel } from "../kernel/query/cel-parse.js";
+import type { Storage, UserRow } from "../storage/types.js";
+import { sqliteAdapter } from "./adapter.js";
 import { compileFilter } from "./compile-filter.js";
 
 let storage: Storage;

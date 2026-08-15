@@ -121,10 +121,7 @@ export function runKernelSuite(factory: AdapterFactory): void {
 
     describe("users.list", () => {
       it("returns all users, ordered by slug", async () => {
-        expect(await kernel.users.list(SYSTEM_ACTOR)).toEqual([
-          { user: "alice" },
-          { user: "bob" },
-        ]);
+        expect(await kernel.users.list(SYSTEM_ACTOR)).toEqual([{ user: "alice" }, { user: "bob" }]);
       });
     });
 

@@ -8,16 +8,16 @@
  * candidate-id whitelist.
  */
 
+import type { ScopeGroup, SearchPlan, SigilExclusion } from "../../storage/search-plan.js";
 import type { RepoRow, Storage, VersionRow } from "../../storage/types.js";
-import type { SearchPlan, ScopeGroup, SigilExclusion } from "../../storage/search-plan.js";
 import type { Actor } from "../auth/actor.js";
 import { slugMatchesPattern } from "../auth/glob.js";
 import { KernelError } from "../errors.js";
 import type { PathConfig } from "../path-config.js";
 import { effectivePathConfig, parseRepoOverride } from "../path-config.js";
 import type { Version } from "../wire.js";
-import { parseCel } from "./cel-parse.js";
 import type { CelExpr } from "./ast.js";
+import { parseCel } from "./cel-parse.js";
 
 export type QuerySpec = {
   /** Slug, glob, or list. Omitted = every repo the caller can address. */

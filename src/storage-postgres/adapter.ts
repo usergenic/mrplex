@@ -184,9 +184,7 @@ class PostgresStorage implements Storage {
 
   async users_list(): Promise<UserRow[]> {
     return this.withClient(async (c) => {
-      const res = await c.query<UserRow>(
-        "select id, slug, created_at from users order by slug",
-      );
+      const res = await c.query<UserRow>("select id, slug, created_at from users order by slug");
       return res.rows;
     });
   }
@@ -214,20 +212,18 @@ class PostgresStorage implements Storage {
 
   async users_by_slug(slug: string): Promise<UserRow | null> {
     return this.withClient(async (c) => {
-      const res = await c.query<UserRow>(
-        "select id, slug, created_at from users where slug = $1",
-        [slug],
-      );
+      const res = await c.query<UserRow>("select id, slug, created_at from users where slug = $1", [
+        slug,
+      ]);
       return res.rows[0] ?? null;
     });
   }
 
   async users_by_id(id: number): Promise<UserRow | null> {
     return this.withClient(async (c) => {
-      const res = await c.query<UserRow>(
-        "select id, slug, created_at from users where id = $1",
-        [id],
-      );
+      const res = await c.query<UserRow>("select id, slug, created_at from users where id = $1", [
+        id,
+      ]);
       return res.rows[0] ?? null;
     });
   }
@@ -266,10 +262,10 @@ class PostgresStorage implements Storage {
         slug: string;
         path_config: unknown;
         created_at: string;
-      }>(
-        "update repos set slug = $1 where id = $2 returning id, slug, path_config, created_at",
-        [new_slug, id],
-      );
+      }>("update repos set slug = $1 where id = $2 returning id, slug, path_config, created_at", [
+        new_slug,
+        id,
+      ]);
       if (res.rows.length === 0) throw new Error(`repos_rename: repo ${id} not found`);
       return hydrateRepo(res.rows[0] as never);
     });
@@ -710,7 +706,7 @@ class PostgresStorage implements Storage {
       ).rows;
       const models = (
         await c.query<{ model: string; chunk_count: number }>(
-          `select model, count(*)::int as chunk_count from chunks group by model order by model`,
+          "select model, count(*)::int as chunk_count from chunks group by model order by model",
         )
       ).rows;
       return {
@@ -804,10 +800,10 @@ class PostgresStorage implements Storage {
 
   async tokens_revoke_by_user(user_id: number, revoked_at: string): Promise<void> {
     await this.withClient((c) =>
-      c.query(
-        "update api_tokens set revoked_at = coalesce(revoked_at, $1) where user_id = $2",
-        [revoked_at, user_id],
-      ),
+      c.query("update api_tokens set revoked_at = coalesce(revoked_at, $1) where user_id = $2", [
+        revoked_at,
+        user_id,
+      ]),
     );
   }
 
@@ -831,9 +827,10 @@ function hydrateRepo(row: {
   return {
     id: row.id,
     slug: row.slug,
-    path_config: row.path_config === null || row.path_config === undefined
-      ? null
-      : JSON.stringify(row.path_config),
+    path_config:
+      row.path_config === null || row.path_config === undefined
+        ? null
+        : JSON.stringify(row.path_config),
     created_at: row.created_at,
   };
 }

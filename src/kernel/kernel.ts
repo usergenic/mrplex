@@ -274,9 +274,7 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
         authorize(actor, "read", { kind: "server" });
         const includeSystem = opts?.include_system ?? false;
         const rows = await storage.repos_list();
-        return rows
-          .filter((r) => includeSystem || !isSlugSystemNamespaced(r.slug))
-          .map(toRepoWire);
+        return rows.filter((r) => includeSystem || !isSlugSystemNamespaced(r.slug)).map(toRepoWire);
       },
       async get(actor, slug) {
         return toRepoWire(await resolveRepo(actor, slug, "read"));

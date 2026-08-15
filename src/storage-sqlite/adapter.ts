@@ -1,5 +1,6 @@
 import { RE2JS } from "@bufbuild/re2";
 import Database from "better-sqlite3";
+import type { SearchPlan } from "../storage/search-plan.js";
 import type {
   BacklogRow,
   BacklogStatus,
@@ -19,7 +20,6 @@ import type {
   VersionInsertInput,
   VersionRow,
 } from "../storage/types.js";
-import type { SearchPlan } from "../storage/search-plan.js";
 import { compileSearchPlan } from "./compile-sqlite.js";
 import { migrate } from "./migrations/index.js";
 import { decodeVectorBlob, encodeVectorBlob, loadSqliteVec } from "./vec.js";
@@ -79,7 +79,6 @@ function parseSqliteUrl(url: string): string {
 }
 
 class SqliteStorage implements Storage {
-  // biome-ignore lint/style/useReadonlyClassProperties: exposed for test-only exec hook.
   private db: Database.Database;
   private txDepth = 0;
 
