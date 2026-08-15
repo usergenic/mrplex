@@ -191,14 +191,12 @@ function compileIntrinsic(mangledName: string): string {
  * The `->>` variant (text) is used inside typed comparisons.
  */
 function frontmatterPath(parts: readonly string[]): string {
+  // Parts come from the CEL parser (identExpr.value.name /
+  // selectExpr.value.field) — the CEL grammar forbids newlines and
+  // other control chars in identifiers, so single-quote escaping is
+  // the only string-safety concern here.
   if (parts.length === 0) throw new Error("frontmatterPath: empty parts");
-  const first = parts[0] as string;
-  if (first.includes("\n") || first.includes("\r")) {
-    throw new KernelError("filter_invalid", {
-      reason: `frontmatter key contains newline: ${JSON.stringify(first)}`,
-    });
-  }
-  let expr = `versions.frontmatter -> '${first.replace(/'/g, "''")}'`;
+  let expr = `versions.frontmatter -> '${(parts[0] as string).replace(/'/g, "''")}'`;
   for (let i = 1; i < parts.length; i++) {
     const p = parts[i] as string;
     expr = `${expr} -> '${p.replace(/'/g, "''")}'`;

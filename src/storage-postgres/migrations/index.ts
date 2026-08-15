@@ -34,6 +34,18 @@ function loadMigrations(): Migration[] {
   });
 }
 
+/**
+ * Apply pending migrations to the database on the given client.
+ *
+ * **Precondition:** the caller must pass a client that is **not** inside
+ * an active transaction — migrate() opens its own `begin` and holds a
+ * `pg_advisory_xact_lock` for the duration. A client already in a tx
+ * either raises `25001 active_sql_transaction` here (server default) or
+ * silently rolls the migration into the outer tx (breaking the
+ * advisory-lock scope). The adapter's `open()` satisfies this by
+ * acquiring a fresh pool client and calling migrate() on it before
+ * anything else runs.
+ */
 export async function migrate(client: PoolClient): Promise<void> {
   const migrations = loadMigrations();
   // The lock lives for the transaction; multi-instance safety.

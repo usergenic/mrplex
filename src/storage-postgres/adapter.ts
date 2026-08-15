@@ -15,7 +15,8 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
-import { Pool, type PoolClient, types as pgTypes } from "pg";
+import pg, { Pool, type PoolClient } from "pg";
+import { KernelError } from "../kernel/errors.js";
 import type { SearchPlan } from "../storage/search-plan.js";
 import type {
   BacklogRow,
@@ -36,19 +37,34 @@ import type {
   VersionRow,
 } from "../storage/types.js";
 import { compileSearchPlan } from "./compile-postgres.js";
-import { isSerializationRetryable } from "./errors.js";
+import { isRegexInvalid, isSerializationRetryable, isVersionRaceViolation } from "./errors.js";
 import { migrate } from "./migrations/index.js";
 
-// PG type OIDs. INT8 = 20, NUMERIC = 1700.
-// Parse int8 → number with a SafeInteger guard so schema drift (e.g. an
-// id truly exceeding 2^53) fails loud, not silently rounds.
-pgTypes.setTypeParser(20, (val) => {
+// PG type OID for INT8 (bigint). We parse it to a JS number with a
+// SafeInteger guard so schema drift (an id truly exceeding 2^53) fails
+// loud, not silently rounds. The parser is installed on a per-pool
+// TypeOverrides so importing this adapter never mutates the
+// process-wide `pg.types` registry.
+const PG_OID_INT8 = 20;
+
+function safeInt8Parser(val: string): number {
   const n = Number(val);
   if (!Number.isSafeInteger(n)) {
     throw new Error(`postgres int8 value ${val} is not a safe JS integer`);
   }
   return n;
-});
+}
+
+function makeTypeOverrides(): pg.CustomTypesConfig {
+  // pg's TypeOverrides constructor takes an optional parent registry
+  // and lets you override per OID. We narrow the return to
+  // CustomTypesConfig (the Pool option's shape) so callers see the
+  // config object rather than the concrete TypeOverrides class.
+  // biome-ignore lint/suspicious/noExplicitAny: pg's types export lacks TypeOverrides.
+  const overrides = new (pg as any).TypeOverrides();
+  overrides.setTypeParser(PG_OID_INT8, safeInt8Parser);
+  return overrides;
+}
 
 function parseVectorLiteral(v: unknown): Float32Array {
   if (v instanceof Float32Array) return v;
@@ -98,7 +114,7 @@ class PostgresStorage implements Storage {
   private readonly txDepthByClient = new WeakMap<PoolClient, number>();
 
   constructor(url: string) {
-    this.pool = new Pool({ connectionString: url });
+    this.pool = new Pool({ connectionString: url, types: makeTypeOverrides() });
     this.txClient = new AsyncLocalStorage<PoolClient>();
   }
 
@@ -152,7 +168,6 @@ class PostgresStorage implements Storage {
     }
     // Top-level tx — REPEATABLE READ + retry on 40001/40P01.
     const maxAttempts = 3;
-    let lastErr: unknown;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const client = await this.pool.connect();
       try {
@@ -167,8 +182,12 @@ class PostgresStorage implements Storage {
           throw err;
         }
       } catch (err) {
-        lastErr = err;
-        if (isSerializationRetryable(err) && attempt < maxAttempts) {
+        // Retry serialization failures AND partial-index race violations.
+        // Both indicate a concurrent writer beat us; a fresh tx re-runs
+        // the kernel's app-level pre-check which raises the right
+        // KernelError (create_conflict / stale_prev / path_taken).
+        const retryable = isSerializationRetryable(err) || isVersionRaceViolation(err);
+        if (retryable && attempt < maxAttempts) {
           const delayMs = Math.floor(Math.random() * 25 * attempt);
           await new Promise((r) => setTimeout(r, delayMs));
           continue;
@@ -179,7 +198,8 @@ class PostgresStorage implements Storage {
         client.release();
       }
     }
-    throw lastErr;
+    // Unreachable: the loop either returns or throws on every attempt.
+    throw new Error("tx: retry loop exited without decision (unreachable)");
   }
 
   async users_list(): Promise<UserRow[]> {
@@ -418,8 +438,22 @@ class PostgresStorage implements Storage {
     if (plan.scope.kind === "deny_all") return [];
     return this.withClient(async (c) => {
       const { sql, params } = compileSearchPlan(plan);
-      const res = await c.query<VersionRawRow>(sql, params);
-      return res.rows as VersionRow[];
+      try {
+        const res = await c.query<VersionRawRow>(sql, params);
+        return res.rows as VersionRow[];
+      } catch (err) {
+        // A user regex that survives CEL parse but fails Postgres's
+        // POSIX ARE compiler surfaces as SQLSTATE 2201B. Map it to
+        // filter_invalid so the wire error catalog stays consistent
+        // (SQLite's RE2 UDF returns 0 for bad patterns, so this is
+        // the PG-only surface for the same failure mode).
+        if (isRegexInvalid(err)) {
+          throw new KernelError("filter_invalid", {
+            reason: `invalid regex in filter: ${err.message ?? "2201B"}`,
+          });
+        }
+        throw err;
+      }
     });
   }
 
@@ -476,7 +510,7 @@ class PostgresStorage implements Storage {
     // Validate cross-batch invariants before touching the db.
     let dim: number | null = null;
     for (const c of chunks) {
-      const len = c.embedding instanceof Float32Array ? c.embedding.length : c.embedding.length;
+      const len = c.embedding.length;
       if (dim === null) dim = len;
       else if (len !== dim) {
         throw new Error(
@@ -671,30 +705,21 @@ class PostgresStorage implements Storage {
 
   async backlog_status(now: string): Promise<BacklogStatus> {
     return this.withClient(async (c) => {
-      const pending = Number(
-        (await c.query<{ n: string }>("select count(*)::text as n from embedding_backlog")).rows[0]
-          ?.n ?? "0",
-      );
-      const due = Number(
-        (
-          await c.query<{ n: string }>(
-            "select count(*)::text as n from embedding_backlog where next_retry_at is null or next_retry_at <= $1",
-            [now],
-          )
-        ).rows[0]?.n ?? "0",
-      );
-      const failing = Number(
-        (
-          await c.query<{ n: string }>(
-            "select count(*)::text as n from embedding_backlog where attempts > 0",
-          )
-        ).rows[0]?.n ?? "0",
-      );
-      const oldest = (
-        await c.query<{ next_retry_at: string }>(
-          `select next_retry_at from embedding_backlog
-             where next_retry_at is not null
-             order by next_retry_at asc limit 1`,
+      // Collapse the three counts + oldest into one query via `filter`
+      // and a min() aggregate — one round-trip instead of four.
+      const summary = (
+        await c.query<{
+          pending: string;
+          due: string;
+          failing: string;
+          oldest: string | null;
+        }>(
+          `select count(*)::text as pending,
+                  count(*) filter (where next_retry_at is null or next_retry_at <= $1)::text as due,
+                  count(*) filter (where attempts > 0)::text as failing,
+                  min(next_retry_at) filter (where next_retry_at is not null) as oldest
+             from embedding_backlog`,
+          [now],
         )
       ).rows[0];
       const recent = (
@@ -710,10 +735,10 @@ class PostgresStorage implements Storage {
         )
       ).rows;
       return {
-        pending,
-        due,
-        failing,
-        oldest_next_retry_at: oldest?.next_retry_at ?? null,
+        pending: Number(summary?.pending ?? "0"),
+        due: Number(summary?.due ?? "0"),
+        failing: Number(summary?.failing ?? "0"),
+        oldest_next_retry_at: summary?.oldest ?? null,
         recent_errors: recent,
         models,
       };
