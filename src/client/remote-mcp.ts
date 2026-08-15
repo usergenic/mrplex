@@ -14,6 +14,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { ScopeInput } from "../kernel/auth/scope.js";
+import type { UnifiedDiff } from "../kernel/diff.js";
 import { KernelError, isKernelErrorCode } from "../kernel/errors.js";
 import type { FrontmatterInput } from "../kernel/frontmatter-input.js";
 import type { PathConfigOverride } from "../kernel/path-config.js";
@@ -136,6 +137,7 @@ function buildRemoteClient(client: Client): KernelClient {
           ...(opts?.limit !== undefined && { limit: opts.limit }),
           ...(opts?.before !== undefined && { before: opts.before }),
         }),
+      diff: (repo, path, from, to) => call<UnifiedDiff>("docs_diff", { repo, path, from, to }),
       create: (repo, path, input: FrontmatterInput & { body: string }) =>
         call<Version>("docs_create", {
           repo,

@@ -1,12 +1,10 @@
 /**
  * MCP tool registry — design §6.2.
  *
- * 20 tools mirroring the kernel one-to-one. Each entry names the tool,
+ * 21 tools mirroring the kernel one-to-one. Each entry names the tool,
  * describes it, carries a JSON Schema for the input, and delegates to a
- * kernel call with the resolved actor.
- *
- * Design's §6.2 list contains 21 entries; `docs_diff` deferred to M4 per
- * the m3-plan §5 decision 7. The remaining 20 land here.
+ * kernel call with the resolved actor. M4 added `docs_diff` (the tool
+ * m3 deferred).
  *
  * Results shape:
  *   • On success: { structured, text } — structured is the wire type,
@@ -50,7 +48,7 @@ export type ToolHandler = (
   kernel: Kernel,
   actor: Actor,
   args: Record<string, unknown>,
-) => ToolResult;
+) => ToolResult | Promise<ToolResult>;
 
 export type ToolEntry = {
   name: string;
@@ -333,6 +331,31 @@ export const TOOL_REGISTRY: ToolEntry[] = [
     },
   },
   {
+    name: "docs_diff",
+    description:
+      "Unified diff between two versions of the document at (repo, path). Both versions must belong to that document — otherwise version_not_in_document.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string" },
+        path: { type: "string" },
+        from: { type: "string", description: "source version id" },
+        to: { type: "string", description: "target version id" },
+      },
+      required: ["repo", "path", "from", "to"],
+    },
+    handler: (kernel, actor, args) => {
+      const d = kernel.docs.diff(
+        actor,
+        argStr(args, "repo"),
+        argStr(args, "path"),
+        argStr(args, "from"),
+        argStr(args, "to"),
+      );
+      return { structured: d as unknown as Record<string, unknown>, text: d.patch };
+    },
+  },
+  {
     name: "docs_create",
     description:
       "Create a new document. Provide exactly one of `frontmatter` (JSON map) or `frontmatter_raw` (verbatim YAML). §3.2.",
@@ -473,15 +496,19 @@ export const TOOL_REGISTRY: ToolEntry[] = [
         },
         filter: { type: "string" },
         text: { type: "string" },
-        rank: { type: "string", description: "Deferred to M4 — currently returns filter_invalid." },
+        rank: {
+          type: "string",
+          description:
+            "Semantic rank via embeddings (§5.1). Requires an embed hook; else rank_unavailable.",
+        },
         limit: { type: "integer", minimum: 0 },
         include_hidden: { type: "boolean" },
         include_system: { type: "boolean" },
       },
     },
-    handler: (kernel, actor, args) => {
+    handler: async (kernel, actor, args) => {
       const spec = args as QuerySpec;
-      const rows = kernel.query(actor, spec);
+      const rows = await kernel.query(actor, spec);
       return { structured: wrapList(rows), text: renderVersionList(rows) };
     },
   },

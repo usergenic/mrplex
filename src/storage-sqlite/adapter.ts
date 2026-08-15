@@ -1,6 +1,10 @@
 import { RE2JS } from "@bufbuild/re2";
 import Database from "better-sqlite3";
 import type {
+  BacklogRow,
+  BacklogStatus,
+  ChunkRow,
+  ChunkUpsertInput,
   DocumentRow,
   FrontmatterJson,
   HistoryOptions,
@@ -11,11 +15,13 @@ import type {
   TokenInsertInput,
   TokenRow,
   UserRow,
+  VectorSearchHit,
   VersionInsertInput,
   VersionRow,
   VersionsSearchInput,
 } from "../storage/types.js";
 import { migrate } from "./migrations/index.js";
+import { encodeVectorBlob, loadSqliteVec } from "./vec.js";
 
 type VersionRawRow = {
   id: number;
@@ -106,6 +112,10 @@ class SqliteStorage implements Storage {
         return compiled.matches(input) ? 1 : 0;
       },
     );
+    // sqlite-vec provides vec_distance_cosine + friends over float32
+    // BLOBs — m4-plan §5 decision 3. Loaded once per connection; safe
+    // to load before migrations because it only registers UDFs.
+    loadSqliteVec(this.db);
   }
 
   close(): void {
@@ -426,6 +436,244 @@ class SqliteStorage implements Storage {
       )
       .all(...params) as VersionRawRow[];
     return rows.map(hydrateVersion);
+  }
+
+  // Chunks + vectors (design §3.2, §5.3). Written by the backlog worker;
+  // read by kernel.query's `rank` branch. Vectors are LE float32 BLOBs
+  // (see storage-sqlite/vec.ts); dedup keys on (model, text_hash).
+  chunks_upsert(version_id: number, model: string, chunks: readonly ChunkUpsertInput[]): void {
+    if (chunks.length === 0) {
+      // Explicit "no chunks" is still a valid state (empty body); wipe
+      // any prior rows so re-embedding doesn't leave stale vectors.
+      this.tx(() => {
+        this.db.prepare("delete from chunks where version_id = ?").run(version_id);
+      });
+      return;
+    }
+    // Normalize each embedding to a Buffer (BLOB) at the adapter
+    // boundary — callers pass either number[] (fresh from the hook) or
+    // Buffer (reused via chunks_by_hash). Storing the encoded form once
+    // per row is cheap; keeping the API surface backend-agnostic means
+    // the kernel never imports storage-sqlite/vec.js.
+    const encoded = chunks.map((c) => ({
+      ...c,
+      embedding: Buffer.isBuffer(c.embedding) ? c.embedding : encodeVectorBlob(c.embedding),
+    }));
+    // Refuse mixed-dim writes within one call (§5.3, m4-plan §1).
+    const dim = encoded[0]?.embedding.byteLength;
+    if (dim === undefined) throw new Error("chunks_upsert: unreachable");
+    for (const c of encoded) {
+      if (c.embedding.byteLength !== dim) {
+        throw new Error(
+          `chunks_upsert: mixed embedding dimensions in one batch (${c.embedding.byteLength} vs ${dim})`,
+        );
+      }
+      if (c.model !== model) {
+        throw new Error(
+          `chunks_upsert: mixed models in one batch (${JSON.stringify(c.model)} vs ${JSON.stringify(model)})`,
+        );
+      }
+    }
+    this.tx(() => {
+      this.db.prepare("delete from chunks where version_id = ?").run(version_id);
+      const insert = this.db.prepare(
+        "insert into chunks(version_id, ix, text, text_hash, model, embedding) values (?, ?, ?, ?, ?, ?)",
+      );
+      for (const c of encoded) {
+        insert.run(version_id, c.ix, c.text, c.text_hash, c.model, c.embedding);
+      }
+    });
+  }
+
+  chunks_by_hash(
+    model: string,
+    text_hashes: readonly string[],
+  ): { text_hash: string; embedding: Buffer }[] {
+    if (text_hashes.length === 0) return [];
+    const ph = text_hashes.map(() => "?").join(",");
+    // GROUP BY text_hash returns one row per hash (arbitrary embedding
+    // among duplicates is fine — dedup semantics guarantee they're the
+    // same vector).
+    const rows = this.db
+      .prepare(
+        `select text_hash, embedding
+           from chunks
+           where model = ?
+             and text_hash in (${ph})
+             and embedding is not null
+           group by text_hash`,
+      )
+      .all(model, ...text_hashes) as { text_hash: string; embedding: Buffer }[];
+    return rows;
+  }
+
+  chunks_by_version(version_id: number): ChunkRow[] {
+    return this.db
+      .prepare(
+        `select version_id, ix, text, text_hash, model, embedding
+           from chunks
+           where version_id = ?
+           order by ix`,
+      )
+      .all(version_id) as ChunkRow[];
+  }
+
+  chunks_model_summary(): { model: string; chunk_count: number }[] {
+    return this.db
+      .prepare(
+        `select model, count(*) as chunk_count
+           from chunks
+           group by model
+           order by model`,
+      )
+      .all() as { model: string; chunk_count: number }[];
+  }
+
+  vector_search(
+    repo_ids: readonly number[],
+    model: string,
+    embedding: readonly number[],
+    k: number,
+  ): VectorSearchHit[] {
+    if (repo_ids.length === 0 || k <= 0) return [];
+    // Encode the query vector at the adapter boundary (m4-plan §7.2.2 —
+    // adapter owns serialization). Kernel callers pass number[].
+    const queryBlob = encodeVectorBlob(embedding);
+    // Brute-force scan over current-version chunks matching model
+    // (§7.2.1 pins SQLite at brute-force in v1; M5's pgvector adapter
+    // gets HNSW/IVFFlat).
+    //
+    // We collapse to best chunk per version via ROW_NUMBER() rather than
+    // MIN(...) + bare columns. SQLite does support the bare-column-with-
+    // MIN convention, but the pairing (chunk_ix, score) is exactly the
+    // claim we need to prove correct — using ROW_NUMBER makes that
+    // pairing explicit rather than relying on a dialect-specific rule
+    // that Postgres won't share when M5 lands.
+    const repoPh = repo_ids.map(() => "?").join(",");
+    const rows = this.db
+      .prepare(
+        `with scored as (
+           select chunks.version_id as version_id,
+                  chunks.ix as chunk_ix,
+                  vec_distance_cosine(chunks.embedding, ?) as score,
+                  row_number() over (
+                    partition by chunks.version_id
+                    order by vec_distance_cosine(chunks.embedding, ?) asc, chunks.ix asc
+                  ) as rn
+             from chunks
+             join versions on versions.id = chunks.version_id
+             where chunks.model = ?
+               and chunks.embedding is not null
+               and versions.next_id is null
+               and versions.repo_id in (${repoPh})
+         )
+         select version_id, chunk_ix, score
+           from scored
+           where rn = 1
+           order by score asc
+           limit ?`,
+      )
+      .all(queryBlob, queryBlob, model, ...repo_ids, k) as VectorSearchHit[];
+    return rows;
+  }
+
+  // Embedding backlog (design §5.3). One row per version awaiting or
+  // retrying embedding. Enqueue is idempotent-per-version (upsert) and
+  // resets attempts + next_retry_at so a superseding write doesn't
+  // inherit an old backoff.
+  backlog_enqueue(version_id: number): void {
+    this.db
+      .prepare(
+        `insert into embedding_backlog(version_id, attempts, last_error, next_retry_at)
+           values (?, 0, null, null)
+           on conflict(version_id) do update
+             set attempts = 0, last_error = null, next_retry_at = null`,
+      )
+      .run(version_id);
+  }
+
+  backlog_dequeue(now: string, limit: number): BacklogRow[] {
+    if (limit <= 0) return [];
+    return this.db
+      .prepare(
+        `select version_id, attempts, last_error, next_retry_at
+           from embedding_backlog
+           where next_retry_at is null or next_retry_at <= ?
+           order by coalesce(next_retry_at, '') asc, version_id asc
+           limit ?`,
+      )
+      .all(now, limit) as BacklogRow[];
+  }
+
+  backlog_retain(input: {
+    version_id: number;
+    attempts: number;
+    last_error: string;
+    next_retry_at: string;
+  }): void {
+    this.db
+      .prepare(
+        `update embedding_backlog
+           set attempts = ?, last_error = ?, next_retry_at = ?
+           where version_id = ?`,
+      )
+      .run(input.attempts, input.last_error, input.next_retry_at, input.version_id);
+  }
+
+  backlog_delete(version_id: number): void {
+    this.db.prepare("delete from embedding_backlog where version_id = ?").run(version_id);
+  }
+
+  backlog_status(now: string): BacklogStatus {
+    const pending = (
+      this.db.prepare("select count(*) as n from embedding_backlog").get() as { n: number }
+    ).n;
+    const due = (
+      this.db
+        .prepare(
+          "select count(*) as n from embedding_backlog where next_retry_at is null or next_retry_at <= ?",
+        )
+        .get(now) as { n: number }
+    ).n;
+    const failing = (
+      this.db.prepare("select count(*) as n from embedding_backlog where attempts > 0").get() as {
+        n: number;
+      }
+    ).n;
+    const oldestRow = this.db
+      .prepare(
+        `select next_retry_at
+           from embedding_backlog
+           where next_retry_at is not null
+           order by next_retry_at asc
+           limit 1`,
+      )
+      .get() as { next_retry_at: string } | undefined;
+    const recent = this.db
+      .prepare(
+        `select version_id, last_error
+           from embedding_backlog
+           where last_error is not null
+           order by next_retry_at desc
+           limit 5`,
+      )
+      .all() as { version_id: number; last_error: string }[];
+    const models = this.db
+      .prepare(
+        `select model, count(*) as chunk_count
+           from chunks
+           group by model
+           order by model`,
+      )
+      .all() as { model: string; chunk_count: number }[];
+    return {
+      pending,
+      due,
+      failing,
+      oldest_next_retry_at: oldestRow?.next_retry_at ?? null,
+      recent_errors: recent,
+      models,
+    };
   }
 
   // Tokens (design §3.2, §8). SQLite has no boolean, so `admin` stores 0/1.

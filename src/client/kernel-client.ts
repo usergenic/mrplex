@@ -11,6 +11,7 @@
  */
 
 import type { ScopeInput } from "../kernel/auth/scope.js";
+import type { UnifiedDiff } from "../kernel/diff.js";
 import type { FrontmatterInput } from "../kernel/frontmatter-input.js";
 import type { PathConfigOverride } from "../kernel/path-config.js";
 import type { QuerySpec } from "../kernel/query/query.js";
@@ -39,6 +40,12 @@ export type KernelClient = {
     get(repo: string, path: string): Promise<Version>;
     get_version(repo: string, version_id: string): Promise<Version>;
     history(repo: string, path: string, opts?: HistoryOptions): Promise<Version[]>;
+    diff(
+      repo: string,
+      path: string,
+      from_version_id: string,
+      to_version_id: string,
+    ): Promise<UnifiedDiff>;
     create(
       repo: string,
       path: string,

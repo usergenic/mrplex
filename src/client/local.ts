@@ -8,6 +8,7 @@
  * WS5 acceptance).
  */
 
+import type { EmbedHook } from "../embed/hook.js";
 import type { Actor } from "../kernel/auth/actor.js";
 import { resolveActor } from "../kernel/auth/tokens.js";
 import { KernelError } from "../kernel/errors.js";
@@ -22,6 +23,12 @@ export type LocalClientConfig = {
   database: string;
   /** Bearer secret. */
   token: string;
+  /**
+   * Optional embed hook for rank queries in embedded-CLI mode. Also
+   * enables write-time backlog enqueue so writes done via the local
+   * client contribute to backlog like serve's do.
+   */
+  embed?: EmbedHook | null;
 };
 
 /**
@@ -36,11 +43,29 @@ export function openLocalClient(config: LocalClientConfig): KernelClient {
     storage.close();
     throw new KernelError("unauthorized", {});
   }
-  const kernel = createKernel(storage);
-  return buildClient(kernel, actor, storage);
+  const hook = config.embed ?? null;
+  const kernel = createKernel({
+    storage,
+    // Enqueue is unconditional (m4-plan §5 decision 5), matching serve.
+    onVersionCommitted: (versionId) => storage.backlog_enqueue(versionId),
+    queryEmbed: hook
+      ? async (rank: string) => {
+          const resp = await hook.embed([rank]);
+          const vector = resp.vectors[0];
+          if (!vector) throw new Error("embed hook returned no vector for query string");
+          return { vector, model: resp.model, dim: resp.dim };
+        }
+      : undefined,
+  });
+  return buildClient(kernel, actor, storage, hook);
 }
 
-function buildClient(kernel: Kernel, actor: Actor, storage: Storage): KernelClient {
+function buildClient(
+  kernel: Kernel,
+  actor: Actor,
+  storage: Storage,
+  hook: EmbedHook | null,
+): KernelClient {
   let closed = false;
   const async = <T>(fn: () => T): Promise<T> => Promise.resolve().then(fn);
 
@@ -63,6 +88,7 @@ function buildClient(kernel: Kernel, actor: Actor, storage: Storage): KernelClie
       get: (repo, path) => async(() => kernel.docs.get(actor, repo, path)),
       get_version: (repo, vid) => async(() => kernel.docs.get_version(actor, repo, vid)),
       history: (repo, path, opts) => async(() => kernel.docs.history(actor, repo, path, opts)),
+      diff: (repo, path, from, to) => async(() => kernel.docs.diff(actor, repo, path, from, to)),
       create: (repo, path, input) => async(() => kernel.docs.create(actor, repo, path, input)),
       put: (repo, prev, path, input) =>
         async(() => kernel.docs.put(actor, repo, prev, path, input)),
@@ -74,10 +100,20 @@ function buildClient(kernel: Kernel, actor: Actor, storage: Storage): KernelClie
         async(() => kernel.tokens.create(actor, label, scopes, opts)),
       revoke: (id) => async(() => kernel.tokens.revoke(actor, id)),
     },
-    query: (spec) => async(() => kernel.query(actor, spec)),
+    query: (spec) => kernel.query(actor, spec),
     close: async () => {
       if (closed) return;
       closed = true;
+      // Close the hook first — a subprocess hook needs to reap its
+      // child before we drop the storage handle; the child could
+      // otherwise outlive the CLI invocation.
+      if (hook) {
+        try {
+          await hook.close();
+        } catch {
+          /* best-effort */
+        }
+      }
       storage.close();
     },
   };

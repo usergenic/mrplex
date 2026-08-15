@@ -26,6 +26,7 @@ import {
   tokenIdString,
 } from "./auth/tokens.js";
 import { deletionPath, pathIsInSystemNamespace } from "./deletion.js";
+import { type UnifiedDiff, runDiff } from "./diff.js";
 import {
   KernelError,
   docNotFound,
@@ -82,6 +83,13 @@ export type Kernel = {
     get(actor: Actor, repo: string, path: string): Version;
     get_version(actor: Actor, repo: string, version_id: string): Version;
     history(actor: Actor, repo: string, path: string, opts?: HistoryOptions): Version[];
+    diff(
+      actor: Actor,
+      repo: string,
+      path: string,
+      from_version_id: string,
+      to_version_id: string,
+    ): UnifiedDiff;
     create(
       actor: Actor,
       repo: string,
@@ -107,7 +115,14 @@ export type Kernel = {
     ): TokenCreateResult;
     revoke(actor: Actor, token_id: string): Token;
   };
-  query(actor: Actor, spec: QuerySpec): Version[];
+  /**
+   * Query is async because the `rank` mode (M4) calls the embed hook to
+   * turn the query string into a vector — an I/O boundary. Filter-only
+   * and text-only queries complete synchronously inside this promise
+   * (a microtask), so the async signature is honesty about the rank
+   * path, not overhead on the common case.
+   */
+  query(actor: Actor, spec: QuerySpec): Promise<Version[]>;
 };
 
 export type KernelConfig = {
@@ -117,6 +132,33 @@ export type KernelConfig = {
    * Caller is responsible for validating via validateConfig() before passing.
    */
   serverPathConfig?: PathConfig;
+  /**
+   * M4 write-time hook: called with the new version's storage id after
+   * every committed create / put / delete. Used by the embedding worker
+   * to enqueue for chunking (§5.3, m4-plan §5 decision 5 — enqueue is
+   * unconditional whether or not a hook is configured).
+   *
+   * The kernel invokes this in the same synchronous scope after
+   * version_insert commits; a throw here bubbles to the caller and the
+   * whole write is treated as failed. In practice the worker's
+   * backlog_enqueue is one cheap UPSERT and doesn't throw.
+   */
+  onVersionCommitted?: (version_id: number) => void;
+  /**
+   * M4 read-time embed: called with a single rank-query string to
+   * produce the vector to search against (§5.1, m4-plan WS4).
+   *
+   * The kernel calls this ONLY when `rank` is present in a QuerySpec.
+   * Absent → `rank_unavailable`. Errors here also surface as
+   * `rank_unavailable` (data carries the cause) — a rank query can't
+   * defer like a write can.
+   *
+   * Must return the batch's contract-validated response (same shape
+   * the write-side hook returns). The kernel selects results by the
+   * response's `model`, not by any persisted "current model" (§5
+   * decision 9).
+   */
+  queryEmbed?: (rank: string) => Promise<{ vector: number[]; model: string; dim: number }>;
 };
 
 export function createKernel(config: KernelConfig | Storage): Kernel {
@@ -127,6 +169,8 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
       : { storage: config as Storage };
   const storage = cfg.storage;
   const serverPathConfig = cfg.serverPathConfig ?? HARDCODED_DEFAULTS;
+  const onVersionCommitted = cfg.onVersionCommitted;
+  const queryEmbed = cfg.queryEmbed;
 
   // Author lookup — cheap and hot, so cache within a kernel instance.
   const userCache = new Map<number, User>();
@@ -413,13 +457,31 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
         return rows.map((r) => toVersionWire(r, repoSlug));
       },
 
+      diff(actor, repoSlug, path, fromVersionId, toVersionId) {
+        return runDiff(
+          actor,
+          {
+            repo: repoSlug,
+            path,
+            from_version_id: fromVersionId,
+            to_version_id: toVersionId,
+          },
+          {
+            storage,
+            resolveReadRepo: (a, slug) => resolveRepo(a, slug, "read"),
+            authorizeReadPath: (a, repo_id, p) =>
+              authorize(a, "read", { kind: "path", repo_id, path: p }),
+          },
+        );
+      },
+
       create(actor, repoSlug, path, input) {
         const repo = resolveRepo(actor, repoSlug, "write");
         authorize(actor, "write", { kind: "path", repo_id: repo.id, path });
         validatePath(path, repoEffectiveConfig(repo));
         const canon = canonicalizeFrontmatter(input);
 
-        return storage.tx(() => {
+        const { version, insertedId } = storage.tx(() => {
           const existing = storage.version_current(repo.id, path);
           if (existing) {
             throw new KernelError("create_conflict", {
@@ -440,8 +502,10 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
             author_id: actor.user_id,
             created_at: new Date().toISOString(),
           });
-          return toVersionWire(inserted, repoSlug);
+          return { version: toVersionWire(inserted, repoSlug), insertedId: inserted.id };
         });
+        onVersionCommitted?.(insertedId);
+        return version;
       },
 
       put(actor, repoSlug, prevVersionId, destPath, input) {
@@ -468,7 +532,7 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
         const canon = canonicalizeOrCarry(input, prev);
         const body = input.body ?? prev.body;
 
-        return storage.tx(() => {
+        const { version, insertedId } = storage.tx(() => {
           // Verify prev is STILL current (design §4.1 rule 1). Doing it inside
           // the tx before insert closes the race window.
           const current = storage.version_current(repo.id, prev.path);
@@ -511,8 +575,10 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
             author_id: actor.user_id,
             created_at: new Date().toISOString(),
           });
-          return toVersionWire(inserted, repoSlug);
+          return { version: toVersionWire(inserted, repoSlug), insertedId: inserted.id };
         });
+        onVersionCommitted?.(insertedId);
+        return version;
       },
 
       delete(actor, repoSlug, prevVersionId) {
@@ -568,7 +634,7 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
         // validatePath would reject. We SKIP validatePath here — this is the
         // kernel emitting on its own behalf (design §4.1 rule 4).
 
-        return storage.tx(() => {
+        const { version, insertedId } = storage.tx(() => {
           // Re-check prev is still current inside the tx to close the race
           // window between the pre-check above and the insert.
           const current = storage.version_current(repo.id, prev.path);
@@ -595,8 +661,10 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
             author_id: actor.user_id,
             created_at: new Date().toISOString(),
           });
-          return toVersionWire(inserted, repoSlug);
+          return { version: toVersionWire(inserted, repoSlug), insertedId: inserted.id };
         });
+        onVersionCommitted?.(insertedId);
+        return version;
       },
     },
 
@@ -642,7 +710,7 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
       },
     },
 
-    query(actor: Actor, spec: QuerySpec): Version[] {
+    async query(actor: Actor, spec: QuerySpec): Promise<Version[]> {
       // Server-level read authorization — the QuerySpec.repo field + scope
       // enforcement inside runQuery() do the fine-grained filtering.
       authorize(actor, "read", { kind: "server" });
@@ -650,6 +718,7 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
         storage,
         serverPathConfig,
         toVersionWire,
+        queryEmbed,
       });
     },
   };

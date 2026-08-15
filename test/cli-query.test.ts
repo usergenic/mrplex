@@ -161,10 +161,7 @@ describe("cli query", () => {
     expect(out.stdout).toContain("pricing.md");
   });
 
-  it("--rank is not-yet-implemented in M2 (returns filter_invalid, exit 1)", () => {
-    // The CLI doesn't expose --rank but the API validates the kernel
-    // path — pretend a caller wired it up via --filter. Instead test the
-    // documented shape: unknown CEL syntax fails.
+  it("malformed CEL returns filter_invalid, exit 1", () => {
     const out = run("query", "--repo", "notes", "--filter", "this is [ not valid CEL");
     expect(out.status).toBe(1);
     expect(out.stderr).toContain("filter_invalid");

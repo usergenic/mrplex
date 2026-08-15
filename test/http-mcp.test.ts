@@ -43,9 +43,9 @@ afterEach(async () => {
 });
 
 describe("MCP lifecycle + tools/list", () => {
-  it("lists 20 tools (docs_diff deferred to M4)", async () => {
+  it("lists 21 tools (including docs_diff — M4)", async () => {
     const r = await client.listTools();
-    expect(r.tools.length).toBe(20);
+    expect(r.tools.length).toBe(21);
     // Sample the important names.
     const names = new Set(r.tools.map((t) => t.name));
     for (const name of [
@@ -55,13 +55,12 @@ describe("MCP lifecycle + tools/list", () => {
       "docs_create",
       "docs_put",
       "docs_delete",
+      "docs_diff",
       "query",
       "tokens_create",
     ]) {
       expect(names.has(name)).toBe(true);
     }
-    // docs_diff is explicitly deferred (m3-plan decision 7).
-    expect(names.has("docs_diff")).toBe(false);
   });
 
   it("every tool has an object inputSchema", async () => {

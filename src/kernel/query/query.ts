@@ -4,16 +4,20 @@
  * Composes:
  *   • CEL filter (§5.1) — compiled to SQL via compile-sqlite.ts
  *   • FTS text (§5.1) — the SQLite FTS5 branch is wired in the adapter
+ *   • Rank (§5.1, M4) — the embed hook produces the query vector;
+ *     vector_search returns the top-k version ids by cosine distance
+ *     (current-versions only). Rank intersects with filter/text/scope/
+ *     sigil-exclusion inline: for the intersection, the rank hits are
+ *     the candidate row set, and everything else applies as WHERE
+ *     clauses ANDed on top. Ordering falls out of the hit-order.
  *   • Scope filter (§8.2) — compiled to SQL via the RE2-backed regexp UDF.
  *     Silently drops rows outside scope, not 403.
  *   • Default sigil exclusion (§5.1, §3.5.5) — hidden/system paths hidden
  *     unless opt-in flags are set. Per-repo: each repo group contributes
  *     its own sigil clauses based on its effective config.
- *   • Result ordering (§5.1 pin) — text-score if `text` is present,
- *     else `$created_at DESC`.
+ *   • Result ordering (§5.1 pin) — rank score if `rank` is present, else
+ *     text-score if `text` is present, else `$created_at DESC`.
  *   • Limit — required; kernel provides the default.
- *
- * `rank` is deferred to M4; queries with `rank` set return filter_invalid.
  */
 
 import type { RepoRow, Storage, VersionRow } from "../../storage/types.js";
@@ -51,12 +55,17 @@ export type QueryDeps = {
   storage: Storage;
   serverPathConfig: PathConfig;
   toVersionWire: (row: VersionRow, repoSlug: string) => Version;
+  /**
+   * Optional rank-time embed hook. When absent and `spec.rank` is set,
+   * runQuery throws `rank_unavailable` (m4-plan §5 decision 4).
+   */
+  queryEmbed?: (rank: string) => Promise<{ vector: number[]; model: string; dim: number }>;
 };
 
 /** M2 default when the spec omits limit. */
 export const DEFAULT_QUERY_LIMIT = 50;
 
-export function runQuery(actor: Actor, spec: QuerySpec, deps: QueryDeps): Version[] {
+export async function runQuery(actor: Actor, spec: QuerySpec, deps: QueryDeps): Promise<Version[]> {
   validateSpec(spec);
 
   // 1. Resolve repos the caller can address.
@@ -92,17 +101,95 @@ export function runQuery(actor: Actor, spec: QuerySpec, deps: QueryDeps): Versio
   //    RE2-backed regexp UDF (see storage-sqlite/adapter.ts).
   const scopeFilter = actor.admin ? { sql: "", params: [] } : buildScopeFilter(actor.scopes);
 
-  // 5. Combine everything the kernel supplies.
+  const userLimit = spec.limit ?? DEFAULT_QUERY_LIMIT;
+  if (userLimit <= 0) return [];
+
+  // 5. Rank branch (M4). When `rank` is set, the candidate row set is
+  //    the vector_search top-k, and filter/text/scope/sigil ANDed as
+  //    a version_id whitelist through the normal versions_search path.
+  //    Ordering: rank wins (best first), then text score, then created_at
+  //    (§5.1). vector_search already returns best-per-version — we pass
+  //    that order downstream via a CASE-indexed clause.
+  if (spec.rank !== undefined) {
+    if (!deps.queryEmbed) {
+      throw new KernelError("rank_unavailable", {
+        reason: "no embedding hook configured on this server",
+      });
+    }
+    let embed: { vector: number[]; model: string; dim: number };
+    try {
+      embed = await deps.queryEmbed(spec.rank);
+    } catch (err) {
+      throw new KernelError("rank_unavailable", {
+        reason: `embedding hook failed at query time: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      });
+    }
+    // Validate the hook's shape at the query boundary — a misbehaving
+    // hook (or a wrapper that skipped validateEmbedResponse) shouldn't
+    // reach vec_distance_cosine and surface as a generic UDF error.
+    if (embed.vector.length !== embed.dim) {
+      throw new KernelError("rank_unavailable", {
+        reason: `embedding hook returned vector.length ${embed.vector.length} != dim ${embed.dim}`,
+      });
+    }
+
+    // Ask storage for a wider k than the caller's limit — the intersection
+    // may drop hits that fail filter/text/scope. A 4× multiplier is a
+    // cheap first pass; if we exhaust hits we fall through to whatever
+    // survived. Cap at 200 to keep memory bounded.
+    const rankK = Math.min(userLimit * 4, 200);
+    const hits = deps.storage.vector_search(
+      targetRepos.map((r) => r.id),
+      embed.model,
+      embed.vector,
+      rankK,
+    );
+    if (hits.length === 0) return [];
+
+    // Apply filter/text/scope/sigil to the rank hits by running
+    // versions_search restricted to the hit ids and reordering by the
+    // rank score locally. versions_search's `next_id IS NULL` predicate
+    // ANDs with our whitelist (vector_search already scoped to current
+    // versions via its own join) — no conflict.
+    const candidateIds = hits.map((h) => h.version_id);
+    const scoreById = new Map(hits.map((h) => [h.version_id, h.score]));
+    const idPh = candidateIds.map(() => "?").join(",");
+    const combinedWhere = joinWhere([
+      whereSql,
+      sigilExclusion.sql,
+      scopeFilter.sql,
+      `versions.id IN (${idPh})`,
+    ]);
+    const combinedParams: (string | number | bigint | null)[] = [
+      ...whereParams,
+      ...sigilExclusion.params,
+      ...scopeFilter.params,
+      ...candidateIds,
+    ];
+    const rows = deps.storage.versions_search({
+      repo_ids: targetRepos.map((r) => r.id),
+      where_sql: combinedWhere,
+      where_params: combinedParams,
+      text: spec.text,
+      limit: candidateIds.length, // fetch all survivors; we sort locally
+    });
+    // Reorder by rank score (best-first).
+    rows.sort((a, b) => (scoreById.get(a.id) ?? 1) - (scoreById.get(b.id) ?? 1));
+    return rows.slice(0, userLimit).map((row) => {
+      const repoSlug = (reposById.get(row.repo_id) as RepoRow).slug;
+      return deps.toVersionWire(row, repoSlug);
+    });
+  }
+
+  // 6. Non-rank path — filter/text/scope/sigil composed as before.
   const combinedWhere = joinWhere([whereSql, sigilExclusion.sql, scopeFilter.sql]);
   const combinedParams: (string | number | bigint | null)[] = [
     ...whereParams,
     ...sigilExclusion.params,
     ...scopeFilter.params,
   ];
-
-  // 6. Storage-level search.
-  const userLimit = spec.limit ?? DEFAULT_QUERY_LIMIT;
-  if (userLimit <= 0) return [];
   const rows = deps.storage.versions_search({
     repo_ids: targetRepos.map((r) => r.id),
     where_sql: combinedWhere,
@@ -132,9 +219,11 @@ function validateSpec(spec: QuerySpec): void {
     }
   }
   if (spec.rank !== undefined) {
-    throw new KernelError("filter_invalid", {
-      reason: "the `rank` mode is deferred to M4 (embeddings)",
-    });
+    if (typeof spec.rank !== "string" || spec.rank.trim().length === 0) {
+      throw new KernelError("filter_invalid", {
+        reason: "the `rank` mode requires a non-empty query string",
+      });
+    }
   }
   if (spec.limit !== undefined) {
     if (typeof spec.limit !== "number" || !Number.isSafeInteger(spec.limit) || spec.limit < 0) {

@@ -56,6 +56,8 @@ export function httpStatusFor(code: KernelErrorCode): number {
     case "frontmatter_invalid":
     case "filter_invalid":
       return 400;
+    case "rank_unavailable":
+      return 503;
     default: {
       const _exhaustive: never = code;
       void _exhaustive;
