@@ -23,31 +23,31 @@ See [docs/design.md](docs/design.md) for the full design.
 
 ## Quickstart
 
+Install and link the `mrplex` command:
+
 ```bash
 npm install
+npm link          # puts `mrplex` on your PATH; alternatively, `npm install -g` after publish
 ```
 
-Bootstrap a fresh database — this mints the root admin token exactly once:
+Point every command at the same database + token by exporting once:
 
 ```bash
-export TOK=$(npm run --silent cli -- --database ./mrplex.db bootstrap)
-export MRPLEX_TOKEN="$TOK"
+export MRPLEX_DATABASE=./mrplex.db
+export MRPLEX_TOKEN=$(mrplex bootstrap)   # mints the root admin token exactly once
 ```
 
 Create a user + repo, then walk a doc through its lifecycle:
 
 ```bash
-# Admin ops.
-npm run --silent cli -- --database ./mrplex.db users create alice
-npm run --silent cli -- --database ./mrplex.db repos create notes
+mrplex users create alice
+mrplex repos create notes
 
 # create → update → move → delete → restore
-V=$(printf '%s\n' '---' 'title: Hello' '---' '' 'body v1' | \
-    npm run --silent cli -- --database ./mrplex.db --json docs create notes hello.md --from-file - \
-    | jq -r .version_id)
+V=$(printf '%s\n' '---' 'title: Hello' '---' '' 'body v1' \
+    | mrplex --json docs create notes hello.md --from-file - | jq -r .version_id)
 
-V=$(npm run --silent cli -- --database ./mrplex.db --json docs put notes hello.md --prev "$V" \
-    --from-file - <<'EOF' | jq -r .version_id
+V=$(mrplex --json docs put notes hello.md --prev "$V" --from-file - <<'EOF' | jq -r .version_id
 ---
 title: Hello
 ---
@@ -55,72 +55,69 @@ body v2
 EOF
 )
 
-V=$(npm run --silent cli -- --database ./mrplex.db --json docs mv notes hello.md greetings/hi.md --prev "$V" | jq -r .version_id)
-V=$(npm run --silent cli -- --database ./mrplex.db --json docs delete notes greetings/hi.md --prev "$V" | jq -r .version_id)
-V=$(npm run --silent cli -- --database ./mrplex.db --json docs put notes greetings/hi.md --prev "$V" | jq -r .version_id)
+V=$(mrplex --json docs mv notes hello.md greetings/hi.md --prev "$V" | jq -r .version_id)
+V=$(mrplex --json docs delete notes greetings/hi.md --prev "$V" | jq -r .version_id)
+V=$(mrplex --json docs put notes greetings/hi.md --prev "$V" | jq -r .version_id)
 
 # History now has 5 versions in reverse chain order:
-npm run --silent cli -- --database ./mrplex.db docs history notes greetings/hi.md
+mrplex docs history notes greetings/hi.md
 ```
 
 Mint a scoped token for an agent:
 
 ```bash
-npm run --silent cli -- --database ./mrplex.db tokens create \
-    --label "obsidian-plugin" \
-    --scope "notes:read=**,write=inbox/**"
+mrplex tokens create --label "obsidian-plugin" --scope "notes:read=**,write=inbox/**"
 ```
 
 Query — CEL filters + FTS + rank composed:
 
 ```bash
 # Filter only
-npm run --silent cli -- --database ./mrplex.db query --repo notes \
-    --filter 'status == "published"'
+mrplex query --repo notes --filter 'status == "published"'
 
 # Text only (FTS5, porter-stemmed)
-npm run --silent cli -- --database ./mrplex.db query --repo notes --text 'welcome OR intro'
+mrplex query --repo notes --text 'welcome OR intro'
 
 # Filter + text composed
-npm run --silent cli -- --database ./mrplex.db query --repo notes \
-    --filter '"pricing" in list(tags)' --text pricing
+mrplex query --repo notes --filter '"pricing" in list(tags)' --text pricing
 
 # Polymorphic frontmatter — matches tags: pricing AND tags: [pricing, saas]
-npm run --silent cli -- --database ./mrplex.db query --repo notes \
-    --filter '"pricing" in list(tags)'
+mrplex query --repo notes --filter '"pricing" in list(tags)'
 
 # $-prefixed intrinsics
-npm run --silent cli -- --database ./mrplex.db query --repo notes \
-    --filter '$path.startsWith("guides/")'
+mrplex query --repo notes --filter '$path.startsWith("guides/")'
 
 # Semantic rank (requires an embedding hook — see below)
-npm run --silent cli -- --database ./mrplex.db query --repo notes \
-    --rank 'tiered SaaS pricing'
+mrplex query --repo notes --rank 'tiered SaaS pricing'
 
 # All three composed
-npm run --silent cli -- --database ./mrplex.db query --repo notes \
+mrplex query --repo notes \
     --filter 'status == "published"' --text pricing --rank 'subscription fees'
 ```
 
 Diff any two versions of a document — history + diff give you the versioned reader:
 
 ```bash
-npm run --silent cli -- --database ./mrplex.db docs history notes greetings/hi.md
-npm run --silent cli -- --database ./mrplex.db docs diff notes greetings/hi.md \
-    --from v1 --to v3
+mrplex docs history notes greetings/hi.md
+mrplex docs diff notes greetings/hi.md --from v1 --to v3
 ```
 
 Serve the HTTP surfaces and drive the CLI remotely:
 
 ```bash
 # Start the server (REST + MCP Streamable HTTP on :8321 by default)
-npm run --silent cli -- --database ./mrplex.db serve --port 8321 &
+mrplex serve --port 8321 &
 
-# Same commands, now over the network
-npm run --silent cli -- --server http://127.0.0.1:8321 docs get notes greetings/hi.md
-npm run --silent cli -- --server http://127.0.0.1:8321 query --repo notes --filter 'status == "published"'
-npm run --silent cli -- --server http://127.0.0.1:8321 docs diff notes greetings/hi.md --from v1 --to v3
+# Same commands, now over the network — --server takes precedence over --database
+mrplex --server http://127.0.0.1:8321 docs get notes greetings/hi.md
+mrplex --server http://127.0.0.1:8321 query --repo notes --filter 'status == "published"'
+mrplex --server http://127.0.0.1:8321 docs diff notes greetings/hi.md --from v1 --to v3
 ```
+
+> Prefer not to `npm link`? Use `npx mrplex …` from the repo, or add
+> `./node_modules/.bin` to your `PATH`. Every `mrplex …` command in
+> this README is equivalent to `npx mrplex …` or
+> `npm run --silent cli -- …`.
 
 ## Embeddings
 
@@ -129,10 +126,10 @@ mrplex ships **no** embedding provider — you wire one up. Two hook shapes:
 ```bash
 # HTTP endpoint — server POSTs { chunks: [...] } and expects
 # { vectors: [[...]], model: "…", dim: N }.
-mrplex serve --database ./mrplex.db --embed-url http://127.0.0.1:8399
+mrplex serve --embed-url http://127.0.0.1:8399
 
 # Subprocess — one JSON line in / one JSON line out over stdin/stdout.
-mrplex serve --database ./mrplex.db --embed-cmd "path/to/embedder --stdio"
+mrplex serve --embed-cmd "path/to/embedder --stdio"
 ```
 
 Either flag can also come from `MRPLEX_EMBED_URL` / `MRPLEX_EMBED_CMD` env or CLI config. `--embed-url` and `--embed-cmd` are mutually exclusive.
@@ -141,10 +138,10 @@ Backlog + backfill for retrofitting an existing corpus:
 
 ```bash
 # Re-chunk + re-embed a repo's current versions that are missing chunks.
-mrplex embed backfill --database ./mrplex.db --repo notes --embed-url http://127.0.0.1:8399
+mrplex embed backfill --repo notes --embed-url http://127.0.0.1:8399
 
 # Inspect the queue — counts, models present, recent errors.
-mrplex embed status --database ./mrplex.db
+mrplex embed status
 ```
 
 For dev + tests, `scripts/stub-embedder.mjs` speaks both hook shapes with deterministic hash-projection vectors (and `--fail-rate`, `--slow-ms` for exercising backoff):
@@ -172,9 +169,10 @@ CI runs typecheck + lint + tests on Ubuntu & macOS × Node 20 & 22, plus a `ci-p
 # Start a throwaway Postgres+pgvector.
 docker compose -f docker-compose.test.yml up -d
 
-# Bootstrap + serve against it.
-mrplex bootstrap --database postgres://mrplex:mrplex@localhost:5432/mrplex
-mrplex serve --database postgres://mrplex:mrplex@localhost:5432/mrplex
+# Point mrplex at it (`--database` also honored per-command).
+export MRPLEX_DATABASE=postgres://mrplex:mrplex@localhost:5432/mrplex
+mrplex bootstrap
+mrplex serve
 
 # Run the parity suite against the live PG (adds ~16 kernel tests).
 MRPLEX_TEST_POSTGRES_URL=postgres://mrplex:mrplex@localhost:5432/mrplex npm test
