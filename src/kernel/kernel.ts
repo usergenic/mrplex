@@ -3,8 +3,10 @@
  * translation live. Surfaces (CLI in M0; MCP/REST in M3) call these methods
  * and never touch the storage layer directly.
  *
- * M0 shipped reads. M1 adds writes with `prev_version_id` enforcement,
- * frontmatter canonicalization, and real `authorize()` on every op.
+ * All kernel methods are async (m5-plan WS1). SQLite adapter is
+ * internally synchronous so calls resolve on the next microtask; the
+ * async signature is honesty about the Postgres adapter and the
+ * embedding hook.
  */
 
 import { randomBytes } from "node:crypto";
@@ -62,107 +64,76 @@ export type TokenCreateResult = { token: string; meta: Token };
 
 export type Kernel = {
   repos: {
-    list(actor: Actor, opts?: { include_system?: boolean }): Repo[];
-    get(actor: Actor, slug: string): Repo;
-    create(actor: Actor, slug: string): Repo;
-    rename(actor: Actor, slug: string, new_slug: string): Repo;
-    delete(actor: Actor, slug: string): Repo;
+    list(actor: Actor, opts?: { include_system?: boolean }): Promise<Repo[]>;
+    get(actor: Actor, slug: string): Promise<Repo>;
+    create(actor: Actor, slug: string): Promise<Repo>;
+    rename(actor: Actor, slug: string, new_slug: string): Promise<Repo>;
+    delete(actor: Actor, slug: string): Promise<Repo>;
     set_path_config(
       actor: Actor,
       slug: string,
       config: PathConfigOverride | null,
-    ): SetPathConfigResult;
+    ): Promise<SetPathConfigResult>;
   };
   users: {
-    list(actor: Actor): User[];
-    create(actor: Actor, slug: string): User;
-    rename(actor: Actor, slug: string, new_slug: string): User;
-    delete(actor: Actor, slug: string): User;
+    list(actor: Actor): Promise<User[]>;
+    create(actor: Actor, slug: string): Promise<User>;
+    rename(actor: Actor, slug: string, new_slug: string): Promise<User>;
+    delete(actor: Actor, slug: string): Promise<User>;
   };
   docs: {
-    get(actor: Actor, repo: string, path: string): Version;
-    get_version(actor: Actor, repo: string, version_id: string): Version;
-    history(actor: Actor, repo: string, path: string, opts?: HistoryOptions): Version[];
+    get(actor: Actor, repo: string, path: string): Promise<Version>;
+    get_version(actor: Actor, repo: string, version_id: string): Promise<Version>;
+    history(actor: Actor, repo: string, path: string, opts?: HistoryOptions): Promise<Version[]>;
     diff(
       actor: Actor,
       repo: string,
       path: string,
       from_version_id: string,
       to_version_id: string,
-    ): UnifiedDiff;
+    ): Promise<UnifiedDiff>;
     create(
       actor: Actor,
       repo: string,
       path: string,
       input: FrontmatterInput & { body: string },
-    ): Version;
+    ): Promise<Version>;
     put(
       actor: Actor,
       repo: string,
       prev_version_id: string,
       path: string,
       input: Partial<FrontmatterInput> & { body?: string },
-    ): Version;
-    delete(actor: Actor, repo: string, prev_version_id: string): Version;
+    ): Promise<Version>;
+    delete(actor: Actor, repo: string, prev_version_id: string): Promise<Version>;
   };
   tokens: {
-    list(actor: Actor): Token[];
+    list(actor: Actor): Promise<Token[]>;
     create(
       actor: Actor,
       label: string | null,
       scopes: ScopeInput[],
       opts?: { admin?: boolean; expires_at?: string | null },
-    ): TokenCreateResult;
-    revoke(actor: Actor, token_id: string): Token;
+    ): Promise<TokenCreateResult>;
+    revoke(actor: Actor, token_id: string): Promise<Token>;
   };
-  /**
-   * Query is async because the `rank` mode (M4) calls the embed hook to
-   * turn the query string into a vector — an I/O boundary. Filter-only
-   * and text-only queries complete synchronously inside this promise
-   * (a microtask), so the async signature is honesty about the rank
-   * path, not overhead on the common case.
-   */
   query(actor: Actor, spec: QuerySpec): Promise<Version[]>;
 };
 
 export type KernelConfig = {
   storage: Storage;
-  /**
-   * Server-level path config (§3.5.2 tier 2). Defaults to HARDCODED_DEFAULTS.
-   * Caller is responsible for validating via validateConfig() before passing.
-   */
   serverPathConfig?: PathConfig;
   /**
    * M4 write-time hook: called with the new version's storage id after
-   * every committed create / put / delete. Used by the embedding worker
-   * to enqueue for chunking (§5.3, m4-plan §5 decision 5 — enqueue is
-   * unconditional whether or not a hook is configured).
-   *
-   * The kernel invokes this in the same synchronous scope after
-   * version_insert commits; a throw here bubbles to the caller and the
-   * whole write is treated as failed. In practice the worker's
-   * backlog_enqueue is one cheap UPSERT and doesn't throw.
+   * every committed create / put / delete. Awaited in-line so a throw
+   * from the enqueue path fails the kernel call. In practice the
+   * worker's backlog_enqueue is one cheap UPSERT and doesn't throw.
    */
-  onVersionCommitted?: (version_id: number) => void;
-  /**
-   * M4 read-time embed: called with a single rank-query string to
-   * produce the vector to search against (§5.1, m4-plan WS4).
-   *
-   * The kernel calls this ONLY when `rank` is present in a QuerySpec.
-   * Absent → `rank_unavailable`. Errors here also surface as
-   * `rank_unavailable` (data carries the cause) — a rank query can't
-   * defer like a write can.
-   *
-   * Must return the batch's contract-validated response (same shape
-   * the write-side hook returns). The kernel selects results by the
-   * response's `model`, not by any persisted "current model" (§5
-   * decision 9).
-   */
+  onVersionCommitted?: (version_id: number) => Promise<void> | void;
   queryEmbed?: (rank: string) => Promise<{ vector: number[]; model: string; dim: number }>;
 };
 
 export function createKernel(config: KernelConfig | Storage): Kernel {
-  // Accept a bare Storage for M0 backwards-compat.
   const cfg: KernelConfig =
     "storage" in (config as KernelConfig)
       ? (config as KernelConfig)
@@ -172,12 +143,11 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
   const onVersionCommitted = cfg.onVersionCommitted;
   const queryEmbed = cfg.queryEmbed;
 
-  // Author lookup — cheap and hot, so cache within a kernel instance.
   const userCache = new Map<number, User>();
-  function userById(id: number): User {
+  async function userById(id: number): Promise<User> {
     const cached = userCache.get(id);
     if (cached) return cached;
-    const row = storage.users_by_id(id);
+    const row = await storage.users_by_id(id);
     if (!row) throw new KernelError("user_not_found", { user_id: id });
     const user = { user: row.slug };
     userCache.set(id, user);
@@ -191,7 +161,7 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
     };
   }
 
-  function toVersionWire(row: VersionRow, repoSlug: string): Version {
+  async function toVersionWire(row: VersionRow, repoSlug: string): Promise<Version> {
     return {
       version_id: encodeVersionId(row.id),
       prev_version_id: row.prev_id === null ? null : encodeVersionId(row.prev_id),
@@ -201,7 +171,22 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
       frontmatter: row.frontmatter,
       frontmatter_raw: row.frontmatter_raw,
       body: row.body,
-      author: userById(row.author_id),
+      author: await userById(row.author_id),
+      created_at: row.created_at,
+    };
+  }
+
+  function toVersionWireSync(row: VersionRow, repoSlug: string, author: User): Version {
+    return {
+      version_id: encodeVersionId(row.id),
+      prev_version_id: row.prev_id === null ? null : encodeVersionId(row.prev_id),
+      next_version_id: row.next_id === null ? null : encodeVersionId(row.next_id),
+      repo: repoSlug,
+      path: row.path,
+      frontmatter: row.frontmatter,
+      frontmatter_raw: row.frontmatter_raw,
+      body: row.body,
+      author,
       created_at: row.created_at,
     };
   }
@@ -210,30 +195,19 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
     return effectivePathConfig(serverPathConfig, parseRepoOverride(repo.path_config));
   }
 
-  function resolveRepo(actor: Actor, slug: string, action: Action): RepoRow {
-    // Look the repo up FIRST, then authorize on the resolved id — scopes bind
-    // ids (§8.2), so we need it to check.
-    const row = storage.repos_by_slug(slug);
+  async function resolveRepo(actor: Actor, slug: string, action: Action): Promise<RepoRow> {
+    const row = await storage.repos_by_slug(slug);
     if (!row) throw repoNotFound(slug);
     const target: Target = { kind: "repo", repo_id: row.id };
     authorize(actor, action, target);
     return row;
   }
 
-  /**
-   * Redact `current_path` in stale_prev when the caller's read scope doesn't
-   * cover it — design §4.3. Admin sees everything; anyone else sees null.
-   */
   function currentPathForStaleError(actor: Actor, repo_id: number, path: string): string | null {
     if (actor.admin) return path;
     return scopesGrant(actor.scopes, "read", repo_id, path) ? path : null;
   }
 
-  /**
-   * Canonicalize a write's frontmatter input. Same-path put with no
-   * frontmatter fields set carries over from prev (design implicit — a
-   * body-only edit shouldn't force the caller to re-send the frontmatter).
-   */
   function canonicalizeOrCarry(
     input: Partial<FrontmatterInput>,
     prev: VersionRow | null,
@@ -244,17 +218,6 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
     return canonicalizeFrontmatter(input as FrontmatterInput);
   }
 
-  /**
-   * Short hex uniquifier for system-namespace slug renames (§3.4). 3 random
-   * bytes → exactly 6 hex chars → 24 bits of entropy — comfortably beyond
-   * any realistic collision risk within a single repo/user's lifetime
-   * deletion history.
-   *
-   * m1-plan §5 originally said "base32", but Node has no built-in base32
-   * encoder and the value the design cares about is "short, stable,
-   * alphanumeric, enough entropy." Hex satisfies all three with zero
-   * dependencies and is what actually ships.
-   */
   function slugUniquifier(): string {
     return randomBytes(3).toString("hex");
   }
@@ -267,33 +230,30 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
     return new KernelError("slug_taken", { slug });
   }
 
-  /**
-   * Translate StoredScope[] → wire Scope[]. Requires storage to look up
-   * current slugs for the bound repo ids. A repo id whose row no longer
-   * exists is silently dropped (rename-friendly per §8.2's "tokens.list
-   * renders bound repos by their current slugs").
-   */
-  function scopesToWire(scopes: StoredScope[]): Scope[] {
-    return scopes.map((s) => {
+  async function scopesToWire(scopes: StoredScope[]): Promise<Scope[]> {
+    const out: Scope[] = [];
+    for (const s of scopes) {
       if (s.repos === "*") {
-        return { repos: "*", read: s.read, write: s.write };
+        out.push({ repos: "*", read: s.read, write: s.write });
+        continue;
       }
       const slugs: string[] = [];
       for (const id of s.repos) {
-        const row = storage.repos_by_id(id);
+        const row = await storage.repos_by_id(id);
         if (row) slugs.push(row.slug);
       }
       slugs.sort();
-      return { repos: slugs, read: s.read, write: s.write };
-    });
+      out.push({ repos: slugs, read: s.read, write: s.write });
+    }
+    return out;
   }
 
-  function tokenRowToWire(row: TokenRow): Token {
+  async function tokenRowToWire(row: TokenRow): Promise<Token> {
     return {
       id: tokenIdString(row),
       label: row.label,
-      admin: row.admin === 1,
-      scopes: scopesToWire(parseStoredScopes(row.scopes)),
+      admin: row.admin,
+      scopes: await scopesToWire(parseStoredScopes(row.scopes)),
       expires_at: row.expires_at,
       created_at: row.created_at,
       last_used_at: row.last_used_at,
@@ -310,72 +270,56 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
 
   return {
     repos: {
-      list(actor, opts) {
+      async list(actor, opts) {
         authorize(actor, "read", { kind: "server" });
         const includeSystem = opts?.include_system ?? false;
-        // Server-config sigils apply here — slugs live in the server namespace,
-        // not per-repo — matching §3.5.6 (slugs validated against server config).
-        return storage
-          .repos_list()
-          .filter((r) => includeSystem || !isSlugSystemNamespaced(r.slug))
-          .map(toRepoWire);
+        const rows = await storage.repos_list();
+        return rows.filter((r) => includeSystem || !isSlugSystemNamespaced(r.slug)).map(toRepoWire);
       },
-      get(actor, slug) {
-        return toRepoWire(resolveRepo(actor, slug, "read"));
+      async get(actor, slug) {
+        return toRepoWire(await resolveRepo(actor, slug, "read"));
       },
-      create(actor, slug) {
+      async create(actor, slug) {
         authorize(actor, "admin", { kind: "server_admin" });
         validateSlug(slug, serverPathConfig);
-        if (storage.repos_by_slug(slug)) throw slugCollisionError(slug);
-        const row = storage.repos_create({ slug, created_at: new Date().toISOString() });
+        if (await storage.repos_by_slug(slug)) throw slugCollisionError(slug);
+        const row = await storage.repos_create({ slug, created_at: new Date().toISOString() });
         return toRepoWire(row);
       },
-      rename(actor, slug, new_slug) {
+      async rename(actor, slug, new_slug) {
         authorize(actor, "admin", { kind: "server_admin" });
-        const repo = storage.repos_by_slug(slug);
+        const repo = await storage.repos_by_slug(slug);
         if (!repo) throw repoNotFound(slug);
         if (new_slug === slug) return toRepoWire(repo);
         validateSlug(new_slug, serverPathConfig);
-        if (storage.repos_by_slug(new_slug)) throw slugCollisionError(new_slug);
-        return toRepoWire(storage.repos_rename(repo.id, new_slug));
+        if (await storage.repos_by_slug(new_slug)) throw slugCollisionError(new_slug);
+        return toRepoWire(await storage.repos_rename(repo.id, new_slug));
       },
-      delete(actor, slug) {
+      async delete(actor, slug) {
         authorize(actor, "admin", { kind: "server_admin" });
-        const repo = storage.repos_by_slug(slug);
+        const repo = await storage.repos_by_slug(slug);
         if (!repo) throw repoNotFound(slug);
-        // Idempotent (§3.4): already system-namespaced → no-op.
         if (isSlugSystemNamespaced(repo.slug)) return toRepoWire(repo);
-        // Rename the slug into the system namespace with a uniquifier so
-        // multiple deletions of same-basename repos don't collide.
         const sigil = serverPathConfig.system_sigils[0] as string;
-        // Try a few times in the (astronomically unlikely) event of a
-        // uniquifier collision.
         for (let attempt = 0; attempt < 5; attempt++) {
           const newSlug = `${sigil}deleted-${repo.slug}-${slugUniquifier()}`;
-          if (storage.repos_by_slug(newSlug)) continue;
-          return toRepoWire(storage.repos_rename(repo.id, newSlug));
+          if (await storage.repos_by_slug(newSlug)) continue;
+          return toRepoWire(await storage.repos_rename(repo.id, newSlug));
         }
         throw new Error("repos.delete: uniquifier collision (retries exhausted)");
       },
-      set_path_config(actor, slug, config) {
+      async set_path_config(actor, slug, config) {
         authorize(actor, "admin", { kind: "server_admin" });
-        const repo = storage.repos_by_slug(slug);
+        const repo = await storage.repos_by_slug(slug);
         if (!repo) throw repoNotFound(slug);
         if (config !== null) {
           validateRepoOverride(config, serverPathConfig);
         }
         const configJson = config === null ? null : JSON.stringify(config);
-        const updated = storage.repos_set_path_config(repo.id, configJson);
-        // Advisory warnings (§3.5.3): scan the repo's live paths against the
-        // new effective config and collect any that no longer validate.
-        // Rides the partial-index on (repo_id, path) where next_id is null,
-        // so it's O(live-set) per repo.
+        const updated = await storage.repos_set_path_config(repo.id, configJson);
         const newEffective = effectivePathConfig(serverPathConfig, config);
         const warnings: PathWarning[] = [];
-        // Skip trashed docs — those live under system sigils and were emitted
-        // by the kernel; user-visible warnings should be about user-territory
-        // paths only.
-        for (const version of storage.versions_live_by_repo(repo.id)) {
+        for (const version of await storage.versions_live_by_repo(repo.id)) {
           if (pathIsInSystemNamespace(version.path, newEffective.system_sigils)) {
             continue;
           }
@@ -390,39 +334,38 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
     },
 
     users: {
-      list(actor) {
+      async list(actor) {
         authorize(actor, "read", { kind: "server" });
-        return storage.users_list().map((u) => ({ user: u.slug }));
+        return (await storage.users_list()).map((u) => ({ user: u.slug }));
       },
-      create(actor, slug) {
+      async create(actor, slug) {
         authorize(actor, "admin", { kind: "server_admin" });
         validateSlug(slug, serverPathConfig);
-        if (storage.users_by_slug(slug)) throw new KernelError("slug_taken", { slug });
-        const row = storage.users_create({ slug, created_at: new Date().toISOString() });
+        if (await storage.users_by_slug(slug)) throw new KernelError("slug_taken", { slug });
+        const row = await storage.users_create({ slug, created_at: new Date().toISOString() });
         return { user: row.slug };
       },
-      rename(actor, slug, new_slug) {
+      async rename(actor, slug, new_slug) {
         authorize(actor, "admin", { kind: "server_admin" });
-        const user = storage.users_by_slug(slug);
+        const user = await storage.users_by_slug(slug);
         if (!user) throw userNotFound(slug);
         if (new_slug === slug) return { user: user.slug };
         validateSlug(new_slug, serverPathConfig);
-        if (storage.users_by_slug(new_slug)) throw slugCollisionError(new_slug);
-        const updated = storage.users_rename(user.id, new_slug);
+        if (await storage.users_by_slug(new_slug)) throw slugCollisionError(new_slug);
+        const updated = await storage.users_rename(user.id, new_slug);
         return { user: updated.slug };
       },
-      delete(actor, slug) {
+      async delete(actor, slug) {
         authorize(actor, "admin", { kind: "server_admin" });
-        const user = storage.users_by_slug(slug);
+        const user = await storage.users_by_slug(slug);
         if (!user) throw userNotFound(slug);
         if (isSlugSystemNamespaced(user.slug)) return { user: user.slug };
         const sigil = serverPathConfig.system_sigils[0] as string;
         for (let attempt = 0; attempt < 5; attempt++) {
           const newSlug = `${sigil}deleted-${user.slug}-${slugUniquifier()}`;
-          if (storage.users_by_slug(newSlug)) continue;
-          // Revoke all their tokens as part of the same conceptual op (§3.4).
-          storage.tokens_revoke_by_user(user.id, new Date().toISOString());
-          const updated = storage.users_rename(user.id, newSlug);
+          if (await storage.users_by_slug(newSlug)) continue;
+          await storage.tokens_revoke_by_user(user.id, new Date().toISOString());
+          const updated = await storage.users_rename(user.id, newSlug);
           return { user: updated.slug };
         }
         throw new Error("users.delete: uniquifier collision (retries exhausted)");
@@ -430,34 +373,34 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
     },
 
     docs: {
-      get(actor, repoSlug, path) {
-        const repo = resolveRepo(actor, repoSlug, "read");
+      async get(actor, repoSlug, path) {
+        const repo = await resolveRepo(actor, repoSlug, "read");
         authorize(actor, "read", { kind: "path", repo_id: repo.id, path });
-        const row = storage.version_current(repo.id, path);
+        const row = await storage.version_current(repo.id, path);
         if (!row) throw docNotFound(repoSlug, path);
         return toVersionWire(row, repoSlug);
       },
 
-      get_version(actor, repoSlug, versionId) {
-        const repo = resolveRepo(actor, repoSlug, "read");
+      async get_version(actor, repoSlug, versionId) {
+        const repo = await resolveRepo(actor, repoSlug, "read");
         const id = decodeVersionId(versionId);
         if (id === null) throw versionNotFound(versionId);
-        const row = storage.version_by_id(id);
+        const row = await storage.version_by_id(id);
         if (!row || row.repo_id !== repo.id) throw versionNotFound(versionId);
         authorize(actor, "read", { kind: "path", repo_id: repo.id, path: row.path });
         return toVersionWire(row, repoSlug);
       },
 
-      history(actor, repoSlug, path, opts) {
-        const repo = resolveRepo(actor, repoSlug, "read");
+      async history(actor, repoSlug, path, opts) {
+        const repo = await resolveRepo(actor, repoSlug, "read");
         authorize(actor, "read", { kind: "path", repo_id: repo.id, path });
-        const current = storage.version_current(repo.id, path);
+        const current = await storage.version_current(repo.id, path);
         if (!current) throw docNotFound(repoSlug, path);
-        const rows = storage.version_history(current.document_id, opts);
-        return rows.map((r) => toVersionWire(r, repoSlug));
+        const rows = await storage.version_history(current.document_id, opts);
+        return Promise.all(rows.map((r) => toVersionWire(r, repoSlug)));
       },
 
-      diff(actor, repoSlug, path, fromVersionId, toVersionId) {
+      async diff(actor, repoSlug, path, fromVersionId, toVersionId) {
         return runDiff(
           actor,
           {
@@ -475,14 +418,14 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
         );
       },
 
-      create(actor, repoSlug, path, input) {
-        const repo = resolveRepo(actor, repoSlug, "write");
+      async create(actor, repoSlug, path, input) {
+        const repo = await resolveRepo(actor, repoSlug, "write");
         authorize(actor, "write", { kind: "path", repo_id: repo.id, path });
         validatePath(path, repoEffectiveConfig(repo));
         const canon = canonicalizeFrontmatter(input);
 
-        const { version, insertedId } = storage.tx(() => {
-          const existing = storage.version_current(repo.id, path);
+        const { version, insertedId } = await storage.tx(async () => {
+          const existing = await storage.version_current(repo.id, path);
           if (existing) {
             throw new KernelError("create_conflict", {
               repo: repoSlug,
@@ -490,8 +433,8 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
               current_version_id: encodeVersionId(existing.id),
             });
           }
-          const doc = storage.documents_create(repo.id);
-          const inserted = storage.version_insert({
+          const doc = await storage.documents_create(repo.id);
+          const inserted = await storage.version_insert({
             document_id: doc.id,
             repo_id: repo.id,
             prev_id: null,
@@ -502,23 +445,23 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
             author_id: actor.user_id,
             created_at: new Date().toISOString(),
           });
-          return { version: toVersionWire(inserted, repoSlug), insertedId: inserted.id };
+          const author = await userById(actor.user_id);
+          return {
+            version: toVersionWireSync(inserted, repoSlug, author),
+            insertedId: inserted.id,
+          };
         });
-        onVersionCommitted?.(insertedId);
+        await onVersionCommitted?.(insertedId);
         return version;
       },
 
-      put(actor, repoSlug, prevVersionId, destPath, input) {
-        const repo = resolveRepo(actor, repoSlug, "write");
+      async put(actor, repoSlug, prevVersionId, destPath, input) {
+        const repo = await resolveRepo(actor, repoSlug, "write");
         const prevId = decodeVersionId(prevVersionId);
         if (prevId === null) throw versionNotFound(prevVersionId);
-        const prev = storage.version_by_id(prevId);
+        const prev = await storage.version_by_id(prevId);
         if (!prev || prev.repo_id !== repo.id) throw versionNotFound(prevVersionId);
 
-        // Authorize the move (or in-place update, which is a "move" with
-        // source === destination — that still fires scopesGrant on the same
-        // path twice, harmless). The move target lets the system-namespace
-        // carve-out apply for restore (source is system, dest is user).
         const putCfg = repoEffectiveConfig(repo);
         authorize(actor, "write", {
           kind: "move",
@@ -532,16 +475,11 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
         const canon = canonicalizeOrCarry(input, prev);
         const body = input.body ?? prev.body;
 
-        const { version, insertedId } = storage.tx(() => {
-          // Verify prev is STILL current (design §4.1 rule 1). Doing it inside
-          // the tx before insert closes the race window.
-          const current = storage.version_current(repo.id, prev.path);
+        const { version, insertedId } = await storage.tx(async () => {
+          const current = await storage.version_current(repo.id, prev.path);
           if (!current || current.id !== prev.id) {
-            // Document may have moved elsewhere (or been deleted into
-            // :deleted/…) since prev was observed; look up its current
-            // by document_id to give the client an accurate pointer.
             const docCurrent =
-              current ?? storage.version_history(prev.document_id, { limit: 1 })[0] ?? null;
+              current ?? (await storage.version_history(prev.document_id, { limit: 1 }))[0] ?? null;
             throw new KernelError("stale_prev", {
               current_version_id: docCurrent ? encodeVersionId(docCurrent.id) : null,
               current_path: docCurrent
@@ -551,10 +489,8 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
             });
           }
 
-          // If destination differs from source, check for path collision with
-          // a DIFFERENT document.
           if (destPath !== prev.path) {
-            const occupant = storage.version_current(repo.id, destPath);
+            const occupant = await storage.version_current(repo.id, destPath);
             if (occupant && occupant.document_id !== prev.document_id) {
               throw new KernelError("path_taken", {
                 repo: repoSlug,
@@ -564,7 +500,7 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
             }
           }
 
-          const inserted = storage.version_insert({
+          const inserted = await storage.version_insert({
             document_id: prev.document_id,
             repo_id: repo.id,
             prev_id: prev.id,
@@ -575,30 +511,31 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
             author_id: actor.user_id,
             created_at: new Date().toISOString(),
           });
-          return { version: toVersionWire(inserted, repoSlug), insertedId: inserted.id };
+          const author = await userById(actor.user_id);
+          return {
+            version: toVersionWireSync(inserted, repoSlug, author),
+            insertedId: inserted.id,
+          };
         });
-        onVersionCommitted?.(insertedId);
+        await onVersionCommitted?.(insertedId);
         return version;
       },
 
-      delete(actor, repoSlug, prevVersionId) {
-        const repo = resolveRepo(actor, repoSlug, "write");
+      async delete(actor, repoSlug, prevVersionId) {
+        const repo = await resolveRepo(actor, repoSlug, "write");
         const prevId = decodeVersionId(prevVersionId);
         if (prevId === null) throw versionNotFound(prevVersionId);
-        const prev = storage.version_by_id(prevId);
+        const prev = await storage.version_by_id(prevId);
         if (!prev || prev.repo_id !== repo.id) throw versionNotFound(prevVersionId);
 
         const cfg = repoEffectiveConfig(repo);
 
-        // Verify prev is STILL the current version of its document. Only
-        // then can we short-circuit the "already deleted" idempotent case.
-        // A prev that is system-namespaced but no longer current means the
-        // document has since gone through delete → restore → delete cycles
-        // and this call is stale — stale_prev, not a no-op.
-        const currentAtPrevPath = storage.version_current(repo.id, prev.path);
+        const currentAtPrevPath = await storage.version_current(repo.id, prev.path);
         if (!currentAtPrevPath || currentAtPrevPath.id !== prev.id) {
           const docCurrent =
-            currentAtPrevPath ?? storage.version_history(prev.document_id, { limit: 1 })[0] ?? null;
+            currentAtPrevPath ??
+            (await storage.version_history(prev.document_id, { limit: 1 }))[0] ??
+            null;
           throw new KernelError("stale_prev", {
             current_version_id: docCurrent ? encodeVersionId(docCurrent.id) : null,
             current_path: docCurrent
@@ -608,14 +545,10 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
           });
         }
 
-        // prev IS current. Idempotency (design §4.1 rule 4): if the current
-        // version's path is under a system sigil, the doc is already
-        // deleted — no-op, return unchanged.
         if (pathIsInSystemNamespace(prev.path, cfg.system_sigils)) {
           return toVersionWire(prev, repoSlug);
         }
 
-        // Compute the deletion path (§3.5.4 — set for input, first for output).
         const destPath = deletionPath(
           cfg.system_sigils[0] as string,
           prev.path,
@@ -630,17 +563,11 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
           system_sigils: cfg.system_sigils,
         });
 
-        // NOTE the destPath's segment starts with a system sigil, which
-        // validatePath would reject. We SKIP validatePath here — this is the
-        // kernel emitting on its own behalf (design §4.1 rule 4).
-
-        const { version, insertedId } = storage.tx(() => {
-          // Re-check prev is still current inside the tx to close the race
-          // window between the pre-check above and the insert.
-          const current = storage.version_current(repo.id, prev.path);
+        const { version, insertedId } = await storage.tx(async () => {
+          const current = await storage.version_current(repo.id, prev.path);
           if (!current || current.id !== prev.id) {
             const docCurrent =
-              current ?? storage.version_history(prev.document_id, { limit: 1 })[0] ?? null;
+              current ?? (await storage.version_history(prev.document_id, { limit: 1 }))[0] ?? null;
             throw new KernelError("stale_prev", {
               current_version_id: docCurrent ? encodeVersionId(docCurrent.id) : null,
               current_path: docCurrent
@@ -650,7 +577,7 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
             });
           }
 
-          const inserted = storage.version_insert({
+          const inserted = await storage.version_insert({
             document_id: prev.document_id,
             repo_id: repo.id,
             prev_id: prev.id,
@@ -661,31 +588,31 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
             author_id: actor.user_id,
             created_at: new Date().toISOString(),
           });
-          return { version: toVersionWire(inserted, repoSlug), insertedId: inserted.id };
+          const author = await userById(actor.user_id);
+          return {
+            version: toVersionWireSync(inserted, repoSlug, author),
+            insertedId: inserted.id,
+          };
         });
-        onVersionCommitted?.(insertedId);
+        await onVersionCommitted?.(insertedId);
         return version;
       },
     },
 
     tokens: {
-      list(actor) {
-        // A user always sees their own tokens (design §8.2 self-token
-        // management). Admin listing across users is `[OPEN]`. Adapter
-        // already filters revoked + expired.
-        return storage.tokens_list(actor.user_id).map(tokenRowToWire);
+      async list(actor) {
+        const rows = await storage.tokens_list(actor.user_id);
+        return Promise.all(rows.map((r) => tokenRowToWire(r)));
       },
-      create(actor, label, scopeInputs, opts) {
+      async create(actor, label, scopeInputs, opts) {
         const admin = opts?.admin ?? false;
         assertAdminSubset(actor.admin, admin);
-        const resolvedScopes = resolveScopeInputs(scopeInputs, storage);
-        // Child scopes must be a subset of parent's — unless parent is
-        // admin, which can mint anything.
+        const resolvedScopes = await resolveScopeInputs(scopeInputs, storage);
         if (!actor.admin) {
           assertChildScopeSubset(actor.scopes, resolvedScopes);
         }
         const secret = generateSecret();
-        const row = storage.tokens_create({
+        const row = await storage.tokens_create({
           user_id: actor.user_id,
           secret_hash: hashSecret(secret),
           label,
@@ -694,25 +621,22 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
           expires_at: opts?.expires_at ?? null,
           created_at: new Date().toISOString(),
         });
-        return { token: secret, meta: tokenRowToWire(row) };
+        return { token: secret, meta: await tokenRowToWire(row) };
       },
-      revoke(actor, tokenId) {
+      async revoke(actor, tokenId) {
         const id = decodeTokenId(tokenId);
         if (id === null) throw tokenNotFound(tokenId);
-        const row = storage.tokens_by_id(id);
+        const row = await storage.tokens_by_id(id);
         if (!row) throw tokenNotFound(tokenId);
-        // Self-revoke is always allowed. Cross-user revoke requires admin.
         if (row.user_id !== actor.user_id && !actor.admin) {
           throw new KernelError("forbidden", {});
         }
-        const revoked = storage.tokens_revoke(id, new Date().toISOString());
+        const revoked = await storage.tokens_revoke(id, new Date().toISOString());
         return tokenRowToWire(revoked ?? row);
       },
     },
 
     async query(actor: Actor, spec: QuerySpec): Promise<Version[]> {
-      // Server-level read authorization — the QuerySpec.repo field + scope
-      // enforcement inside runQuery() do the fine-grained filtering.
       authorize(actor, "read", { kind: "server" });
       return runQuery(actor, spec, {
         storage,

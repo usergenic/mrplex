@@ -14,14 +14,14 @@ import {
 } from "./tokens.js";
 
 describe("generateSecret", () => {
-  it("returns a mrplex_-prefixed base64url string", () => {
+  it("returns a mrplex_-prefixed base64url string", async () => {
     const s = generateSecret();
     expect(s).toMatch(/^mrplex_[A-Za-z0-9_-]+$/);
     // 32 bytes → 43 chars of unpadded base64url.
     expect(s.length).toBe("mrplex_".length + 43);
   });
 
-  it("produces unique secrets across calls", () => {
+  it("produces unique secrets across calls", async () => {
     const secrets = new Set<string>();
     for (let i = 0; i < 1000; i++) secrets.add(generateSecret());
     expect(secrets.size).toBe(1000);
@@ -29,34 +29,34 @@ describe("generateSecret", () => {
 });
 
 describe("hashSecret", () => {
-  it("is deterministic (same input → same digest)", () => {
+  it("is deterministic (same input → same digest)", async () => {
     expect(hashSecret("mrplex_abc")).toBe(hashSecret("mrplex_abc"));
   });
 
-  it("produces a hex-encoded 64-char digest", () => {
+  it("produces a hex-encoded 64-char digest", async () => {
     expect(hashSecret("anything")).toMatch(/^[0-9a-f]{64}$/);
   });
 
-  it("distinct secrets → distinct digests", () => {
+  it("distinct secrets → distinct digests", async () => {
     expect(hashSecret("a")).not.toBe(hashSecret("b"));
   });
 });
 
 describe("hashesEqual", () => {
-  it("equal for equal hex digests", () => {
+  it("equal for equal hex digests", async () => {
     const h = hashSecret("x");
     expect(hashesEqual(h, h)).toBe(true);
   });
-  it("not equal for different digests", () => {
+  it("not equal for different digests", async () => {
     expect(hashesEqual(hashSecret("a"), hashSecret("b"))).toBe(false);
   });
-  it("not equal for different-length strings", () => {
+  it("not equal for different-length strings", async () => {
     expect(hashesEqual("aa", "aabb")).toBe(false);
   });
 });
 
 describe("parseStoredScopes / serializeStoredScopes", () => {
-  it("round-trips a typical scopes array", () => {
+  it("round-trips a typical scopes array", async () => {
     const scopes: StoredScope[] = [
       { repos: [1, 2], read: ["**"], write: ["inbox/**"] },
       { repos: "*", read: ["**"] },
@@ -64,15 +64,15 @@ describe("parseStoredScopes / serializeStoredScopes", () => {
     expect(parseStoredScopes(serializeStoredScopes(scopes))).toEqual(scopes);
   });
 
-  it("round-trips an empty array", () => {
+  it("round-trips an empty array", async () => {
     expect(parseStoredScopes(serializeStoredScopes([]))).toEqual([]);
   });
 
-  it("rejects non-array JSON", () => {
+  it("rejects non-array JSON", async () => {
     expect(() => parseStoredScopes(JSON.stringify({ nope: true }))).toThrow(/array/);
   });
 
-  it("rejects entries whose repos is not '*' or number[]", () => {
+  it("rejects entries whose repos is not '*' or number[]", async () => {
     expect(() => parseStoredScopes(JSON.stringify([{ repos: "notes", read: ["**"] }]))).toThrow(
       /repos/,
     );
@@ -82,25 +82,25 @@ describe("parseStoredScopes / serializeStoredScopes", () => {
 describe("resolveActor (SQLite backed)", () => {
   let storage: Storage;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     const path = join(tmpdir(), `mrplex-tokens-${Date.now()}-${Math.random()}.db`);
-    storage = sqliteAdapter.open({ database: `sqlite:${path}` });
+    storage = await sqliteAdapter.open({ database: `sqlite:${path}` });
   });
 
-  afterEach(() => {
-    storage.close();
+  afterEach(async () => {
+    await storage.close();
   });
 
-  function issueToken(
+  async function issueToken(
     input: {
       admin?: boolean;
       scopes?: StoredScope[];
       expires_at?: string | null;
     } = {},
   ) {
-    const user = storage.users_create({ slug: "alice", created_at: "2026-08-14T00:00:00Z" });
+    const user = await storage.users_create({ slug: "alice", created_at: "2026-08-14T00:00:00Z" });
     const secret = generateSecret();
-    const row = storage.tokens_create({
+    const row = await storage.tokens_create({
       user_id: user.id,
       secret_hash: hashSecret(secret),
       label: "test",
@@ -112,9 +112,9 @@ describe("resolveActor (SQLite backed)", () => {
     return { user, secret, row };
   }
 
-  it("resolves a valid token to an Actor", () => {
-    const { user, secret } = issueToken({ admin: true });
-    const actor = resolveActor(secret, storage);
+  it("resolves a valid token to an Actor", async () => {
+    const { user, secret } = await issueToken({ admin: true });
+    const actor = await resolveActor(secret, storage);
     expect(actor).not.toBeNull();
     expect(actor?.user_id).toBe(user.id);
     expect(actor?.admin).toBe(true);
@@ -122,33 +122,40 @@ describe("resolveActor (SQLite backed)", () => {
     expect(actor?.token_id).toBeDefined();
   });
 
-  it("returns null for an unknown secret", () => {
-    expect(resolveActor(generateSecret(), storage)).toBeNull();
+  it("returns null for an unknown secret", async () => {
+    expect(await resolveActor(generateSecret(), storage)).toBeNull();
   });
 
-  it("returns null for a revoked token", () => {
-    const { secret, row } = issueToken();
-    storage.tokens_revoke(row.id, "2026-08-14T00:00:02Z");
-    expect(resolveActor(secret, storage)).toBeNull();
+  it("returns null for a revoked token", async () => {
+    const { secret, row } = await issueToken();
+    await storage.tokens_revoke(row.id, "2026-08-14T00:00:02Z");
+    expect(await resolveActor(secret, storage)).toBeNull();
   });
 
-  it("returns null for an expired token", () => {
-    const { secret } = issueToken({ expires_at: "2020-01-01T00:00:00Z" });
-    expect(resolveActor(secret, storage)).toBeNull();
+  it("returns null for an expired token", async () => {
+    const { secret } = await issueToken({ expires_at: "2020-01-01T00:00:00Z" });
+    expect(await resolveActor(secret, storage)).toBeNull();
   });
 
-  it("touches last_used_at on a successful resolve", () => {
-    const { secret, row } = issueToken();
-    expect(storage.tokens_by_id(row.id)?.last_used_at).toBeNull();
-    resolveActor(secret, storage);
-    const after = storage.tokens_by_id(row.id);
+  it("touches last_used_at on a successful resolve", async () => {
+    const { secret, row } = await issueToken();
+    expect((await storage.tokens_by_id(row.id))?.last_used_at).toBeNull();
+    await resolveActor(secret, storage);
+    // Touch is fire-and-forget (§8.5) — wait for it to land. Poll rather
+    // than a fixed sleep so the test isn't slower than it needs to be.
+    for (let i = 0; i < 50; i++) {
+      const row2 = await storage.tokens_by_id(row.id);
+      if (row2?.last_used_at !== null && row2?.last_used_at !== undefined) break;
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    const after = await storage.tokens_by_id(row.id);
     expect(after?.last_used_at).not.toBeNull();
   });
 
-  it("users_delete precondition: tokens_revoke_by_user takes them all out", () => {
-    const { user, secret } = issueToken();
-    expect(resolveActor(secret, storage)).not.toBeNull();
-    storage.tokens_revoke_by_user(user.id, "2026-08-14T00:00:02Z");
-    expect(resolveActor(secret, storage)).toBeNull();
+  it("users_delete precondition: tokens_revoke_by_user takes them all out", async () => {
+    const { user, secret } = await issueToken();
+    expect(await resolveActor(secret, storage)).not.toBeNull();
+    await storage.tokens_revoke_by_user(user.id, "2026-08-14T00:00:02Z");
+    expect(await resolveActor(secret, storage)).toBeNull();
   });
 });

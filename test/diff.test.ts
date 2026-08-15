@@ -44,7 +44,7 @@ describe("docs.diff — surfaces", () => {
   });
 
   it("REST /diff and MCP docs_diff both return the unified diff", async () => {
-    const { token } = bootstrap(`sqlite:${tmpDb}`);
+    const { token } = await bootstrap(`sqlite:${tmpDb}`);
     const port = await ephemeralPort();
     const handle = await startServer({
       database: `sqlite:${tmpDb}`,
@@ -129,7 +129,7 @@ describe("docs.diff — surfaces", () => {
   }, 20000);
 
   it("version_not_in_document maps to 422 + tool-error", async () => {
-    const { token } = bootstrap(`sqlite:${tmpDb}`);
+    const { token } = await bootstrap(`sqlite:${tmpDb}`);
     const port = await ephemeralPort();
     const handle = await startServer({
       database: `sqlite:${tmpDb}`,

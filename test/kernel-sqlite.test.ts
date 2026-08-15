@@ -5,8 +5,9 @@ import { runKernelSuite } from "./kernel-suite.js";
 
 runKernelSuite({
   name: "sqlite",
-  open: () => {
+  open: async () => {
     const path = join(tmpdir(), `mrplex-kernel-${Date.now()}-${Math.random()}.db`);
-    return sqliteAdapter.open({ database: `sqlite:${path}` });
+    const storage = await sqliteAdapter.open({ database: `sqlite:${path}` });
+    return { storage };
   },
 });

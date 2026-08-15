@@ -1,5 +1,6 @@
 import { RE2JS } from "@bufbuild/re2";
 import Database from "better-sqlite3";
+import type { SearchPlan } from "../storage/search-plan.js";
 import type {
   BacklogRow,
   BacklogStatus,
@@ -18,10 +19,10 @@ import type {
   VectorSearchHit,
   VersionInsertInput,
   VersionRow,
-  VersionsSearchInput,
 } from "../storage/types.js";
+import { compileSearchPlan } from "./compile-sqlite.js";
 import { migrate } from "./migrations/index.js";
-import { encodeVectorBlob, loadSqliteVec } from "./vec.js";
+import { decodeVectorBlob, encodeVectorBlob, loadSqliteVec } from "./vec.js";
 
 type VersionRawRow = {
   id: number;
@@ -41,6 +42,9 @@ const hydrateVersion = (row: VersionRawRow): VersionRow => ({
   ...row,
   frontmatter: JSON.parse(row.frontmatter) as FrontmatterJson,
 });
+
+type TokenRawRow = Omit<TokenRow, "admin"> & { admin: number };
+const hydrateToken = (row: TokenRawRow): TokenRow => ({ ...row, admin: row.admin === 1 });
 
 /**
  * Compile + cache RE2JS patterns per SqliteStorage instance. Returns null
@@ -86,21 +90,7 @@ class SqliteStorage implements Storage {
     this.db.pragma("foreign_keys = ON");
     this.db.pragma("busy_timeout = 5000");
     // regexp() user function — the SQL side of CEL's matches() (m2-plan
-    // §5). Two reasons this uses RE2JS instead of the built-in RegExp:
-    //   1. CEL spec conformance: matches() is defined against Google's RE2
-    //      dialect (linear-time, no lookaround). JS's RegExp has different
-    //      features AND different worst-case behavior; using RE2JS keeps
-    //      the language contract stable when M5's Postgres adapter lands
-    //      (Postgres uses `~` with its own regex library — RE2JS's syntax
-    //      is a closer match than PCRE-style JS regex).
-    //   2. ReDoS: any read-scoped caller can otherwise craft `(a+)+b`-
-    //      shaped patterns that hang the event loop. RE2JS is a linear-
-    //      time engine by construction, so pathological input costs the
-    //      same as any other input.
-    //
-    // We cache compiled RE2JS instances per pattern via re2Cache — SQLite
-    // calls this UDF once per row scanned; recompiling for every call
-    // would multiply cost by the row count.
+    // §5). RE2JS keeps the semantics identical to Postgres's `~`.
     const dbHandle = this.db;
     this.db.function(
       "regexp",
@@ -112,26 +102,28 @@ class SqliteStorage implements Storage {
         return compiled.matches(input) ? 1 : 0;
       },
     );
-    // sqlite-vec provides vec_distance_cosine + friends over float32
-    // BLOBs — m4-plan §5 decision 3. Loaded once per connection; safe
-    // to load before migrations because it only registers UDFs.
     loadSqliteVec(this.db);
   }
 
-  close(): void {
+  async close(): Promise<void> {
     this.db.close();
   }
 
-  migrate(): void {
+  async migrate(): Promise<void> {
     migrate(this.db);
   }
 
-  tx<T>(fn: () => T): T {
+  async tx<T>(fn: () => Promise<T>): Promise<T> {
+    // SQLite's transactions are on-connection and can hold across
+    // `await`s because better-sqlite3 is synchronous per call — no
+    // other statement runs on the connection between our steps.
+    // Kernel contract (design §7.2 / m5-plan WS1): tx bodies never
+    // await foreign I/O, only storage calls; that's safe.
     if (this.txDepth === 0) {
       this.db.exec("begin immediate");
       this.txDepth++;
       try {
-        const result = fn();
+        const result = await fn();
         this.db.exec("commit");
         this.txDepth--;
         return result;
@@ -146,7 +138,7 @@ class SqliteStorage implements Storage {
     this.db.exec(`savepoint ${name}`);
     this.txDepth++;
     try {
-      const result = fn();
+      const result = await fn();
       this.db.exec(`release ${name}`);
       this.txDepth--;
       return result;
@@ -158,20 +150,19 @@ class SqliteStorage implements Storage {
     }
   }
 
-  users_list(): UserRow[] {
+  async users_list(): Promise<UserRow[]> {
     return this.db
       .prepare("select id, slug, created_at from users order by slug")
       .all() as UserRow[];
   }
 
-  users_create(input: { slug: string; created_at: string }): UserRow {
-    const row = this.db
+  async users_create(input: { slug: string; created_at: string }): Promise<UserRow> {
+    return this.db
       .prepare("insert into users(slug, created_at) values (?, ?) returning id, slug, created_at")
       .get(input.slug, input.created_at) as UserRow;
-    return row;
   }
 
-  users_rename(id: number, new_slug: string): UserRow {
+  async users_rename(id: number, new_slug: string): Promise<UserRow> {
     const row = this.db
       .prepare("update users set slug = ? where id = ? returning id, slug, created_at")
       .get(new_slug, id) as UserRow | undefined;
@@ -179,7 +170,7 @@ class SqliteStorage implements Storage {
     return row;
   }
 
-  users_by_slug(slug: string): UserRow | null {
+  async users_by_slug(slug: string): Promise<UserRow | null> {
     return (
       (this.db.prepare("select id, slug, created_at from users where slug = ?").get(slug) as
         | UserRow
@@ -187,7 +178,7 @@ class SqliteStorage implements Storage {
     );
   }
 
-  users_by_id(id: number): UserRow | null {
+  async users_by_id(id: number): Promise<UserRow | null> {
     return (
       (this.db.prepare("select id, slug, created_at from users where id = ?").get(id) as
         | UserRow
@@ -195,22 +186,21 @@ class SqliteStorage implements Storage {
     );
   }
 
-  repos_list(): RepoRow[] {
+  async repos_list(): Promise<RepoRow[]> {
     return this.db
       .prepare("select id, slug, path_config, created_at from repos order by slug")
       .all() as RepoRow[];
   }
 
-  repos_create(input: { slug: string; created_at: string }): RepoRow {
-    const row = this.db
+  async repos_create(input: { slug: string; created_at: string }): Promise<RepoRow> {
+    return this.db
       .prepare(
         "insert into repos(slug, created_at) values (?, ?) returning id, slug, path_config, created_at",
       )
       .get(input.slug, input.created_at) as RepoRow;
-    return row;
   }
 
-  repos_rename(id: number, new_slug: string): RepoRow {
+  async repos_rename(id: number, new_slug: string): Promise<RepoRow> {
     const row = this.db
       .prepare("update repos set slug = ? where id = ? returning id, slug, path_config, created_at")
       .get(new_slug, id) as RepoRow | undefined;
@@ -218,7 +208,7 @@ class SqliteStorage implements Storage {
     return row;
   }
 
-  repos_set_path_config(id: number, path_config: string | null): RepoRow {
+  async repos_set_path_config(id: number, path_config: string | null): Promise<RepoRow> {
     const row = this.db
       .prepare(
         "update repos set path_config = ? where id = ? returning id, slug, path_config, created_at",
@@ -228,7 +218,7 @@ class SqliteStorage implements Storage {
     return row;
   }
 
-  repos_by_slug(slug: string): RepoRow | null {
+  async repos_by_slug(slug: string): Promise<RepoRow | null> {
     return (
       (this.db
         .prepare("select id, slug, path_config, created_at from repos where slug = ?")
@@ -236,7 +226,7 @@ class SqliteStorage implements Storage {
     );
   }
 
-  repos_by_id(id: number): RepoRow | null {
+  async repos_by_id(id: number): Promise<RepoRow | null> {
     return (
       (this.db
         .prepare("select id, slug, path_config, created_at from repos where id = ?")
@@ -244,35 +234,15 @@ class SqliteStorage implements Storage {
     );
   }
 
-  documents_create(repo_id: number): DocumentRow {
-    const row = this.db
+  async documents_create(repo_id: number): Promise<DocumentRow> {
+    return this.db
       .prepare("insert into documents(repo_id) values (?) returning id, repo_id")
       .get(repo_id) as DocumentRow;
-    return row;
   }
 
-  version_insert(input: VersionInsertInput): VersionRow {
-    return this.tx(() => {
-      // The partial index `(document_id) where next_id is null` forbids two
-      // rows sharing document_id with next_id=NULL. When advancing the chain,
-      // we can't insert the new current row while the old current row still
-      // has next_id=NULL — the partial-index constraint would fire.
-      //
-      // Trick: move the previous current out of the "current" set FIRST by
-      // temporarily pointing its next_id at itself (a valid FK — the row
-      // exists). Then insert the new current with next_id=NULL. Then fix the
-      // prev row's next_id to the new row's id.
-      //
-      // Three statements, one tx, no window in which two rows share
-      // (document_id, next_id=NULL). Same discipline is what the design's
-      // §7.2.2 obligation #1 asks for.
+  async version_insert(input: VersionInsertInput): Promise<VersionRow> {
+    return this.tx(async () => {
       if (input.prev_id !== null) {
-        // The placeholder update is also the guard that binds prev to THIS
-        // document: it only matches when the referenced row belongs to the
-        // input document_id AND is still current. A caller passing another
-        // document's current version_id as prev fails here (0 rows changed),
-        // so we can't cross-link chains or orphan a foreign document's
-        // "current" pointer.
         const updated = this.db
           .prepare(
             "update versions set next_id = id where id = ? and document_id = ? and next_id is null",
@@ -316,7 +286,7 @@ class SqliteStorage implements Storage {
     });
   }
 
-  version_by_id(id: number): VersionRow | null {
+  async version_by_id(id: number): Promise<VersionRow | null> {
     const row = this.db
       .prepare(
         `select id, document_id, repo_id, prev_id, next_id, path,
@@ -327,7 +297,7 @@ class SqliteStorage implements Storage {
     return row ? hydrateVersion(row) : null;
   }
 
-  version_current(repo_id: number, path: string): VersionRow | null {
+  async version_current(repo_id: number, path: string): Promise<VersionRow | null> {
     const row = this.db
       .prepare(
         `select id, document_id, repo_id, prev_id, next_id, path,
@@ -338,7 +308,7 @@ class SqliteStorage implements Storage {
     return row ? hydrateVersion(row) : null;
   }
 
-  versions_live_by_repo(repo_id: number): VersionRow[] {
+  async versions_live_by_repo(repo_id: number): Promise<VersionRow[]> {
     const rows = this.db
       .prepare(
         `select id, document_id, repo_id, prev_id, next_id, path,
@@ -351,57 +321,21 @@ class SqliteStorage implements Storage {
     return rows.map(hydrateVersion);
   }
 
-  fts_index(_version_id: number, _body: string): void {
+  async fts_index(_version_id: number, _body: string): Promise<void> {
     // SQLite FTS5 external-content mode with AFTER INSERT triggers on
     // `versions` keeps the index in sync automatically (see migration
-    // 0003_fts_docs.sql). The interface method exists so engines that
-    // require explicit calls (or that back FTS with an auxiliary process)
-    // have a place to hook in — see design §7.2.2 "What an adapter is NOT
-    // required to provide."
+    // 0003_fts_docs.sql).
   }
 
-  versions_search(input: VersionsSearchInput): VersionRow[] {
-    if (input.repo_ids.length === 0) return [];
-    const repoPh = input.repo_ids.map(() => "?").join(",");
-    const clauses: string[] = ["versions.next_id IS NULL", `versions.repo_id IN (${repoPh})`];
-    const params: unknown[] = [...input.repo_ids];
-    if (input.where_sql.trim().length > 0) {
-      clauses.push(`(${input.where_sql})`);
-      params.push(...input.where_params);
-    }
-    let sql: string;
-    if (input.text !== undefined) {
-      clauses.push("versions.id = fts_docs.rowid");
-      clauses.push("fts_docs MATCH ?");
-      params.push(input.text);
-      sql = `SELECT versions.id, versions.document_id, versions.repo_id,
-                    versions.prev_id, versions.next_id, versions.path,
-                    versions.frontmatter_raw, versions.frontmatter,
-                    versions.body, versions.author_id, versions.created_at
-             FROM versions, fts_docs
-             WHERE ${clauses.join(" AND ")}
-             ORDER BY bm25(fts_docs)
-             LIMIT ?`;
-    } else {
-      sql = `SELECT versions.id, versions.document_id, versions.repo_id,
-                    versions.prev_id, versions.next_id, versions.path,
-                    versions.frontmatter_raw, versions.frontmatter,
-                    versions.body, versions.author_id, versions.created_at
-             FROM versions
-             WHERE ${clauses.join(" AND ")}
-             ORDER BY versions.created_at DESC, versions.id DESC
-             LIMIT ?`;
-    }
-    params.push(input.limit);
+  async versions_search(plan: SearchPlan): Promise<VersionRow[]> {
+    if (plan.repo_ids.length === 0) return [];
+    if (plan.scope.kind === "deny_all") return [];
+    const { sql, params } = compileSearchPlan(plan);
     const rows = this.db.prepare(sql).all(...params) as VersionRawRow[];
     return rows.map(hydrateVersion);
   }
 
-  version_history(document_id: number, opts?: HistoryOptions): VersionRow[] {
-    // History walks the version chain (design §3.4), not created_at, so
-    // backdated edits and clock skew can't reorder the result. A recursive
-    // CTE anchored at the current version follows prev_id back to the root;
-    // rows come out newest-first by construction.
+  async version_history(document_id: number, opts?: HistoryOptions): Promise<VersionRow[]> {
     const clauses: string[] = [];
     const params: (string | number)[] = [document_id];
     if (opts?.before) {
@@ -438,28 +372,27 @@ class SqliteStorage implements Storage {
     return rows.map(hydrateVersion);
   }
 
-  // Chunks + vectors (design §3.2, §5.3). Written by the backlog worker;
-  // read by kernel.query's `rank` branch. Vectors are LE float32 BLOBs
-  // (see storage-sqlite/vec.ts); dedup keys on (model, text_hash).
-  chunks_upsert(version_id: number, model: string, chunks: readonly ChunkUpsertInput[]): void {
+  async chunks_upsert(
+    version_id: number,
+    model: string,
+    chunks: readonly ChunkUpsertInput[],
+  ): Promise<void> {
     if (chunks.length === 0) {
-      // Explicit "no chunks" is still a valid state (empty body); wipe
-      // any prior rows so re-embedding doesn't leave stale vectors.
-      this.tx(() => {
+      await this.tx(async () => {
         this.db.prepare("delete from chunks where version_id = ?").run(version_id);
       });
       return;
     }
     // Normalize each embedding to a Buffer (BLOB) at the adapter
-    // boundary — callers pass either number[] (fresh from the hook) or
-    // Buffer (reused via chunks_by_hash). Storing the encoded form once
-    // per row is cheap; keeping the API surface backend-agnostic means
-    // the kernel never imports storage-sqlite/vec.js.
+    // boundary. Callers pass either number[] (fresh from the hook) or
+    // Float32Array (reused via chunks_by_hash).
     const encoded = chunks.map((c) => ({
       ...c,
-      embedding: Buffer.isBuffer(c.embedding) ? c.embedding : encodeVectorBlob(c.embedding),
+      embedding:
+        c.embedding instanceof Float32Array
+          ? Buffer.from(c.embedding.buffer, c.embedding.byteOffset, c.embedding.byteLength)
+          : encodeVectorBlob(c.embedding),
     }));
-    // Refuse mixed-dim writes within one call (§5.3, m4-plan §1).
     const dim = encoded[0]?.embedding.byteLength;
     if (dim === undefined) throw new Error("chunks_upsert: unreachable");
     for (const c of encoded) {
@@ -474,7 +407,7 @@ class SqliteStorage implements Storage {
         );
       }
     }
-    this.tx(() => {
+    await this.tx(async () => {
       this.db.prepare("delete from chunks where version_id = ?").run(version_id);
       const insert = this.db.prepare(
         "insert into chunks(version_id, ix, text, text_hash, model, embedding) values (?, ?, ?, ?, ?, ?)",
@@ -485,15 +418,12 @@ class SqliteStorage implements Storage {
     });
   }
 
-  chunks_by_hash(
+  async chunks_by_hash(
     model: string,
     text_hashes: readonly string[],
-  ): { text_hash: string; embedding: Buffer }[] {
+  ): Promise<{ text_hash: string; embedding: Float32Array }[]> {
     if (text_hashes.length === 0) return [];
     const ph = text_hashes.map(() => "?").join(",");
-    // GROUP BY text_hash returns one row per hash (arbitrary embedding
-    // among duplicates is fine — dedup semantics guarantee they're the
-    // same vector).
     const rows = this.db
       .prepare(
         `select text_hash, embedding
@@ -504,21 +434,32 @@ class SqliteStorage implements Storage {
            group by text_hash`,
       )
       .all(model, ...text_hashes) as { text_hash: string; embedding: Buffer }[];
-    return rows;
+    return rows.map((r) => ({ text_hash: r.text_hash, embedding: decodeVectorBlob(r.embedding) }));
   }
 
-  chunks_by_version(version_id: number): ChunkRow[] {
-    return this.db
+  async chunks_by_version(version_id: number): Promise<ChunkRow[]> {
+    const rows = this.db
       .prepare(
         `select version_id, ix, text, text_hash, model, embedding
            from chunks
            where version_id = ?
            order by ix`,
       )
-      .all(version_id) as ChunkRow[];
+      .all(version_id) as {
+      version_id: number;
+      ix: number;
+      text: string;
+      text_hash: string;
+      model: string;
+      embedding: Buffer | null;
+    }[];
+    return rows.map((r) => ({
+      ...r,
+      embedding: r.embedding ? decodeVectorBlob(r.embedding) : null,
+    }));
   }
 
-  chunks_model_summary(): { model: string; chunk_count: number }[] {
+  async chunks_model_summary(): Promise<{ model: string; chunk_count: number }[]> {
     return this.db
       .prepare(
         `select model, count(*) as chunk_count
@@ -529,28 +470,16 @@ class SqliteStorage implements Storage {
       .all() as { model: string; chunk_count: number }[];
   }
 
-  vector_search(
+  async vector_search(
     repo_ids: readonly number[],
     model: string,
     embedding: readonly number[],
     k: number,
-  ): VectorSearchHit[] {
+  ): Promise<VectorSearchHit[]> {
     if (repo_ids.length === 0 || k <= 0) return [];
-    // Encode the query vector at the adapter boundary (m4-plan §7.2.2 —
-    // adapter owns serialization). Kernel callers pass number[].
     const queryBlob = encodeVectorBlob(embedding);
-    // Brute-force scan over current-version chunks matching model
-    // (§7.2.1 pins SQLite at brute-force in v1; M5's pgvector adapter
-    // gets HNSW/IVFFlat).
-    //
-    // We collapse to best chunk per version via ROW_NUMBER() rather than
-    // MIN(...) + bare columns. SQLite does support the bare-column-with-
-    // MIN convention, but the pairing (chunk_ix, score) is exactly the
-    // claim we need to prove correct — using ROW_NUMBER makes that
-    // pairing explicit rather than relying on a dialect-specific rule
-    // that Postgres won't share when M5 lands.
     const repoPh = repo_ids.map(() => "?").join(",");
-    const rows = this.db
+    return this.db
       .prepare(
         `with scored as (
            select chunks.version_id as version_id,
@@ -574,14 +503,9 @@ class SqliteStorage implements Storage {
            limit ?`,
       )
       .all(queryBlob, queryBlob, model, ...repo_ids, k) as VectorSearchHit[];
-    return rows;
   }
 
-  // Embedding backlog (design §5.3). One row per version awaiting or
-  // retrying embedding. Enqueue is idempotent-per-version (upsert) and
-  // resets attempts + next_retry_at so a superseding write doesn't
-  // inherit an old backoff.
-  backlog_enqueue(version_id: number): void {
+  async backlog_enqueue(version_id: number): Promise<void> {
     this.db
       .prepare(
         `insert into embedding_backlog(version_id, attempts, last_error, next_retry_at)
@@ -592,7 +516,7 @@ class SqliteStorage implements Storage {
       .run(version_id);
   }
 
-  backlog_dequeue(now: string, limit: number): BacklogRow[] {
+  async backlog_dequeue(now: string, limit: number): Promise<BacklogRow[]> {
     if (limit <= 0) return [];
     return this.db
       .prepare(
@@ -605,12 +529,12 @@ class SqliteStorage implements Storage {
       .all(now, limit) as BacklogRow[];
   }
 
-  backlog_retain(input: {
+  async backlog_retain(input: {
     version_id: number;
     attempts: number;
     last_error: string;
     next_retry_at: string;
-  }): void {
+  }): Promise<void> {
     this.db
       .prepare(
         `update embedding_backlog
@@ -620,11 +544,11 @@ class SqliteStorage implements Storage {
       .run(input.attempts, input.last_error, input.next_retry_at, input.version_id);
   }
 
-  backlog_delete(version_id: number): void {
+  async backlog_delete(version_id: number): Promise<void> {
     this.db.prepare("delete from embedding_backlog where version_id = ?").run(version_id);
   }
 
-  backlog_status(now: string): BacklogStatus {
+  async backlog_status(now: string): Promise<BacklogStatus> {
     const pending = (
       this.db.prepare("select count(*) as n from embedding_backlog").get() as { n: number }
     ).n;
@@ -676,11 +600,8 @@ class SqliteStorage implements Storage {
     };
   }
 
-  // Tokens (design §3.2, §8). SQLite has no boolean, so `admin` stores 0/1.
-  // `tokens_by_hash` / `tokens_list` filter out revoked and expired rows here
-  // so the kernel never has to remember.
-  tokens_create(input: TokenInsertInput): TokenRow {
-    return this.db
+  async tokens_create(input: TokenInsertInput): Promise<TokenRow> {
+    const raw = this.db
       .prepare(
         `insert into api_tokens
            (user_id, secret_hash, label, scopes, admin,
@@ -697,41 +618,37 @@ class SqliteStorage implements Storage {
         input.admin ? 1 : 0,
         input.expires_at,
         input.created_at,
-      ) as TokenRow;
+      ) as TokenRawRow;
+    return hydrateToken(raw);
   }
 
-  tokens_by_hash(hash: string): TokenRow | null {
-    // Filter revoked + expired at read time.
-    return (
-      (this.db
-        .prepare(
-          `select id, user_id, secret_hash, label, scopes,
-                  admin, expires_at, revoked_at, created_at, last_used_at
-             from api_tokens
-             where secret_hash = ?
-               and revoked_at is null
-               and (expires_at is null or expires_at > ?)`,
-        )
-        .get(hash, new Date().toISOString()) as TokenRow | undefined) ?? null
-    );
+  async tokens_by_hash(hash: string): Promise<TokenRow | null> {
+    const raw = this.db
+      .prepare(
+        `select id, user_id, secret_hash, label, scopes,
+                admin, expires_at, revoked_at, created_at, last_used_at
+           from api_tokens
+           where secret_hash = ?
+             and revoked_at is null
+             and (expires_at is null or expires_at > ?)`,
+      )
+      .get(hash, new Date().toISOString()) as TokenRawRow | undefined;
+    return raw ? hydrateToken(raw) : null;
   }
 
-  tokens_by_id(id: number): TokenRow | null {
-    return (
-      (this.db
-        .prepare(
-          `select id, user_id, secret_hash, label, scopes,
-                  admin, expires_at, revoked_at, created_at, last_used_at
-             from api_tokens where id = ?`,
-        )
-        .get(id) as TokenRow | undefined) ?? null
-    );
+  async tokens_by_id(id: number): Promise<TokenRow | null> {
+    const raw = this.db
+      .prepare(
+        `select id, user_id, secret_hash, label, scopes,
+                admin, expires_at, revoked_at, created_at, last_used_at
+           from api_tokens where id = ?`,
+      )
+      .get(id) as TokenRawRow | undefined;
+    return raw ? hydrateToken(raw) : null;
   }
 
-  tokens_list(user_id: number): TokenRow[] {
-    // Filter revoked + expired at read time (adapter contract, matching
-    // tokens_by_hash) so the kernel doesn't have to remember.
-    return this.db
+  async tokens_list(user_id: number): Promise<TokenRow[]> {
+    const rows = this.db
       .prepare(
         `select id, user_id, secret_hash, label, scopes,
                 admin, expires_at, revoked_at, created_at, last_used_at
@@ -741,41 +658,39 @@ class SqliteStorage implements Storage {
              and (expires_at is null or expires_at > ?)
            order by created_at desc, id desc`,
       )
-      .all(user_id, new Date().toISOString()) as TokenRow[];
+      .all(user_id, new Date().toISOString()) as TokenRawRow[];
+    return rows.map(hydrateToken);
   }
 
-  tokens_revoke(id: number, revoked_at: string): TokenRow | null {
-    const row = this.db
+  async tokens_revoke(id: number, revoked_at: string): Promise<TokenRow | null> {
+    const raw = this.db
       .prepare(
         `update api_tokens set revoked_at = coalesce(revoked_at, ?)
            where id = ?
          returning id, user_id, secret_hash, label, scopes,
                    admin, expires_at, revoked_at, created_at, last_used_at`,
       )
-      .get(revoked_at, id) as TokenRow | undefined;
-    return row ?? null;
+      .get(revoked_at, id) as TokenRawRow | undefined;
+    return raw ? hydrateToken(raw) : null;
   }
 
-  tokens_revoke_by_user(user_id: number, revoked_at: string): void {
+  async tokens_revoke_by_user(user_id: number, revoked_at: string): Promise<void> {
     this.db
       .prepare("update api_tokens set revoked_at = coalesce(revoked_at, ?) where user_id = ?")
       .run(revoked_at, user_id);
   }
 
-  tokens_touch_last_used(id: number, when: string): void {
-    // §8.5: best-effort, non-transactional. If we're inside a tx, it'll still
-    // get committed with the rest — that's fine, this is a "cheap enough"
-    // update on the hot auth path.
+  async tokens_touch_last_used(id: number, when: string): Promise<void> {
     this.db.prepare("update api_tokens set last_used_at = ? where id = ?").run(when, id);
   }
 }
 
 export const sqliteAdapter: StorageAdapter = {
   scheme: "sqlite",
-  open(config: OpenConfig): Storage {
+  async open(config: OpenConfig): Promise<Storage> {
     const path = parseSqliteUrl(config.database);
     const storage = new SqliteStorage(path);
-    storage.migrate();
+    await storage.migrate();
     return storage;
   },
 };

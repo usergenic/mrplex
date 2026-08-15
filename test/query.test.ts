@@ -17,31 +17,31 @@ let storage: Storage;
 let kernel: Kernel;
 let admin: Actor;
 
-function seedDoc(
+async function seedDoc(
   repoSlug: string,
   path: string,
   frontmatter: Record<string, unknown>,
   body: string,
-): string {
-  const v = kernel.docs.create(admin, repoSlug, path, {
+): Promise<string> {
+  const v = await kernel.docs.create(admin, repoSlug, path, {
     frontmatter,
     body,
   });
   return v.version_id;
 }
 
-beforeEach(() => {
-  storage = sqliteAdapter.open({
+beforeEach(async () => {
+  storage = await sqliteAdapter.open({
     database: `sqlite:${join(tmpdir(), `mrplex-query-${Date.now()}-${Math.random()}.db`)}`,
   });
   kernel = createKernel(storage);
-  const alice = storage.users_create({ slug: "alice", created_at: "2026-08-14T00:00:00Z" });
+  const alice = await storage.users_create({ slug: "alice", created_at: "2026-08-14T00:00:00Z" });
   admin = { user_id: alice.id, admin: true, scopes: [] };
-  storage.repos_create({ slug: "notes", created_at: "2026-08-14T00:00:00Z" });
+  await storage.repos_create({ slug: "notes", created_at: "2026-08-14T00:00:00Z" });
 });
 
-afterEach(() => {
-  storage.close();
+afterEach(async () => {
+  await storage.close();
 });
 
 // -----------------------------------------------------------------------------
@@ -50,9 +50,9 @@ afterEach(() => {
 
 describe("query — filter mode", () => {
   it("returns docs matching a CEL predicate", async () => {
-    seedDoc("notes", "a.md", { status: "draft" }, "");
-    seedDoc("notes", "b.md", { status: "published" }, "");
-    seedDoc("notes", "c.md", { status: "draft" }, "");
+    await seedDoc("notes", "a.md", { status: "draft" }, "");
+    await seedDoc("notes", "b.md", { status: "published" }, "");
+    await seedDoc("notes", "c.md", { status: "draft" }, "");
     const results = await kernel.query(admin, {
       repo: "notes",
       filter: 'status == "draft"',
@@ -61,9 +61,9 @@ describe("query — filter mode", () => {
   });
 
   it("supports the design's §5.1 example — status && list membership", async () => {
-    seedDoc("notes", "one.md", { status: "draft", tags: ["pricing"] }, "");
-    seedDoc("notes", "two.md", { status: "draft", tags: ["other"] }, "");
-    seedDoc("notes", "three.md", { status: "published", tags: ["pricing"] }, "");
+    await seedDoc("notes", "one.md", { status: "draft", tags: ["pricing"] }, "");
+    await seedDoc("notes", "two.md", { status: "draft", tags: ["other"] }, "");
+    await seedDoc("notes", "three.md", { status: "published", tags: ["pricing"] }, "");
     const results = await kernel.query(admin, {
       repo: "notes",
       filter: 'status == "draft" && "pricing" in list(tags)',
@@ -72,8 +72,8 @@ describe("query — filter mode", () => {
   });
 
   it("$path intrinsic", async () => {
-    seedDoc("notes", "drafts/one.md", {}, "");
-    seedDoc("notes", "published/two.md", {}, "");
+    await seedDoc("notes", "drafts/one.md", {}, "");
+    await seedDoc("notes", "published/two.md", {}, "");
     const results = await kernel.query(admin, {
       repo: "notes",
       filter: '$path.startsWith("drafts/")',
@@ -88,17 +88,17 @@ describe("query — filter mode", () => {
 
 describe("query — text mode", () => {
   it("returns docs whose body matches an FTS5 query", async () => {
-    seedDoc("notes", "a.md", {}, "The quick brown fox");
-    seedDoc("notes", "b.md", {}, "Nothing to see here");
-    seedDoc("notes", "c.md", {}, "another quick note");
+    await seedDoc("notes", "a.md", {}, "The quick brown fox");
+    await seedDoc("notes", "b.md", {}, "Nothing to see here");
+    await seedDoc("notes", "c.md", {}, "another quick note");
     const results = await kernel.query(admin, { repo: "notes", text: "quick" });
     expect(results.map((v) => v.path).sort()).toEqual(["a.md", "c.md"]);
   });
 
   it("filter + text compose via AND", async () => {
-    seedDoc("notes", "a.md", { status: "draft" }, "quick brown fox");
-    seedDoc("notes", "b.md", { status: "published" }, "quick brown fox");
-    seedDoc("notes", "c.md", { status: "draft" }, "another topic");
+    await seedDoc("notes", "a.md", { status: "draft" }, "quick brown fox");
+    await seedDoc("notes", "b.md", { status: "published" }, "quick brown fox");
+    await seedDoc("notes", "c.md", { status: "draft" }, "another topic");
     const results = await kernel.query(admin, {
       repo: "notes",
       filter: 'status == "draft"',
@@ -108,7 +108,7 @@ describe("query — text mode", () => {
   });
 
   it("returns [] when the FTS query matches nothing", async () => {
-    seedDoc("notes", "a.md", {}, "just some content");
+    await seedDoc("notes", "a.md", {}, "just some content");
     const results = await kernel.query(admin, { repo: "notes", text: "nonexistent" });
     expect(results).toEqual([]);
   });
@@ -120,25 +120,25 @@ describe("query — text mode", () => {
 
 describe("query — sigil exclusion", () => {
   it("hides hidden-sigil paths by default", async () => {
-    seedDoc("notes", "visible.md", {}, "");
-    seedDoc("notes", ".obsidian/config.md", {}, "");
+    await seedDoc("notes", "visible.md", {}, "");
+    await seedDoc("notes", ".obsidian/config.md", {}, "");
     const results = await kernel.query(admin, { repo: "notes" });
     expect(results.map((v) => v.path)).toEqual(["visible.md"]);
   });
 
   it("include_hidden surfaces .-prefixed paths", async () => {
-    seedDoc("notes", "visible.md", {}, "");
-    seedDoc("notes", ".obsidian/config.md", {}, "");
+    await seedDoc("notes", "visible.md", {}, "");
+    await seedDoc("notes", ".obsidian/config.md", {}, "");
     const results = await kernel.query(admin, { repo: "notes", include_hidden: true });
     expect(results.map((v) => v.path).sort()).toEqual([".obsidian/config.md", "visible.md"]);
   });
 
   it("hides system-sigil paths (trashed docs) by default", async () => {
-    const v = kernel.docs.create(admin, "notes", "hello.md", {
+    const v = await kernel.docs.create(admin, "notes", "hello.md", {
       frontmatter: {},
       body: "hi\n",
     });
-    kernel.docs.delete(admin, "notes", v.version_id);
+    await kernel.docs.delete(admin, "notes", v.version_id);
     // Now :deleted/hello-v1.md is in the corpus; default query hides it.
     const results = await kernel.query(admin, { repo: "notes" });
     expect(results).toEqual([]);
@@ -155,9 +155,9 @@ describe("query — sigil exclusion", () => {
 
 describe("query — scope filter (§8.2)", () => {
   it("silently drops rows outside a non-admin's read globs", async () => {
-    seedDoc("notes", "public.md", {}, "");
-    seedDoc("notes", "secret/hidden.md", {}, "");
-    const repoRow = storage.repos_by_slug("notes");
+    await seedDoc("notes", "public.md", {}, "");
+    await seedDoc("notes", "secret/hidden.md", {}, "");
+    const repoRow = await storage.repos_by_slug("notes");
     if (!repoRow) throw new Error("seed");
     const scoped: Actor = {
       user_id: admin.user_id,
@@ -169,17 +169,17 @@ describe("query — scope filter (§8.2)", () => {
   });
 
   it("admins bypass scope", async () => {
-    seedDoc("notes", "a.md", {}, "");
-    seedDoc("notes", "b.md", {}, "");
+    await seedDoc("notes", "a.md", {}, "");
+    await seedDoc("notes", "b.md", {}, "");
     const results = await kernel.query(admin, { repo: "notes" });
     expect(results.map((v) => v.path).sort()).toEqual(["a.md", "b.md"]);
   });
 
   it("scope filter honors ! negation with last-match-wins semantics", async () => {
-    seedDoc("notes", "drafts/one.md", {}, "");
-    seedDoc("notes", "drafts/pinned/two.md", {}, "");
-    seedDoc("notes", "drafts/three.md", {}, "");
-    const repoRow = storage.repos_by_slug("notes");
+    await seedDoc("notes", "drafts/one.md", {}, "");
+    await seedDoc("notes", "drafts/pinned/two.md", {}, "");
+    await seedDoc("notes", "drafts/three.md", {}, "");
+    const repoRow = await storage.repos_by_slug("notes");
     if (!repoRow) throw new Error("seed");
     const scoped: Actor = {
       user_id: admin.user_id,
@@ -195,9 +195,9 @@ describe("query — scope filter (§8.2)", () => {
     // not 5 minus scope drops. The pre-fix implementation would overfetch
     // and slice, silently returning fewer than 5 when out-of-scope rows
     // dominated the top of the created_at ordering.
-    for (let i = 0; i < 10; i++) seedDoc("notes", `out/${i}.md`, {}, "");
-    for (let i = 0; i < 10; i++) seedDoc("notes", `in/${i}.md`, {}, "");
-    const repoRow = storage.repos_by_slug("notes");
+    for (let i = 0; i < 10; i++) await seedDoc("notes", `out/${i}.md`, {}, "");
+    for (let i = 0; i < 10; i++) await seedDoc("notes", `in/${i}.md`, {}, "");
+    const repoRow = await storage.repos_by_slug("notes");
     if (!repoRow) throw new Error("seed");
     const scoped: Actor = {
       user_id: admin.user_id,
@@ -217,15 +217,15 @@ describe("query — scope filter (§8.2)", () => {
 describe("query — per-repo sigil exclusion", () => {
   it("respects per-repo hidden_sigils override", async () => {
     // Second repo overrides hidden_sigils to include "_" too.
-    storage.repos_create({
+    await storage.repos_create({
       slug: "custom",
       created_at: "2026-08-14T00:00:01Z",
     });
-    kernel.repos.set_path_config(admin, "custom", {
+    await kernel.repos.set_path_config(admin, "custom", {
       hidden_sigils: [".", "_"],
     });
-    seedDoc("notes", "_notes_hidden_by_custom_only.md", {}, "");
-    seedDoc("custom", "_hidden_in_custom.md", {}, "");
+    await seedDoc("notes", "_notes_hidden_by_custom_only.md", {}, "");
+    await seedDoc("custom", "_hidden_in_custom.md", {}, "");
     // On notes (server default hidden=["."]), the _-prefixed file is NOT
     // hidden. On custom (override hidden=[".","_"]), it IS hidden.
     const notesResults = await kernel.query(admin, { repo: "notes" });
@@ -241,11 +241,11 @@ describe("query — per-repo sigil exclusion", () => {
 
 describe("query — multi-repo", () => {
   it("resolves a repo glob to multiple repos", async () => {
-    storage.repos_create({ slug: "team-alpha", created_at: "2026-08-14T00:00:01Z" });
-    storage.repos_create({ slug: "team-beta", created_at: "2026-08-14T00:00:02Z" });
-    seedDoc("team-alpha", "one.md", { pinned: true }, "");
-    seedDoc("team-beta", "two.md", { pinned: true }, "");
-    seedDoc("notes", "three.md", { pinned: true }, "");
+    await storage.repos_create({ slug: "team-alpha", created_at: "2026-08-14T00:00:01Z" });
+    await storage.repos_create({ slug: "team-beta", created_at: "2026-08-14T00:00:02Z" });
+    await seedDoc("team-alpha", "one.md", { pinned: true }, "");
+    await seedDoc("team-beta", "two.md", { pinned: true }, "");
+    await seedDoc("notes", "three.md", { pinned: true }, "");
     const results = await kernel.query(admin, {
       repo: "team-*",
       filter: "pinned == true",
@@ -257,9 +257,9 @@ describe("query — multi-repo", () => {
   });
 
   it("omitted repo = every repo the caller can address", async () => {
-    storage.repos_create({ slug: "other", created_at: "2026-08-14T00:00:01Z" });
-    seedDoc("notes", "n1.md", {}, "unique1");
-    seedDoc("other", "o1.md", {}, "unique1");
+    await storage.repos_create({ slug: "other", created_at: "2026-08-14T00:00:01Z" });
+    await seedDoc("notes", "n1.md", {}, "unique1");
+    await seedDoc("other", "o1.md", {}, "unique1");
     const results = await kernel.query(admin, { text: "unique1" });
     expect(results.map((v) => v.repo).sort()).toEqual(["notes", "other"]);
   });
@@ -272,23 +272,23 @@ describe("query — multi-repo", () => {
 describe("query — ordering + limit", () => {
   it("orders by $created_at desc when no text", async () => {
     // Create in order — created_at increments per docs.create call.
-    const v1 = seedDoc("notes", "a.md", {}, "");
-    const v2 = seedDoc("notes", "b.md", {}, "");
-    const v3 = seedDoc("notes", "c.md", {}, "");
+    const v1 = await seedDoc("notes", "a.md", {}, "");
+    const v2 = await seedDoc("notes", "b.md", {}, "");
+    const v3 = await seedDoc("notes", "c.md", {}, "");
     const results = await kernel.query(admin, { repo: "notes" });
     expect(results.map((v) => v.version_id)).toEqual([v3, v2, v1]);
   });
 
   it("respects limit", async () => {
-    seedDoc("notes", "a.md", {}, "");
-    seedDoc("notes", "b.md", {}, "");
-    seedDoc("notes", "c.md", {}, "");
+    await seedDoc("notes", "a.md", {}, "");
+    await seedDoc("notes", "b.md", {}, "");
+    await seedDoc("notes", "c.md", {}, "");
     const results = await kernel.query(admin, { repo: "notes", limit: 2 });
     expect(results).toHaveLength(2);
   });
 
   it("limit=0 returns []", async () => {
-    seedDoc("notes", "a.md", {}, "");
+    await seedDoc("notes", "a.md", {}, "");
     expect(await kernel.query(admin, { repo: "notes", limit: 0 })).toEqual([]);
   });
 });
@@ -375,7 +375,7 @@ describe("query — validation", () => {
   });
 
   it("SYSTEM_ACTOR is trusted end-to-end", async () => {
-    seedDoc("notes", "a.md", {}, "");
+    await seedDoc("notes", "a.md", {}, "");
     const results = await kernel.query(SYSTEM_ACTOR, { repo: "notes" });
     expect(results.map((v) => v.path)).toEqual(["a.md"]);
   });

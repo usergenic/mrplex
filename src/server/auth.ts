@@ -34,8 +34,8 @@ export function extractBearerFromHeader(headerValue: string | undefined): string
  * Resolve a bearer secret to an Actor, or throw `unauthorized`.
  * Wraps kernel/auth/tokens.resolveActor with kernel-error semantics.
  */
-export function resolveBearerActor(secret: string, storage: Storage): Actor {
-  const actor = resolveActor(secret, storage);
+export async function resolveBearerActor(secret: string, storage: Storage): Promise<Actor> {
+  const actor = await resolveActor(secret, storage);
   if (!actor) throw new KernelError("unauthorized", {});
   return actor;
 }
@@ -44,7 +44,7 @@ export function resolveBearerActor(secret: string, storage: Storage): Actor {
  * Extract-and-resolve in one call, from a Node IncomingMessage. Throws
  * `unauthorized` on missing header or unknown/revoked/expired token.
  */
-export function actorFromRequest(req: IncomingMessage, storage: Storage): Actor {
+export async function actorFromRequest(req: IncomingMessage, storage: Storage): Promise<Actor> {
   const secret = extractBearerFromHeader(req.headers.authorization);
   if (secret === null) throw new KernelError("unauthorized", {});
   return resolveBearerActor(secret, storage);

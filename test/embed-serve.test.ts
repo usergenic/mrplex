@@ -56,7 +56,7 @@ describe("serve + embed worker (end-to-end)", () => {
 
   it("writes queued by kernel are embedded by the running worker", async () => {
     // Bootstrap a fresh db.
-    const { token } = bootstrap(`sqlite:${tmpDb}`);
+    const { token } = await bootstrap(`sqlite:${tmpDb}`);
 
     // Start stub embedder.
     const stubPort = await ephemeralPort();
@@ -98,11 +98,11 @@ describe("serve + embed worker (end-to-end)", () => {
     expect([200, 201]).toContain(putRes.status);
 
     // Poll the storage until the backlog is empty (worker has drained it).
-    const storage = sqliteAdapter.open({ database: `sqlite:${tmpDb}` });
+    const storage = await sqliteAdapter.open({ database: `sqlite:${tmpDb}` });
     try {
       const deadline = Date.now() + 5000;
       while (Date.now() < deadline) {
-        const status = storage.backlog_status(new Date().toISOString());
+        const status = await storage.backlog_status(new Date().toISOString());
         if (status.pending === 0) {
           const models = status.models;
           expect(models.length).toBe(1);
@@ -114,7 +114,7 @@ describe("serve + embed worker (end-to-end)", () => {
       }
       throw new Error("worker did not drain backlog in time");
     } finally {
-      storage.close();
+      await storage.close();
     }
   }, 15000);
 
@@ -124,7 +124,7 @@ describe("serve + embed worker (end-to-end)", () => {
     // with the stub embedder in --stdio mode, verify a REST-driven
     // write drains through it, then close serve and check the child
     // process is no longer running.
-    const { token } = bootstrap(`sqlite:${tmpDb}`);
+    const { token } = await bootstrap(`sqlite:${tmpDb}`);
     const port = await ephemeralPort();
     const handle = await startServer({
       database: `sqlite:${tmpDb}`,
@@ -152,12 +152,12 @@ describe("serve + embed worker (end-to-end)", () => {
     });
 
     // Poll for drain.
-    const storage = sqliteAdapter.open({ database: `sqlite:${tmpDb}` });
+    const storage = await sqliteAdapter.open({ database: `sqlite:${tmpDb}` });
     let drained = false;
     try {
       const deadline = Date.now() + 5000;
       while (Date.now() < deadline) {
-        const status = storage.backlog_status(new Date().toISOString());
+        const status = await storage.backlog_status(new Date().toISOString());
         if (status.pending === 0) {
           expect(status.models[0]?.model).toBe("stub-embedder-8d");
           drained = true;
@@ -166,7 +166,7 @@ describe("serve + embed worker (end-to-end)", () => {
         await new Promise((r) => setTimeout(r, 100));
       }
     } finally {
-      storage.close();
+      await storage.close();
     }
     expect(drained).toBe(true);
 
@@ -192,7 +192,7 @@ describe("serve + embed worker (end-to-end)", () => {
   }, 20000);
 
   it("hookless serve idles worker, still enqueues backlog", async () => {
-    const { token } = bootstrap(`sqlite:${tmpDb}`);
+    const { token } = await bootstrap(`sqlite:${tmpDb}`);
     const port = await ephemeralPort();
     const handle = await startServer({
       database: `sqlite:${tmpDb}`,
@@ -217,13 +217,13 @@ describe("serve + embed worker (end-to-end)", () => {
     });
 
     // Backlog row exists (unconditional enqueue), worker isn't running.
-    const storage = sqliteAdapter.open({ database: `sqlite:${tmpDb}` });
+    const storage = await sqliteAdapter.open({ database: `sqlite:${tmpDb}` });
     try {
-      const status = storage.backlog_status(new Date().toISOString());
+      const status = await storage.backlog_status(new Date().toISOString());
       expect(status.pending).toBeGreaterThan(0);
       expect(status.models.length).toBe(0); // no chunks written yet
     } finally {
-      storage.close();
+      await storage.close();
     }
   }, 15000);
 });

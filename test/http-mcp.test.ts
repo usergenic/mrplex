@@ -30,7 +30,7 @@ async function connectClient(): Promise<Client> {
 beforeEach(async () => {
   workDir = mkdtempSync(join(tmpdir(), "mrplex-mcp-"));
   const dbUrl = `sqlite:${join(workDir, "test.db")}`;
-  const b = bootstrap(dbUrl);
+  const b = await bootstrap(dbUrl);
   token = b.token;
   handle = await startServer({ database: dbUrl, port: 0, log: () => {} });
   client = await connectClient();

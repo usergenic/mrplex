@@ -72,47 +72,38 @@ export function createWorker(opts: WorkerOptions): Worker {
   let currentIteration: Promise<void> | null = null;
 
   async function processOne(entry: BacklogRow): Promise<"processed" | "failed" | "skipped"> {
-    const version = opts.storage.version_by_id(entry.version_id);
+    const version = await opts.storage.version_by_id(entry.version_id);
     if (!version) {
       // Version was deleted (impossible in v1) — clear the row.
-      opts.storage.backlog_delete(entry.version_id);
+      await opts.storage.backlog_delete(entry.version_id);
       return "skipped";
     }
     if (version.next_id !== null) {
       // Superseded — the successor enqueued its own entry (§5.3).
-      opts.storage.backlog_delete(entry.version_id);
+      await opts.storage.backlog_delete(entry.version_id);
       return "skipped";
     }
     const chunks = chunkBody(version.body);
     if (chunks.length === 0) {
-      // Empty body: legal state, no embedding needed. Wipe any prior
-      // chunks so a doc edited FROM non-empty TO empty doesn't leave
-      // stale vectors that keep it rankable (Copilot #2).
-      // chunks_upsert with an empty list is a documented "delete all"
-      // for the version (see storage-sqlite/adapter.ts). Model string
-      // is unused on the empty path but required by the signature.
-      opts.storage.chunks_upsert(entry.version_id, "", []);
-      opts.storage.backlog_delete(entry.version_id);
+      await opts.storage.chunks_upsert(entry.version_id, "", []);
+      await opts.storage.backlog_delete(entry.version_id);
       return "processed";
     }
 
-    // 1. Dedup lookup: check which hashes we already have vectors for
-    //    under the model the prior version was embedded under. If the
-    //    prior version was under a different model than the hook is
-    //    about to return, we throw the reuse away below.
-    const priorChunks = version.prev_id ? opts.storage.chunks_by_version(version.prev_id) : [];
+    // 1. Dedup lookup.
+    const priorChunks = version.prev_id
+      ? await opts.storage.chunks_by_version(version.prev_id)
+      : [];
     const priorModel = priorChunks[0]?.model ?? null;
 
     // Build the reuse map — hash → embedding — scoped to prior model.
-    const reuseByHash = new Map<string, Buffer>();
+    const reuseByHash = new Map<string, Float32Array>();
     if (priorModel !== null) {
       const hashes = chunks.map((c) => c.text_hash);
-      const rows = opts.storage.chunks_by_hash(priorModel, hashes);
+      const rows = await opts.storage.chunks_by_hash(priorModel, hashes);
       for (const r of rows) reuseByHash.set(r.text_hash, r.embedding);
     }
 
-    // Which chunk indexes still need the hook? Compute once; we may
-    // rebuild it after a model-change re-embed below.
     let needHookIx: number[] = [];
     for (let i = 0; i < chunks.length; i++) {
       const c = chunks[i];
@@ -120,11 +111,10 @@ export function createWorker(opts: WorkerOptions): Worker {
       if (!reuseByHash.has(c.text_hash)) needHookIx.push(i);
     }
 
-    // Guard: helper for backoff-retain. Local closure so we can call it
-    // from both hook-call paths without duplicating the arithmetic.
-    const retain = (err: unknown, attempts: number) => {
+    // Guard: helper for backoff-retain.
+    const retain = async (err: unknown, attempts: number) => {
       const delay = Math.min(baseMs * 2 ** (attempts - 1), capMs);
-      opts.storage.backlog_retain({
+      await opts.storage.backlog_retain({
         version_id: entry.version_id,
         attempts,
         last_error: String(err instanceof Error ? err.message : err).slice(0, 500),
@@ -140,7 +130,7 @@ export function createWorker(opts: WorkerOptions): Worker {
       try {
         resp = await opts.hook.embed(texts);
       } catch (err) {
-        retain(err, entry.attempts + 1);
+        await retain(err, entry.attempts + 1);
         return "failed";
       }
     }
@@ -164,7 +154,7 @@ export function createWorker(opts: WorkerOptions): Worker {
       try {
         resp = await opts.hook.embed(texts);
       } catch (err) {
-        retain(err, entry.attempts + 1);
+        await retain(err, entry.attempts + 1);
         return "failed";
       }
     }
@@ -173,9 +163,7 @@ export function createWorker(opts: WorkerOptions): Worker {
     // path) the prior model applies.
     const model = resp?.model ?? priorModel;
     if (model === null) {
-      // Unreachable — needHookIx.length > 0 when priorModel is null, so
-      // resp would be set. Defensive.
-      retain(new Error("internal: no model resolvable for chunks"), entry.attempts + 1);
+      await retain(new Error("internal: no model resolvable for chunks"), entry.attempts + 1);
       return "failed";
     }
 
@@ -189,7 +177,7 @@ export function createWorker(opts: WorkerOptions): Worker {
         const i = needHookIx[j] as number;
         const vec = resp.vectors[j];
         if (!vec) {
-          retain(new Error("internal: response vector missing"), entry.attempts + 1);
+          await retain(new Error("internal: response vector missing"), entry.attempts + 1);
           return "failed";
         }
         vectorByIx.set(i, vec);
@@ -203,7 +191,6 @@ export function createWorker(opts: WorkerOptions): Worker {
       }
       const reused = effectiveReuse.get(c.text_hash);
       if (!reused) {
-        // Defensive — every chunk should be covered by fresh OR reuse.
         throw new Error(
           `worker: internal — chunk ${i} of version ${entry.version_id} has no vector`,
         );
@@ -212,18 +199,18 @@ export function createWorker(opts: WorkerOptions): Worker {
     });
 
     try {
-      opts.storage.chunks_upsert(entry.version_id, model, upsertChunks);
-      opts.storage.backlog_delete(entry.version_id);
+      await opts.storage.chunks_upsert(entry.version_id, model, upsertChunks);
+      await opts.storage.backlog_delete(entry.version_id);
       return "processed";
     } catch (err) {
-      retain(err, entry.attempts + 1);
+      await retain(err, entry.attempts + 1);
       return "failed";
     }
   }
 
   async function drainOnce() {
     const now = new Date().toISOString();
-    const due = opts.storage.backlog_dequeue(now, batchSize);
+    const due = await opts.storage.backlog_dequeue(now, batchSize);
     let processed = 0;
     let failed = 0;
     let skipped = 0;

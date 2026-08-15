@@ -18,9 +18,9 @@
  * the kernel wraps them in the main query.
  */
 
-import { KernelError } from "../errors.js";
-import { type CelExpr, unwrapConstant, unwrapListHint } from "./ast.js";
-import { INTRINSIC_PREFIX } from "./cel-parse.js";
+import { KernelError } from "../kernel/errors.js";
+import { type CelExpr, unwrapConstant, unwrapListHint } from "../kernel/query/ast.js";
+import { INTRINSIC_PREFIX } from "../kernel/query/cel-parse.js";
 
 // -----------------------------------------------------------------------------
 // Public compiler surface

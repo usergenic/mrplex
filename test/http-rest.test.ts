@@ -31,7 +31,7 @@ async function readJson<T = Record<string, unknown>>(r: Response): Promise<T> {
 beforeEach(async () => {
   workDir = mkdtempSync(join(tmpdir(), "mrplex-rest-"));
   const dbUrl = `sqlite:${join(workDir, "test.db")}`;
-  const b = bootstrap(dbUrl);
+  const b = await bootstrap(dbUrl);
   token = b.token;
   handle = await startServer({ database: dbUrl, port: 0, log: () => {} });
   base = handle.baseUrl;

@@ -693,6 +693,7 @@ Adapters are contracted to be **semantically identical** on the wire. Every lega
 | Frontmatter index quality | **May differ.** | PG uses one GIN on `frontmatter` for arbitrary containment; SQLite indexes specific expression paths and scans for the list branch. Same rows, different plans. |
 | FTS result set | **Identical bag of documents.** | Any doc that matches on one engine matches on the other. |
 | FTS ranking / scoring | **May differ.** | SQLite BM25 vs. PG `ts_rank`; stemming and language config are backend-shaped. Ordering within the result set is not portable. |
+| FTS query syntax | **Adapter-owned.** | SQLite FTS5 MATCH vs. PG `websearch_to_tsquery`. Portable subset that clients can rely on across engines: bare terms and quoted phrases. Boolean operators and per-column filters are engine-specific. |
 | Vector search recall | **Identical at small scale.** | Both engines return the same top-k for small corpora. |
 | Vector search at scale | **May differ.** | pgvector offers HNSW / IVFFlat with tuning knobs; sqlite-vec is brute-force in v1. Recall converges; latency does not. |
 | Auth, scopes, error catalog | **Identical.** | Backend-independent. |
@@ -706,52 +707,77 @@ An adapter implements one interface, exposed to the kernel. The methods below ar
 
 ```types
 StorageAdapter = {
+  // Every method is async — SQLite adapter resolves on the next
+  // microtask, Postgres adapter awaits real I/O. Kernel is async
+  // uniformly (m5-plan WS1).
+
   // Lifecycle
-  open(config)                                              → Storage
-  close()                                                   → void
-  migrate()                                                 → void      // idempotent; brings schema to current version
+  open(config)                                              → Promise<Storage>
+  close()                                                   → Promise<void>
+  migrate()                                                 → Promise<void>  // idempotent; brings schema to current version
 
   // Transactions
-  tx(fn: (Tx) => T)                                         → T         // serializable-or-equivalent; nested tx = savepoint or flatten
+  tx(fn: () => Promise<T>)                                  → Promise<T>
+  // serializable-or-equivalent; nested tx = savepoint. Contract: never
+  // await foreign I/O inside `fn` — the tx body may replay on retry
+  // (PG REPEATABLE READ), so only storage calls are safe.
 
   // Slug-space (users, repos)
-  users_list() / users_create(slug) / users_rename(id, slug) / users_by_slug(slug)
-  repos_list() / repos_create(slug) / repos_rename(id, slug) / repos_by_slug(slug)
+  users_list() / users_create(slug) / users_rename(id, slug) / users_by_slug(slug) / users_by_id(id)
+  repos_list() / repos_create(slug) / repos_rename(id, slug) /
+  repos_set_path_config(id, cfg) / repos_by_slug(slug) / repos_by_id(id)
 
   // Document identity
-  document_create(repo_id)                                  → document_id
+  documents_create(repo_id)                                 → Promise<{ id, repo_id }>
 
   // Version chain (the hot path — must be atomic per §4)
   version_insert({
     document_id, repo_id, prev_id, path, frontmatter_raw, frontmatter, body,
     author_id, created_at
-  })                                                        → version_id
+  })                                                        → Promise<VersionRow>
   // Contract: inside one tx, insert the new version AND set prev.next_id = new.id.
   // Must enforce the two partial indexes from §3.2 at the storage layer, not application code.
 
-  version_by_id(id)                                         → Version | null
-  version_current(repo_id, path)                            → Version | null   // via the partial-index on (repo_id, path) where next_id is null
-  version_history(document_id, limit, before?)              → Version[]
+  version_by_id(id)                                         → Promise<VersionRow | null>
+  version_current(repo_id, path)                            → Promise<VersionRow | null>
+  version_history(document_id, opts?)                       → Promise<VersionRow[]>
+  versions_live_by_repo(repo_id)                            → Promise<VersionRow[]>
 
-  // Query — the one place adapters may differ in perf but not in semantics
-  query({
-    repo_ids, filter_ast, text?, rank?, path_globs, limit
-  })                                                        → Version[]
-  // filter_ast is CEL, compiled by the kernel; the adapter translates to its dialect.
-  // path_globs come from the caller's read scope (§8.2) — enforced here, not above.
+  // Query — kernel emits no SQL; it hands over a structured SearchPlan
+  // and the adapter compiles it to dialect-specific SQL (m5-plan WS2).
+  versions_search(plan: {
+    repo_ids, limit, text?, filter_ast?, sigils, scope, candidate_ids?
+  })                                                        → Promise<VersionRow[]>
+  // filter_ast is parsed CEL (invalid input fails eagerly with
+  // filter_invalid). sigils is a per-repo-group NOT-LIKE list. scope is
+  // one of { allow_all | deny_all | groups }.
 
-  // Full-text (current versions only — indexing a version evicts the document's previous entry)
-  fts_index(version_id, body)                               → void
-  fts_search(repo_ids, query)                               → { version_id, score }[]
+  // Full-text (current versions only — filtered at query time via
+  // versions.next_id IS NULL, not by dropping old rows)
+  fts_index(version_id, body)                               → Promise<void>
+  // No fts_search — versions_search takes plan.text and dispatches
+  // engine-native FTS internally (FTS5 MATCH / websearch_to_tsquery).
 
-  // Vector
-  chunks_upsert(version_id, chunks: { ix, text, text_hash, model, embedding }[]) → void
-  vector_search(repo_ids, embedding, k)                     → { version_id, chunk_ix, score }[]   // hits from current versions only
+  // Vector — embeddings cross the interface as Float32Array
+  chunks_upsert(version_id, model, chunks: { ix, text, text_hash, model, embedding }[]) → Promise<void>
+  chunks_by_hash(model, text_hashes[])                      → Promise<{ text_hash, embedding: Float32Array }[]>
+  chunks_by_version(version_id)                             → Promise<ChunkRow[]>
+  vector_search(repo_ids, model, embedding, k)              → Promise<{ version_id, chunk_ix, score }[]>
+  // Current-versions only. Brute-force in v1 (both adapters); indexed
+  // ANN for pgvector is a fast-follow.
+
+  // Backlog
+  backlog_enqueue(version_id) / backlog_dequeue(now, limit) /
+  backlog_retain(input) / backlog_delete(version_id) /
+  backlog_status(now)
 
   // Tokens
-  tokens_list(user_id) / tokens_by_hash(hash) /
-  tokens_create({ user_id, secret_hash, label, admin, scopes, expires_at }) /
-  tokens_revoke(id) / tokens_touch_last_used(id)
+  tokens_list(user_id) / tokens_by_hash(hash) / tokens_by_id(id) /
+  tokens_create({ user_id, secret_hash, label, admin: boolean, scopes, expires_at }) /
+  tokens_revoke(id, revoked_at) / tokens_revoke_by_user(user_id, revoked_at) /
+  tokens_touch_last_used(id, when)
+  // admin is a native boolean; adapters translate to their engine's
+  // representation (SQLite 0/1, PG native).
 }
 ```
 
@@ -994,6 +1020,16 @@ Log of shape-defining decisions and their rationale. Newer decisions supersede o
 - **Search indexes cover current versions only (§5.1).** FTS eviction on write; `rank` over current chunks. Historical search rides with the deferred time machine (§11).
 - **Graph features deferred, designed as a derived index (§11.2).** Links extract into a rebuildable table binding to `document_id`, so backlinks and traversal survive renames; nothing in the v1 schema blocks retrofitting via backfill.
 - **CEL engine is `@bufbuild/cel` (TypeScript-native) (§7.1).** M2 ships the AST→SQL compiler on top of `@bufbuild/cel`, which emits the canonical protobuf `ParsedExpr` AST (same shape `cel-go` emits) — so the compiler is portable across parsers. The `$` intrinsic marker is admitted via a string-aware preprocessor rather than a grammar change. Supersedes both "`cel-js` or a hand-rolled parser" AND the previous "`cel-go` compiled to WASM" pin; the latter was chosen for spec-exact semantics, which `@bufbuild/cel` also meets (Buf uses it as the CEL runtime for `protovalidate-es`). If M5's Postgres adapter surfaces semantic divergence later, swapping the parser is one file — the compiler doesn't change.
+- **Storage and kernel are async, uniformly (M5, §7.2).** Every `Storage` method returns `Promise<T>`; `tx()` takes `() => Promise<T>`. SQLite resolves on the next microtask (better-sqlite3 is sync internally); Postgres awaits real I/O. Contract: tx bodies never await foreign I/O — the PG adapter retries on 40001/40P01 and the SQLite adapter holds the connection lock. Supersedes M0–M4's sync Storage.
+- **`versions_search` receives a `SearchPlan`, not SQL (M5, §7.2).** Kernel parses CEL eagerly (surfaces `filter_invalid` before the adapter), builds sigil-exclusion groups, flattens read scopes into globs, and hands over a plain object. Adapters compile the plan to their dialect. Kernel imports nothing from `storage-*`; adapters own their SQL.
+- **FTS query syntax is adapter-owned; parity is a portable subset (M5, §5.1, §7.2).** SQLite → FTS5 MATCH; Postgres → `websearch_to_tsquery` (never throws on user input). Cross-adapter clients get bare terms and quoted phrases. Boolean operators / column-scoped queries are engine-specific.
+- **Vector column is dimensionless; brute-force in v1 (M5, §7.2).** Both adapters run brute-force top-k (SQLite `vec_distance_cosine`, PG `<=>`). Indexed ANN (pgvector HNSW / IVFFlat) is a fast-follow.
+- **Embeddings cross the interface as `Float32Array` (M5, §7.2).** The engine-specific byte layout stays private to each adapter (SQLite LE float32 BLOB; PG pgvector literal). Fresh callers may pass `readonly number[]`; reuse callers pass the `Float32Array` they got back.
+- **Postgres schema (M5, §3.2).** `bigserial` ids, `text` timestamps (byte-exact parity with SQLite), `jsonb` + a single GIN over `frontmatter` (§5.2 — `= '"v"'::jsonb OR @> '["v"]'::jsonb`), native `boolean admin`, two partial unique indexes verbatim, `tsvector` generated column + GIN maintained automatically. Vector column via `create extension if not exists vector`.
+- **PG isolation: REPEATABLE READ + retry×3 (M5, §7.2).** `tx()` runs at `REPEATABLE READ`, retries with jitter on SQLSTATE `40001` / `40P01` (design's stated qualifying recipe). Nested tx via savepoints. Same-connection routing via `AsyncLocalStorage<PoolClient>`.
+- **`pg` driver (M5).** Chosen over `postgres.js`: plain parameterized-query API matches the compiled SQL, pure JS, ubiquitous. int8 is parsed to JS `number` with a `Number.isSafeInteger` guard so id drift is loud.
+- **PG migrations: `schema_migrations` + `pg_advisory_xact_lock` (M5).** Forward-only, idempotent, lock-safe under parallel invocation.
+- **SKIP LOCKED deferred (M5).** The v1 single-worker embedding backlog stands; concurrent workers with row leasing is a post-v1 topic.
 
 Remaining `[OPEN]` markers throughout the doc are narrower questions (query cacheability, expression-index tuning, pagination cursors, resource caps, etc.) that don't gate the v1 shape.
 
@@ -1004,7 +1040,7 @@ Remaining `[OPEN]` markers throughout the doc are narrower questions (query cach
 - **M2 — Query.** CEL filter (`@bufbuild/cel`, §7.1) + FTS; `kernel.query` end-to-end; CLI `query` command.
 - **M3 — HTTP surfaces.** MCP server at `/mcp` (Streamable HTTP; optional STDIO transport, startup-gated); REST surface (`GET` / `PUT` / `DELETE` / `MOVE`, `If-Match` / `If-None-Match`, content negotiation, `/versions` / `/history` routes). CLI gains `--server` flag to target a remote instance over MCP. `docs.diff` deferred to M4.
 - **M4 — Semantic.** Chunking + embeddings + vector search. Also picks up `docs.diff`, deferred from M3: the kernel op (§6.1), `/diff` route (§6.3), `docs_diff` tool (§6.2), CLI `docs diff` (§7.3).
-- **M5 — Postgres backend.**
+- **M5 — Postgres backend.** Ships the second v1 storage adapter and (as a one-time break) three seam refactors the parity contract required: async `Storage` and kernel (SQLite `tx()` keeps `begin immediate`; PG uses `REPEATABLE READ` + retry on 40001/40P01); structured `SearchPlan` handed to `versions_search` (kernel emits no SQL; adapters compile the plan into their dialect); `Float32Array` embeddings in the shared type (SQLite's byte-order BLOB is private to `storage-sqlite/vec.ts`). `pg` driver, `pgvector` for vectors (brute-force in M5; indexed ANN is a fast-follow), `websearch_to_tsquery` for the portable FTS subset (bare terms + quoted phrases), `jsonb` + a single GIN for the frontmatter compile path.
 
 ## 11. Future work (post-v1)
 

@@ -44,10 +44,10 @@ function fakeHook(dim = 4): { hook: EmbedHook; calls: string[][]; setFail: (b: b
   };
 }
 
-function bootstrap(storage: Storage) {
+async function bootstrap(storage: Storage) {
   const now = new Date().toISOString();
-  const u = storage.users_create({ slug: "alice", created_at: now });
-  const r = storage.repos_create({ slug: "notes", created_at: now });
+  const u = await storage.users_create({ slug: "alice", created_at: now });
+  const r = await storage.repos_create({ slug: "notes", created_at: now });
   const actor = { user_id: u.id, admin: true, scopes: [] } as {
     user_id: number;
     admin: true;
@@ -58,24 +58,24 @@ function bootstrap(storage: Storage) {
 
 describe("worker: end-to-end", () => {
   it("drains the backlog and writes chunks with vectors", async () => {
-    const s = sqliteAdapter.open({ database: "sqlite::memory:" });
-    const { repo, actor } = bootstrap(s);
+    const s = await sqliteAdapter.open({ database: "sqlite::memory:" });
+    const { repo, actor } = await bootstrap(s);
     const { hook, calls } = fakeHook();
     const worker = createWorker({ storage: s, hook, batchSize: 4 });
     const kernel = createKernel({
       storage: s,
       onVersionCommitted: (id) => s.backlog_enqueue(id),
     });
-    const v = kernel.docs.create(actor, repo.slug, "a.md", {
+    const v = await kernel.docs.create(actor, repo.slug, "a.md", {
       body: "hello world\n\n# section\n\nmore text",
       frontmatter_raw: "",
     });
     const versionId = decodeVersionId(v.version_id);
     // Backlog should have one row.
-    expect(s.backlog_dequeue(new Date().toISOString(), 10).length).toBe(1);
+    expect((await s.backlog_dequeue(new Date().toISOString(), 10)).length).toBe(1);
     await worker.drainOnce();
-    expect(s.backlog_dequeue(new Date().toISOString(), 10).length).toBe(0);
-    const chunks = s.chunks_by_version(versionId);
+    expect((await s.backlog_dequeue(new Date().toISOString(), 10)).length).toBe(0);
+    const chunks = await s.chunks_by_version(versionId);
     expect(chunks.length).toBe(chunkBody(v.body).length);
     expect(calls.length).toBe(1); // one hook call, all chunks in it
     for (const c of chunks) {
@@ -85,8 +85,8 @@ describe("worker: end-to-end", () => {
   });
 
   it("dedup: editing one chunk only re-embeds the touched chunk", async () => {
-    const s = sqliteAdapter.open({ database: "sqlite::memory:" });
-    const { repo, actor } = bootstrap(s);
+    const s = await sqliteAdapter.open({ database: "sqlite::memory:" });
+    const { repo, actor } = await bootstrap(s);
     const { hook, calls } = fakeHook();
     const worker = createWorker({ storage: s, hook });
     const kernel = createKernel({
@@ -94,7 +94,7 @@ describe("worker: end-to-end", () => {
       onVersionCommitted: (id) => s.backlog_enqueue(id),
     });
     const body1 = "block one\n\nblock two\n\nblock three";
-    const v1 = kernel.docs.create(actor, repo.slug, "a.md", {
+    const v1 = await kernel.docs.create(actor, repo.slug, "a.md", {
       body: body1,
       frontmatter_raw: "",
     });
@@ -104,7 +104,7 @@ describe("worker: end-to-end", () => {
 
     // Rewrite touching only "block two".
     const body2 = "block one\n\nblock CHANGED\n\nblock three";
-    kernel.docs.put(actor, repo.slug, v1.version_id, "a.md", {
+    await kernel.docs.put(actor, repo.slug, v1.version_id, "a.md", {
       body: body2,
       frontmatter_raw: "",
     });
@@ -120,8 +120,8 @@ describe("worker: end-to-end", () => {
   });
 
   it("dedup: rewriting the body with same content = zero hook calls", async () => {
-    const s = sqliteAdapter.open({ database: "sqlite::memory:" });
-    const { repo, actor } = bootstrap(s);
+    const s = await sqliteAdapter.open({ database: "sqlite::memory:" });
+    const { repo, actor } = await bootstrap(s);
     const { hook, calls } = fakeHook();
     const worker = createWorker({ storage: s, hook });
     const kernel = createKernel({
@@ -129,11 +129,11 @@ describe("worker: end-to-end", () => {
       onVersionCommitted: (id) => s.backlog_enqueue(id),
     });
     const body = "hello\n\nworld";
-    const v1 = kernel.docs.create(actor, repo.slug, "a.md", { body, frontmatter_raw: "" });
+    const v1 = await kernel.docs.create(actor, repo.slug, "a.md", { body, frontmatter_raw: "" });
     await worker.drainOnce();
     expect(calls.length).toBe(1);
     // Same body, different frontmatter — chunk text unchanged.
-    kernel.docs.put(actor, repo.slug, v1.version_id, "a.md", {
+    await kernel.docs.put(actor, repo.slug, v1.version_id, "a.md", {
       body,
       frontmatter_raw: "status: draft\n",
     });
@@ -142,20 +142,20 @@ describe("worker: end-to-end", () => {
   });
 
   it("burst dedup: N rapid writes collapse to one embed (current-only)", async () => {
-    const s = sqliteAdapter.open({ database: "sqlite::memory:" });
-    const { repo, actor } = bootstrap(s);
+    const s = await sqliteAdapter.open({ database: "sqlite::memory:" });
+    const { repo, actor } = await bootstrap(s);
     const { hook, calls } = fakeHook();
     const worker = createWorker({ storage: s, hook });
     const kernel = createKernel({
       storage: s,
       onVersionCommitted: (id) => s.backlog_enqueue(id),
     });
-    let prev = kernel.docs.create(actor, repo.slug, "a.md", {
+    let prev = await kernel.docs.create(actor, repo.slug, "a.md", {
       body: "v0",
       frontmatter_raw: "",
     });
     for (let i = 1; i < 5; i++) {
-      prev = kernel.docs.put(actor, repo.slug, prev.version_id, "a.md", {
+      prev = await kernel.docs.put(actor, repo.slug, prev.version_id, "a.md", {
         body: `v${i}`,
         frontmatter_raw: "",
       });
@@ -184,8 +184,8 @@ describe("worker: end-to-end", () => {
     const bodyV1 = `${A}\n\n${B}`;
     const bodyV2 = `${A}\n\n${C}`;
 
-    const s = sqliteAdapter.open({ database: "sqlite::memory:" });
-    const { repo, actor } = bootstrap(s);
+    const s = await sqliteAdapter.open({ database: "sqlite::memory:" });
+    const { repo, actor } = await bootstrap(s);
     let model = "model-a";
     const calls: { model: string; count: number }[] = [];
     const hook: EmbedHook = {
@@ -204,7 +204,7 @@ describe("worker: end-to-end", () => {
       storage: s,
       onVersionCommitted: (id) => s.backlog_enqueue(id),
     });
-    const v1 = kernel.docs.create(actor, repo.slug, "a.md", {
+    const v1 = await kernel.docs.create(actor, repo.slug, "a.md", {
       body: bodyV1,
       frontmatter_raw: "",
     });
@@ -216,7 +216,7 @@ describe("worker: end-to-end", () => {
     // Swap the model behind the hook. v2 keeps chunk A (reuse-eligible
     // under model-a) but changes B → C (forces a hook call).
     model = "model-b";
-    kernel.docs.put(actor, repo.slug, v1.version_id, "a.md", {
+    await kernel.docs.put(actor, repo.slug, v1.version_id, "a.md", {
       body: bodyV2,
       frontmatter_raw: "",
     });
@@ -226,12 +226,12 @@ describe("worker: end-to-end", () => {
     // writes them under model-b.
     await worker.drainOnce();
 
-    expect(s.backlog_dequeue(new Date().toISOString(), 10).length).toBe(0);
+    expect((await s.backlog_dequeue(new Date().toISOString(), 10)).length).toBe(0);
     const numericId = Number.parseInt(
-      kernel.docs.get(actor, repo.slug, "a.md").version_id.replace(/^v/, ""),
+      (await kernel.docs.get(actor, repo.slug, "a.md")).version_id.replace(/^v/, ""),
       10,
     );
-    const finalChunks = s.chunks_by_version(numericId);
+    const finalChunks = await s.chunks_by_version(numericId);
     expect(finalChunks.length).toBe(2);
     for (const c of finalChunks) expect(c.model).toBe("model-b");
     // Two hook calls total: the first for the new chunk (C), the second
@@ -245,36 +245,36 @@ describe("worker: end-to-end", () => {
     // A doc edited from non-empty to empty must not leave stale
     // vectors — otherwise it stays rankable despite having no
     // chunkable content.
-    const s = sqliteAdapter.open({ database: "sqlite::memory:" });
-    const { repo, actor } = bootstrap(s);
+    const s = await sqliteAdapter.open({ database: "sqlite::memory:" });
+    const { repo, actor } = await bootstrap(s);
     const { hook } = fakeHook();
     const worker = createWorker({ storage: s, hook });
     const kernel = createKernel({
       storage: s,
       onVersionCommitted: (id) => s.backlog_enqueue(id),
     });
-    const v1 = kernel.docs.create(actor, repo.slug, "a.md", {
+    const v1 = await kernel.docs.create(actor, repo.slug, "a.md", {
       body: "hello world",
       frontmatter_raw: "",
     });
     await worker.drainOnce();
     const idBefore = Number.parseInt(v1.version_id.replace(/^v/, ""), 10);
-    expect(s.chunks_by_version(idBefore).length).toBeGreaterThan(0);
+    expect((await s.chunks_by_version(idBefore)).length).toBeGreaterThan(0);
 
-    const v2 = kernel.docs.put(actor, repo.slug, v1.version_id, "a.md", {
+    const v2 = await kernel.docs.put(actor, repo.slug, v1.version_id, "a.md", {
       body: "",
       frontmatter_raw: "",
     });
     await worker.drainOnce();
     const idAfter = Number.parseInt(v2.version_id.replace(/^v/, ""), 10);
-    expect(s.chunks_by_version(idAfter).length).toBe(0);
+    expect((await s.chunks_by_version(idAfter)).length).toBe(0);
     // And the backlog was cleared.
-    expect(s.backlog_dequeue(new Date().toISOString(), 10).length).toBe(0);
+    expect((await s.backlog_dequeue(new Date().toISOString(), 10)).length).toBe(0);
   });
 
   it("hook failure retains the entry with exponential backoff", async () => {
-    const s = sqliteAdapter.open({ database: "sqlite::memory:" });
-    const { repo, actor } = bootstrap(s);
+    const s = await sqliteAdapter.open({ database: "sqlite::memory:" });
+    const { repo, actor } = await bootstrap(s);
     const { hook, calls, setFail } = fakeHook();
     const worker = createWorker({
       storage: s,
@@ -286,7 +286,7 @@ describe("worker: end-to-end", () => {
       storage: s,
       onVersionCommitted: (id) => s.backlog_enqueue(id),
     });
-    kernel.docs.create(actor, repo.slug, "a.md", {
+    await kernel.docs.create(actor, repo.slug, "a.md", {
       body: "hello",
       frontmatter_raw: "",
     });
@@ -295,11 +295,11 @@ describe("worker: end-to-end", () => {
     expect(calls.length).toBe(1);
     // Not due now.
     const now = new Date().toISOString();
-    const due = s.backlog_dequeue(now, 10);
+    const due = await s.backlog_dequeue(now, 10);
     expect(due.length).toBe(0);
     // Due in the future.
     const later = new Date(Date.now() + 60_000).toISOString();
-    const dueLater = s.backlog_dequeue(later, 10);
+    const dueLater = await s.backlog_dequeue(later, 10);
     expect(dueLater.length).toBe(1);
     expect(dueLater[0]?.attempts).toBe(1);
     expect(dueLater[0]?.last_error).toContain("hook down");
@@ -308,14 +308,14 @@ describe("worker: end-to-end", () => {
     // Advance time in a synthetic way: drainOnce reads `now` internally,
     // and we want it to see the future. Retain with a past next_retry_at
     // manually to make it due.
-    s.backlog_retain({
+    await s.backlog_retain({
       version_id: dueLater[0]?.version_id as number,
       attempts: 1,
       last_error: "hook down",
       next_retry_at: new Date(Date.now() - 1000).toISOString(),
     });
     await worker.drainOnce();
-    expect(s.backlog_dequeue(new Date().toISOString(), 10).length).toBe(0);
+    expect((await s.backlog_dequeue(new Date().toISOString(), 10)).length).toBe(0);
   });
 });
 

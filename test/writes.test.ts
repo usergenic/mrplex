@@ -19,24 +19,24 @@ let storage: Storage;
 let kernel: Kernel;
 let actor: Actor;
 
-function fresh(): Storage {
+async function fresh(): Promise<Storage> {
   return sqliteAdapter.open({
     database: `sqlite:${join(tmpdir(), `mrplex-writes-${Date.now()}-${Math.random()}.db`)}`,
   });
 }
 
-beforeEach(() => {
-  storage = fresh();
+beforeEach(async () => {
+  storage = await fresh();
   kernel = createKernel(storage);
   // Seed a user + a repo; the kernel doesn't have create-user yet (WS7), so
   // reach into the adapter. WS7 will replace this with kernel calls.
-  const alice = storage.users_create({ slug: "alice", created_at: "2026-08-14T00:00:00Z" });
-  storage.repos_create({ slug: "notes", created_at: "2026-08-14T00:00:01Z" });
+  const alice = await storage.users_create({ slug: "alice", created_at: "2026-08-14T00:00:00Z" });
+  await storage.repos_create({ slug: "notes", created_at: "2026-08-14T00:00:01Z" });
   actor = { user_id: alice.id, admin: true, scopes: [] };
 });
 
-afterEach(() => {
-  storage.close();
+afterEach(async () => {
+  await storage.close();
 });
 
 // -----------------------------------------------------------------------------
@@ -44,8 +44,8 @@ afterEach(() => {
 // -----------------------------------------------------------------------------
 
 describe("docs.create", () => {
-  it("creates a new document from raw frontmatter", () => {
-    const v = kernel.docs.create(actor, "notes", "hello.md", {
+  it("creates a new document from raw frontmatter", async () => {
+    const v = await kernel.docs.create(actor, "notes", "hello.md", {
       frontmatter_raw: "title: Hi\n",
       body: "body\n",
     });
@@ -59,8 +59,8 @@ describe("docs.create", () => {
     expect(v.author.user).toBe("alice");
   });
 
-  it("creates from structured frontmatter, serializing to canonical YAML", () => {
-    const v = kernel.docs.create(actor, "notes", "hello.md", {
+  it("creates from structured frontmatter, serializing to canonical YAML", async () => {
+    const v = await kernel.docs.create(actor, "notes", "hello.md", {
       frontmatter: { title: "Hi", tags: ["a", "b"] },
       body: "b\n",
     });
@@ -71,17 +71,17 @@ describe("docs.create", () => {
     expect(v.frontmatter_raw).toMatch(/tags/);
   });
 
-  it("empty-frontmatter body is fine — frontmatter_raw becomes ''", () => {
-    const v = kernel.docs.create(actor, "notes", "readme.md", {
+  it("empty-frontmatter body is fine — frontmatter_raw becomes ''", async () => {
+    const v = await kernel.docs.create(actor, "notes", "readme.md", {
       frontmatter: {},
       body: "hi\n",
     });
     expect(v.frontmatter_raw).toBe("");
   });
 
-  it("rejects supplying both frontmatter forms → frontmatter_invalid", () => {
+  it("rejects supplying both frontmatter forms → frontmatter_invalid", async () => {
     try {
-      kernel.docs.create(actor, "notes", "hello.md", {
+      await kernel.docs.create(actor, "notes", "hello.md", {
         frontmatter: { a: 1 },
         frontmatter_raw: "a: 1\n",
         body: "",
@@ -92,18 +92,18 @@ describe("docs.create", () => {
     }
   });
 
-  it("rejects supplying neither frontmatter form → frontmatter_invalid", () => {
+  it("rejects supplying neither frontmatter form → frontmatter_invalid", async () => {
     try {
-      kernel.docs.create(actor, "notes", "hello.md", { body: "b\n" } as never);
+      await kernel.docs.create(actor, "notes", "hello.md", { body: "b\n" } as never);
       throw new Error("expected throw");
     } catch (err) {
       expect((err as KernelError).code).toBe("frontmatter_invalid");
     }
   });
 
-  it("rejects malformed raw YAML → frontmatter_invalid", () => {
+  it("rejects malformed raw YAML → frontmatter_invalid", async () => {
     try {
-      kernel.docs.create(actor, "notes", "hello.md", {
+      await kernel.docs.create(actor, "notes", "hello.md", {
         frontmatter_raw: "title: [unclosed",
         body: "b\n",
       });
@@ -113,9 +113,9 @@ describe("docs.create", () => {
     }
   });
 
-  it("rejects invalid paths → path_invalid", () => {
+  it("rejects invalid paths → path_invalid", async () => {
     try {
-      kernel.docs.create(actor, "notes", ":deleted/nope.md", {
+      await kernel.docs.create(actor, "notes", ":deleted/nope.md", {
         frontmatter_raw: "",
         body: "",
       });
@@ -125,13 +125,13 @@ describe("docs.create", () => {
     }
   });
 
-  it("rejects duplicate path → create_conflict with current_version_id", () => {
-    const first = kernel.docs.create(actor, "notes", "hello.md", {
+  it("rejects duplicate path → create_conflict with current_version_id", async () => {
+    const first = await kernel.docs.create(actor, "notes", "hello.md", {
       frontmatter_raw: "",
       body: "one\n",
     });
     try {
-      kernel.docs.create(actor, "notes", "hello.md", {
+      await kernel.docs.create(actor, "notes", "hello.md", {
         frontmatter_raw: "",
         body: "two\n",
       });
@@ -156,9 +156,9 @@ describe("docs.put", () => {
     });
   }
 
-  it("in-place update advances the chain and preserves document identity", () => {
-    const v1 = makeDoc();
-    const v2 = kernel.docs.put(actor, "notes", v1.version_id, "hello.md", {
+  it("in-place update advances the chain and preserves document identity", async () => {
+    const v1 = await makeDoc();
+    const v2 = await kernel.docs.put(actor, "notes", v1.version_id, "hello.md", {
       body: "two\n",
     });
     expect(v2.path).toBe("hello.md");
@@ -169,40 +169,40 @@ describe("docs.put", () => {
     expect(v2.frontmatter_raw).toBe("title: Hi\n");
   });
 
-  it("caller can override frontmatter without touching body", () => {
-    const v1 = makeDoc();
-    const v2 = kernel.docs.put(actor, "notes", v1.version_id, "hello.md", {
+  it("caller can override frontmatter without touching body", async () => {
+    const v1 = await makeDoc();
+    const v2 = await kernel.docs.put(actor, "notes", v1.version_id, "hello.md", {
       frontmatter_raw: "title: Renamed\n",
     });
     expect(v2.frontmatter).toEqual({ title: "Renamed" });
     expect(v2.body).toBe("one\n"); // body carried over
   });
 
-  it("move advances the chain AND changes the path in one operation", () => {
-    const v1 = makeDoc("hello.md");
-    const v2 = kernel.docs.put(actor, "notes", v1.version_id, "greetings/hi.md", {});
+  it("move advances the chain AND changes the path in one operation", async () => {
+    const v1 = await makeDoc("hello.md");
+    const v2 = await kernel.docs.put(actor, "notes", v1.version_id, "greetings/hi.md", {});
     expect(v2.path).toBe("greetings/hi.md");
     expect(v2.prev_version_id).toBe(v1.version_id);
     // Same document — history has both.
-    const history = kernel.docs.history(actor, "notes", "greetings/hi.md");
+    const history = await kernel.docs.history(actor, "notes", "greetings/hi.md");
     expect(history.map((h) => h.body)).toEqual(["one\n", "one\n"]);
   });
 
-  it("move + content change in one call", () => {
-    const v1 = makeDoc();
-    const v2 = kernel.docs.put(actor, "notes", v1.version_id, "moved.md", {
+  it("move + content change in one call", async () => {
+    const v1 = await makeDoc();
+    const v2 = await kernel.docs.put(actor, "notes", v1.version_id, "moved.md", {
       body: "moved and edited\n",
     });
     expect(v2.path).toBe("moved.md");
     expect(v2.body).toBe("moved and edited\n");
   });
 
-  it("stale prev → stale_prev with current_version_id and current_path", () => {
-    const v1 = makeDoc();
-    kernel.docs.put(actor, "notes", v1.version_id, "hello.md", { body: "two\n" });
+  it("stale prev → stale_prev with current_version_id and current_path", async () => {
+    const v1 = await makeDoc();
+    await kernel.docs.put(actor, "notes", v1.version_id, "hello.md", { body: "two\n" });
     // v1 is now stale.
     try {
-      kernel.docs.put(actor, "notes", v1.version_id, "hello.md", { body: "three\n" });
+      await kernel.docs.put(actor, "notes", v1.version_id, "hello.md", { body: "three\n" });
       throw new Error("expected throw");
     } catch (err) {
       const ke = err as KernelError<{
@@ -217,35 +217,35 @@ describe("docs.put", () => {
     }
   });
 
-  it("moving into a path occupied by ANOTHER doc → path_taken", () => {
-    const a = kernel.docs.create(actor, "notes", "a.md", {
+  it("moving into a path occupied by ANOTHER doc → path_taken", async () => {
+    const a = await kernel.docs.create(actor, "notes", "a.md", {
       frontmatter_raw: "",
       body: "a\n",
     });
-    kernel.docs.create(actor, "notes", "b.md", {
+    await kernel.docs.create(actor, "notes", "b.md", {
       frontmatter_raw: "",
       body: "b\n",
     });
     try {
-      kernel.docs.put(actor, "notes", a.version_id, "b.md", {});
+      await kernel.docs.put(actor, "notes", a.version_id, "b.md", {});
       throw new Error("expected throw");
     } catch (err) {
       expect((err as KernelError).code).toBe("path_taken");
     }
   });
 
-  it("unknown prev → version_not_found", () => {
+  it("unknown prev → version_not_found", async () => {
     try {
-      kernel.docs.put(actor, "notes", "v99999", "hello.md", {});
+      await kernel.docs.put(actor, "notes", "v99999", "hello.md", {});
       throw new Error("expected throw");
     } catch (err) {
       expect((err as KernelError).code).toBe("version_not_found");
     }
   });
 
-  it("malformed prev → version_not_found", () => {
+  it("malformed prev → version_not_found", async () => {
     try {
-      kernel.docs.put(actor, "notes", "notavalidid", "hello.md", {});
+      await kernel.docs.put(actor, "notes", "notavalidid", "hello.md", {});
       throw new Error("expected throw");
     } catch (err) {
       expect((err as KernelError).code).toBe("version_not_found");
@@ -258,24 +258,24 @@ describe("docs.put", () => {
 // -----------------------------------------------------------------------------
 
 describe("docs.delete", () => {
-  it("moves the document to the system-namespace path", () => {
-    const v1 = kernel.docs.create(actor, "notes", "hello.md", {
+  it("moves the document to the system-namespace path", async () => {
+    const v1 = await kernel.docs.create(actor, "notes", "hello.md", {
       frontmatter_raw: "",
       body: "hi\n",
     });
-    const deleted = kernel.docs.delete(actor, "notes", v1.version_id);
+    const deleted = await kernel.docs.delete(actor, "notes", v1.version_id);
     expect(deleted.path).toBe(`:deleted/hello-${v1.version_id}.md`);
     expect(deleted.prev_version_id).toBe(v1.version_id);
   });
 
-  it("frees the original path for a new document to take", () => {
-    const v1 = kernel.docs.create(actor, "notes", "hello.md", {
+  it("frees the original path for a new document to take", async () => {
+    const v1 = await kernel.docs.create(actor, "notes", "hello.md", {
       frontmatter_raw: "",
       body: "one\n",
     });
-    kernel.docs.delete(actor, "notes", v1.version_id);
+    await kernel.docs.delete(actor, "notes", v1.version_id);
     // New doc at the freed path — fresh document identity.
-    const v2 = kernel.docs.create(actor, "notes", "hello.md", {
+    const v2 = await kernel.docs.create(actor, "notes", "hello.md", {
       frontmatter_raw: "",
       body: "fresh\n",
     });
@@ -283,34 +283,34 @@ describe("docs.delete", () => {
     expect(v2.prev_version_id).toBeNull(); // NEW document, not a restore
   });
 
-  it("deleting an ALREADY-deleted document is a no-op", () => {
-    const v1 = kernel.docs.create(actor, "notes", "hello.md", {
+  it("deleting an ALREADY-deleted document is a no-op", async () => {
+    const v1 = await kernel.docs.create(actor, "notes", "hello.md", {
       frontmatter_raw: "",
       body: "hi\n",
     });
-    const deleted = kernel.docs.delete(actor, "notes", v1.version_id);
+    const deleted = await kernel.docs.delete(actor, "notes", v1.version_id);
     // Calling delete with the deleted-version id: no state change, current
     // version returned.
-    const again = kernel.docs.delete(actor, "notes", deleted.version_id);
+    const again = await kernel.docs.delete(actor, "notes", deleted.version_id);
     expect(again.version_id).toBe(deleted.version_id);
     expect(again.path).toBe(deleted.path);
   });
 
-  it("delete with a STALE trashed-version prev → stale_prev (not no-op)", () => {
+  it("delete with a STALE trashed-version prev → stale_prev (not no-op)", async () => {
     // Cycle: create → delete → restore → delete-again. Now call delete with
     // the FIRST trashed version — it's system-namespaced but no longer
     // current. Must fail stale_prev, not be treated as an already-deleted
     // no-op.
-    const v1 = kernel.docs.create(actor, "notes", "hello.md", {
+    const v1 = await kernel.docs.create(actor, "notes", "hello.md", {
       frontmatter_raw: "",
       body: "one\n",
     });
-    const trashed1 = kernel.docs.delete(actor, "notes", v1.version_id);
-    const restored = kernel.docs.put(actor, "notes", trashed1.version_id, "hello.md", {});
-    const trashed2 = kernel.docs.delete(actor, "notes", restored.version_id);
+    const trashed1 = await kernel.docs.delete(actor, "notes", v1.version_id);
+    const restored = await kernel.docs.put(actor, "notes", trashed1.version_id, "hello.md", {});
+    const trashed2 = await kernel.docs.delete(actor, "notes", restored.version_id);
     // trashed1 is a system-namespaced prev, but no longer current.
     try {
-      kernel.docs.delete(actor, "notes", trashed1.version_id);
+      await kernel.docs.delete(actor, "notes", trashed1.version_id);
       throw new Error("expected stale_prev");
     } catch (err) {
       expect((err as KernelError).code).toBe("stale_prev");
@@ -319,16 +319,16 @@ describe("docs.delete", () => {
     }
   });
 
-  it("restore: docs.put from a trashed prev back to a user-territory path", () => {
-    const v1 = kernel.docs.create(actor, "notes", "hello.md", {
+  it("restore: docs.put from a trashed prev back to a user-territory path", async () => {
+    const v1 = await kernel.docs.create(actor, "notes", "hello.md", {
       frontmatter_raw: "",
       body: "hi\n",
     });
-    const trashed = kernel.docs.delete(actor, "notes", v1.version_id);
-    const restored = kernel.docs.put(actor, "notes", trashed.version_id, "hello.md", {});
+    const trashed = await kernel.docs.delete(actor, "notes", v1.version_id);
+    const restored = await kernel.docs.put(actor, "notes", trashed.version_id, "hello.md", {});
     // Same document — history is one continuous chain (v1 → trashed → restored).
     expect(restored.path).toBe("hello.md");
-    const history = kernel.docs.history(actor, "notes", "hello.md");
+    const history = await kernel.docs.history(actor, "notes", "hello.md");
     expect(history).toHaveLength(3);
     expect(history[0]?.path).toBe("hello.md");
     expect(history[1]?.path).toMatch(/^:deleted\//);
@@ -344,11 +344,11 @@ describe("auth-shaped writes (non-admin actor)", () => {
   let alice: Actor;
   let repoId: number;
 
-  beforeEach(() => {
-    const row = storage.repos_by_slug("notes");
+  beforeEach(async () => {
+    const row = await storage.repos_by_slug("notes");
     if (!row) throw new Error("seed");
     repoId = row.id;
-    const u = storage.users_by_slug("alice");
+    const u = await storage.users_by_slug("alice");
     if (!u) throw new Error("seed");
     alice = {
       user_id: u.id,
@@ -357,17 +357,17 @@ describe("auth-shaped writes (non-admin actor)", () => {
     };
   });
 
-  it("write-in-scope: creating under inbox/ succeeds", () => {
-    const v = kernel.docs.create(alice, "notes", "inbox/incoming.md", {
+  it("write-in-scope: creating under inbox/ succeeds", async () => {
+    const v = await kernel.docs.create(alice, "notes", "inbox/incoming.md", {
       frontmatter_raw: "",
       body: "in\n",
     });
     expect(v.path).toBe("inbox/incoming.md");
   });
 
-  it("write-out-of-scope: create at a path the token doesn't cover → forbidden", () => {
+  it("write-out-of-scope: create at a path the token doesn't cover → forbidden", async () => {
     try {
-      kernel.docs.create(alice, "notes", "elsewhere.md", {
+      await kernel.docs.create(alice, "notes", "elsewhere.md", {
         frontmatter_raw: "",
         body: "",
       });
@@ -377,23 +377,23 @@ describe("auth-shaped writes (non-admin actor)", () => {
     }
   });
 
-  it("delete via carve-out: user can delete a doc they can write, without needing write on :deleted/…", () => {
-    const v = kernel.docs.create(alice, "notes", "inbox/x.md", {
+  it("delete via carve-out: user can delete a doc they can write, without needing write on :deleted/…", async () => {
+    const v = await kernel.docs.create(alice, "notes", "inbox/x.md", {
       frontmatter_raw: "",
       body: "",
     });
-    expect(() => kernel.docs.delete(alice, "notes", v.version_id)).not.toThrow();
+    await expect(kernel.docs.delete(alice, "notes", v.version_id)).resolves.toBeDefined();
   });
 
-  it("delete when the source path is out of write scope → forbidden", () => {
+  it("delete when the source path is out of write scope → forbidden", async () => {
     // Create as admin, then attempt delete as alice — alice has write only
     // under inbox/, but the doc is at elsewhere.md.
-    const v = kernel.docs.create(actor, "notes", "elsewhere.md", {
+    const v = await kernel.docs.create(actor, "notes", "elsewhere.md", {
       frontmatter_raw: "",
       body: "",
     });
     try {
-      kernel.docs.delete(alice, "notes", v.version_id);
+      await kernel.docs.delete(alice, "notes", v.version_id);
       throw new Error("expected throw");
     } catch (err) {
       expect((err as KernelError).code).toBe("forbidden");

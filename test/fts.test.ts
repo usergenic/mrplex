@@ -27,39 +27,38 @@ let otherRepo: RepoRow;
 const NOW = "2026-08-14T00:00:00Z";
 const LATER = "2026-08-14T00:00:01Z";
 
-function fresh(): Storage {
+async function fresh(): Promise<Storage> {
   const path = join(tmpdir(), `mrplex-fts-${Date.now()}-${Math.random()}.db`);
   return sqliteAdapter.open({ database: `sqlite:${path}` });
 }
 
 /** Search-and-return ids via the same versions_search path kernel.query uses. */
-function ftsIds(repoIds: readonly number[], text: string): number[] {
-  return storage
-    .versions_search({
-      repo_ids: repoIds,
-      where_sql: "",
-      where_params: [],
-      text,
-      limit: 100,
-    })
-    .map((v) => v.id);
+async function ftsIds(repoIds: readonly number[], text: string): Promise<number[]> {
+  const rows = await storage.versions_search({
+    repo_ids: repoIds,
+    limit: 100,
+    text,
+    sigils: [],
+    scope: { kind: "allow_all" },
+  });
+  return rows.map((v) => v.id);
 }
 
-beforeEach(() => {
-  storage = fresh();
-  user = storage.users_create({ slug: "alice", created_at: NOW });
-  repo = storage.repos_create({ slug: "notes", created_at: NOW });
-  otherRepo = storage.repos_create({ slug: "other", created_at: NOW });
+beforeEach(async () => {
+  storage = await fresh();
+  user = await storage.users_create({ slug: "alice", created_at: NOW });
+  repo = await storage.repos_create({ slug: "notes", created_at: NOW });
+  otherRepo = await storage.repos_create({ slug: "other", created_at: NOW });
 });
 
-afterEach(() => {
-  storage.close();
+afterEach(async () => {
+  await storage.close();
 });
 
 describe("fts trigger sync with version_insert", () => {
-  it("indexes a new version's body via AFTER INSERT trigger", () => {
-    const doc = storage.documents_create(repo.id);
-    const v = storage.version_insert({
+  it("indexes a new version's body via AFTER INSERT trigger", async () => {
+    const doc = await storage.documents_create(repo.id);
+    const v = await storage.version_insert({
       document_id: doc.id,
       repo_id: repo.id,
       prev_id: null,
@@ -70,12 +69,12 @@ describe("fts trigger sync with version_insert", () => {
       author_id: user.id,
       created_at: NOW,
     });
-    expect(ftsIds([repo.id], "quick")).toEqual([v.id]);
+    expect(await ftsIds([repo.id], "quick")).toEqual([v.id]);
   });
 
-  it("indexes every version — the three-statement dance doesn't double-insert or drop", () => {
-    const doc = storage.documents_create(repo.id);
-    const v1 = storage.version_insert({
+  it("indexes every version — the three-statement dance doesn't double-insert or drop", async () => {
+    const doc = await storage.documents_create(repo.id);
+    const v1 = await storage.version_insert({
       document_id: doc.id,
       repo_id: repo.id,
       prev_id: null,
@@ -86,7 +85,7 @@ describe("fts trigger sync with version_insert", () => {
       author_id: user.id,
       created_at: NOW,
     });
-    const v2 = storage.version_insert({
+    const v2 = await storage.version_insert({
       document_id: doc.id,
       repo_id: repo.id,
       prev_id: v1.id,
@@ -99,14 +98,14 @@ describe("fts trigger sync with version_insert", () => {
     });
     // Searching for apple returns only v2 — v1 also contains "apple" but is
     // superseded (next_id set).
-    expect(ftsIds([repo.id], "apple")).toEqual([v2.id]);
+    expect(await ftsIds([repo.id], "apple")).toEqual([v2.id]);
   });
 });
 
 describe("versions_search — FTS branch, current-only filter", () => {
-  it("skips versions whose next_id is not null", () => {
-    const doc = storage.documents_create(repo.id);
-    const v1 = storage.version_insert({
+  it("skips versions whose next_id is not null", async () => {
+    const doc = await storage.documents_create(repo.id);
+    const v1 = await storage.version_insert({
       document_id: doc.id,
       repo_id: repo.id,
       prev_id: null,
@@ -117,7 +116,7 @@ describe("versions_search — FTS branch, current-only filter", () => {
       author_id: user.id,
       created_at: NOW,
     });
-    storage.version_insert({
+    await storage.version_insert({
       document_id: doc.id,
       repo_id: repo.id,
       prev_id: v1.id,
@@ -128,13 +127,13 @@ describe("versions_search — FTS branch, current-only filter", () => {
       author_id: user.id,
       created_at: LATER,
     });
-    expect(ftsIds([repo.id], "uniquetokenv1")).toEqual([]);
+    expect(await ftsIds([repo.id], "uniquetokenv1")).toEqual([]);
   });
 
-  it("restricts to the given repo set", () => {
-    const docA = storage.documents_create(repo.id);
-    const docB = storage.documents_create(otherRepo.id);
-    storage.version_insert({
+  it("restricts to the given repo set", async () => {
+    const docA = await storage.documents_create(repo.id);
+    const docB = await storage.documents_create(otherRepo.id);
+    await storage.version_insert({
       document_id: docA.id,
       repo_id: repo.id,
       prev_id: null,
@@ -145,7 +144,7 @@ describe("versions_search — FTS branch, current-only filter", () => {
       author_id: user.id,
       created_at: NOW,
     });
-    storage.version_insert({
+    await storage.version_insert({
       document_id: docB.id,
       repo_id: otherRepo.id,
       prev_id: null,
@@ -156,14 +155,14 @@ describe("versions_search — FTS branch, current-only filter", () => {
       author_id: user.id,
       created_at: LATER,
     });
-    expect(ftsIds([repo.id], "sharedterm")).toHaveLength(1);
-    expect(ftsIds([otherRepo.id], "sharedterm")).toHaveLength(1);
-    expect(ftsIds([repo.id, otherRepo.id], "sharedterm")).toHaveLength(2);
+    expect(await ftsIds([repo.id], "sharedterm")).toHaveLength(1);
+    expect(await ftsIds([otherRepo.id], "sharedterm")).toHaveLength(1);
+    expect(await ftsIds([repo.id, otherRepo.id], "sharedterm")).toHaveLength(2);
   });
 
-  it("returns [] for an empty repo set", () => {
-    const doc = storage.documents_create(repo.id);
-    storage.version_insert({
+  it("returns [] for an empty repo set", async () => {
+    const doc = await storage.documents_create(repo.id);
+    await storage.version_insert({
       document_id: doc.id,
       repo_id: repo.id,
       prev_id: null,
@@ -174,12 +173,12 @@ describe("versions_search — FTS branch, current-only filter", () => {
       author_id: user.id,
       created_at: NOW,
     });
-    expect(ftsIds([], "anything")).toEqual([]);
+    expect(await ftsIds([], "anything")).toEqual([]);
   });
 
-  it("returns [] for a MATCH that hits nothing", () => {
-    const doc = storage.documents_create(repo.id);
-    storage.version_insert({
+  it("returns [] for a MATCH that hits nothing", async () => {
+    const doc = await storage.documents_create(repo.id);
+    await storage.version_insert({
       document_id: doc.id,
       repo_id: repo.id,
       prev_id: null,
@@ -190,15 +189,15 @@ describe("versions_search — FTS branch, current-only filter", () => {
       author_id: user.id,
       created_at: NOW,
     });
-    expect(ftsIds([repo.id], "nonexistentterm")).toEqual([]);
+    expect(await ftsIds([repo.id], "nonexistentterm")).toEqual([]);
   });
 });
 
 describe("versions_search — FTS ranking + query syntax", () => {
-  it("returns rows ordered by BM25 — best first", () => {
-    const doc1 = storage.documents_create(repo.id);
-    const doc2 = storage.documents_create(repo.id);
-    storage.version_insert({
+  it("returns rows ordered by BM25 — best first", async () => {
+    const doc1 = await storage.documents_create(repo.id);
+    const doc2 = await storage.documents_create(repo.id);
+    await storage.version_insert({
       document_id: doc1.id,
       repo_id: repo.id,
       prev_id: null,
@@ -209,7 +208,7 @@ describe("versions_search — FTS ranking + query syntax", () => {
       author_id: user.id,
       created_at: NOW,
     });
-    const v2 = storage.version_insert({
+    const v2 = await storage.version_insert({
       document_id: doc2.id,
       repo_id: repo.id,
       prev_id: null,
@@ -220,16 +219,16 @@ describe("versions_search — FTS ranking + query syntax", () => {
       author_id: user.id,
       created_at: LATER,
     });
-    const ids = ftsIds([repo.id], "pricing");
+    const ids = await ftsIds([repo.id], "pricing");
     expect(ids).toHaveLength(2);
     // The more-relevant doc (v2, 4× pricing) should come first.
     expect(ids[0]).toBe(v2.id);
   });
 
-  it("supports FTS5 boolean operators (OR)", () => {
-    const doc1 = storage.documents_create(repo.id);
-    const doc2 = storage.documents_create(repo.id);
-    storage.version_insert({
+  it("supports FTS5 boolean operators (OR)", async () => {
+    const doc1 = await storage.documents_create(repo.id);
+    const doc2 = await storage.documents_create(repo.id);
+    await storage.version_insert({
       document_id: doc1.id,
       repo_id: repo.id,
       prev_id: null,
@@ -240,7 +239,7 @@ describe("versions_search — FTS ranking + query syntax", () => {
       author_id: user.id,
       created_at: NOW,
     });
-    storage.version_insert({
+    await storage.version_insert({
       document_id: doc2.id,
       repo_id: repo.id,
       prev_id: null,
@@ -251,12 +250,12 @@ describe("versions_search — FTS ranking + query syntax", () => {
       author_id: user.id,
       created_at: LATER,
     });
-    expect(ftsIds([repo.id], "welcome OR pricing")).toHaveLength(2);
+    expect(await ftsIds([repo.id], "welcome OR pricing")).toHaveLength(2);
   });
 
-  it("porter-stemmed English — plurals + verb forms match root", () => {
-    const doc = storage.documents_create(repo.id);
-    storage.version_insert({
+  it("porter-stemmed English — plurals + verb forms match root", async () => {
+    const doc = await storage.documents_create(repo.id);
+    await storage.version_insert({
       document_id: doc.id,
       repo_id: repo.id,
       prev_id: null,
@@ -268,13 +267,13 @@ describe("versions_search — FTS ranking + query syntax", () => {
       created_at: NOW,
     });
     // porter stems: run/running/runs → run; dog/dogs → dog
-    expect(ftsIds([repo.id], "run")).toHaveLength(1);
-    expect(ftsIds([repo.id], "dog")).toHaveLength(1);
+    expect(await ftsIds([repo.id], "run")).toHaveLength(1);
+    expect(await ftsIds([repo.id], "dog")).toHaveLength(1);
   });
 });
 
 describe("fts_index (no-op in SQLite)", () => {
-  it("callable but does nothing (triggers handle it)", () => {
-    expect(() => storage.fts_index(9999, "arbitrary body")).not.toThrow();
+  it("callable but does nothing (triggers handle it)", async () => {
+    await expect(storage.fts_index(9999, "arbitrary body")).resolves.toBeUndefined();
   });
 });

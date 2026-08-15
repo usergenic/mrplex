@@ -56,7 +56,7 @@ beforeEach(async () => {
   workDir = mkdtempSync(join(tmpdir(), "mrplex-cli-remote-"));
   mkdirSync(workDir, { recursive: true });
   dbUrl = `sqlite:${join(workDir, "test.db")}`;
-  const b = bootstrap(dbUrl);
+  const b = await bootstrap(dbUrl);
   rootToken = b.token;
 
   serveProc = spawn(

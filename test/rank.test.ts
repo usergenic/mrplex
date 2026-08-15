@@ -20,7 +20,7 @@ import type { Storage } from "../src/storage/types.js";
 // A tiny 3-dim "corpus" — each doc is embedded as a fixed unit vector so
 // the test is a mechanical assertion about ordering under cosine distance.
 
-function seedWithVectors(
+async function seedWithVectors(
   storage: Storage,
   cases: readonly {
     path: string;
@@ -31,11 +31,11 @@ function seedWithVectors(
 ) {
   const admin = { user_id: 1, admin: true as const, scopes: [] };
   const kernel = createKernel(storage);
-  storage.users_create({ slug: "alice", created_at: "2026-08-14T00:00:00Z" });
-  storage.repos_create({ slug: "notes", created_at: "2026-08-14T00:00:00Z" });
+  await storage.users_create({ slug: "alice", created_at: "2026-08-14T00:00:00Z" });
+  await storage.repos_create({ slug: "notes", created_at: "2026-08-14T00:00:00Z" });
   const ids: { path: string; version_id: number }[] = [];
   for (const c of cases) {
-    const v = kernel.docs.create(admin, "notes", c.path, {
+    const v = await kernel.docs.create(admin, "notes", c.path, {
       body: c.body,
       frontmatter_raw: "",
     });
@@ -55,7 +55,7 @@ function seedWithVectors(
     }));
     // Decode the version_id back to a storage id.
     const numericId = Number.parseInt(v.version_id.replace(/^v/, ""), 10);
-    storage.chunks_upsert(numericId, model, upsertChunks);
+    await storage.chunks_upsert(numericId, model, upsertChunks);
     ids.push({ path: c.path, version_id: numericId });
   }
   return { kernel, admin, ids };
@@ -63,8 +63,8 @@ function seedWithVectors(
 
 describe("query — rank", () => {
   it("rank without a queryEmbed hook → rank_unavailable", async () => {
-    const storage = sqliteAdapter.open({ database: "sqlite::memory:" });
-    const { kernel, admin } = seedWithVectors(storage, [
+    const storage = await sqliteAdapter.open({ database: "sqlite::memory:" });
+    const { kernel, admin } = await seedWithVectors(storage, [
       { path: "a.md", body: "alpha", vector: [1, 0, 0] },
     ]);
     try {
@@ -77,8 +77,8 @@ describe("query — rank", () => {
   });
 
   it("orders docs by cosine distance to the query vector (nearest first)", async () => {
-    const storage = sqliteAdapter.open({ database: "sqlite::memory:" });
-    const { admin } = seedWithVectors(storage, [
+    const storage = await sqliteAdapter.open({ database: "sqlite::memory:" });
+    const { admin } = await seedWithVectors(storage, [
       { path: "x.md", body: "x-axis", vector: [1, 0, 0] },
       { path: "y.md", body: "y-axis", vector: [0, 1, 0] },
       { path: "z.md", body: "z-axis", vector: [0, 0, 1] },
@@ -93,8 +93,8 @@ describe("query — rank", () => {
   });
 
   it("intersects with filter (excluded rows disappear)", async () => {
-    const storage = sqliteAdapter.open({ database: "sqlite::memory:" });
-    const { admin } = seedWithVectors(storage, [
+    const storage = await sqliteAdapter.open({ database: "sqlite::memory:" });
+    const { admin } = await seedWithVectors(storage, [
       { path: "x.md", body: "x-axis", vector: [1, 0, 0] },
       { path: "y.md", body: "y-axis", vector: [0.9, 0.1, 0] },
     ]);
@@ -113,8 +113,8 @@ describe("query — rank", () => {
   });
 
   it("docs without chunks under the queried model are absent from rank", async () => {
-    const storage = sqliteAdapter.open({ database: "sqlite::memory:" });
-    const { admin } = seedWithVectors(storage, [
+    const storage = await sqliteAdapter.open({ database: "sqlite::memory:" });
+    const { admin } = await seedWithVectors(storage, [
       { path: "a.md", body: "alpha", vector: [1, 0, 0], model: "model-a" },
       { path: "b.md", body: "beta", vector: [0, 1, 0], model: "model-b" },
     ]);
@@ -131,22 +131,22 @@ describe("query — rank", () => {
   });
 
   it("system-namespace paths stay hidden from rank by default", async () => {
-    const storage = sqliteAdapter.open({ database: "sqlite::memory:" });
+    const storage = await sqliteAdapter.open({ database: "sqlite::memory:" });
     const kernel = createKernel({
       storage,
       queryEmbed: async () => ({ vector: [1, 0, 0], model: "test-3d", dim: 3 }),
     });
-    storage.users_create({ slug: "alice", created_at: "2026-08-14T00:00:00Z" });
-    storage.repos_create({ slug: "notes", created_at: "2026-08-14T00:00:00Z" });
+    await storage.users_create({ slug: "alice", created_at: "2026-08-14T00:00:00Z" });
+    await storage.repos_create({ slug: "notes", created_at: "2026-08-14T00:00:00Z" });
     const admin = { user_id: 1, admin: true as const, scopes: [] };
-    const v = kernel.docs.create(admin, "notes", "hello.md", {
+    const v = await kernel.docs.create(admin, "notes", "hello.md", {
       body: "hello world",
       frontmatter_raw: "",
     });
     // Embed the doc manually.
     const numericId = Number.parseInt(v.version_id.replace(/^v/, ""), 10);
     const chunks = chunkBody("hello world");
-    storage.chunks_upsert(
+    await storage.chunks_upsert(
       numericId,
       "test-3d",
       chunks.map((c) => ({
@@ -158,11 +158,11 @@ describe("query — rank", () => {
       })),
     );
     // Delete → :deleted/…
-    const deleted = kernel.docs.delete(admin, "notes", v.version_id);
+    const deleted = await kernel.docs.delete(admin, "notes", v.version_id);
     // Embed the deleted version too — otherwise it wouldn't be in the
     // current-versions vector index.
     const deletedId = Number.parseInt(deleted.version_id.replace(/^v/, ""), 10);
-    storage.chunks_upsert(deletedId, "test-3d", [
+    await storage.chunks_upsert(deletedId, "test-3d", [
       {
         ix: 0,
         text: "hello world",
@@ -185,8 +185,8 @@ describe("query — rank", () => {
   });
 
   it("hook error at query time → rank_unavailable with cause", async () => {
-    const storage = sqliteAdapter.open({ database: "sqlite::memory:" });
-    const { admin } = seedWithVectors(storage, [
+    const storage = await sqliteAdapter.open({ database: "sqlite::memory:" });
+    const { admin } = await seedWithVectors(storage, [
       { path: "a.md", body: "alpha", vector: [1, 0, 0] },
     ]);
     const kernel = createKernel({
