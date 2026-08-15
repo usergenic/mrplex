@@ -39,12 +39,12 @@ function run(...args: string[]): { stdout: string; stderr: string; status: numbe
   return { stdout: res.stdout, stderr: res.stderr, status: res.status ?? 1 };
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   workDir = mkdtempSync(join(tmpdir(), "mrplex-cli-"));
   mkdirSync(workDir, { recursive: true });
   dbUrl = `sqlite:${join(workDir, "cli.db")}`;
   // Bootstrap FIRST so an admin token exists, then seed adapter-level data.
-  const { token } = bootstrap(dbUrl);
+  const { token } = await bootstrap(dbUrl);
   rootToken = token;
   const seed = spawnSync("npx", ["--no-install", "tsx", SEED, "--database", dbUrl], {
     cwd: REPO_ROOT,

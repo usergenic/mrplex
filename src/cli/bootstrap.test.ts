@@ -21,43 +21,42 @@ afterEach(() => {
 });
 
 describe("bootstrap", () => {
-  it("mints a root admin token on a fresh database", () => {
-    const result = bootstrap(`sqlite:${dbPath}`);
+  it("mints a root admin token on a fresh database", async () => {
+    const result = await bootstrap(`sqlite:${dbPath}`);
     expect(result.token).toMatch(/^mrplex_[A-Za-z0-9_-]+$/);
     expect(result.user).toBe("system");
     expect(result.token_id).toMatch(/^t\d+$/);
   });
 
-  it("issued root token resolves to an admin actor with '*' scopes", () => {
-    const { token } = bootstrap(`sqlite:${dbPath}`);
-    const storage = sqliteAdapter.open({ database: `sqlite:${dbPath}` });
+  it("issued root token resolves to an admin actor with '*' scopes", async () => {
+    const { token } = await bootstrap(`sqlite:${dbPath}`);
+    const storage = await sqliteAdapter.open({ database: `sqlite:${dbPath}` });
     try {
-      const actor = resolveActor(token, storage);
+      const actor = await resolveActor(token, storage);
       expect(actor).not.toBeNull();
       expect(actor?.admin).toBe(true);
       expect(actor?.scopes[0]?.repos).toBe("*");
       expect(actor?.scopes[0]?.read).toEqual(["**"]);
       expect(actor?.scopes[0]?.write).toEqual(["**"]);
     } finally {
-      storage.close();
+      await storage.close();
     }
   });
 
-  it("refuses when any user already exists", () => {
-    // First bootstrap succeeds; second should fail.
-    bootstrap(`sqlite:${dbPath}`);
-    expect(() => bootstrap(`sqlite:${dbPath}`)).toThrow(BootstrapError);
-    expect(() => bootstrap(`sqlite:${dbPath}`)).toThrow(/not empty/);
+  it("refuses when any user already exists", async () => {
+    await bootstrap(`sqlite:${dbPath}`);
+    await expect(bootstrap(`sqlite:${dbPath}`)).rejects.toBeInstanceOf(BootstrapError);
+    await expect(bootstrap(`sqlite:${dbPath}`)).rejects.toThrow(/not empty/);
   });
 
-  it("system user is created with the exact slug 'system'", () => {
-    bootstrap(`sqlite:${dbPath}`);
-    const storage = sqliteAdapter.open({ database: `sqlite:${dbPath}` });
+  it("system user is created with the exact slug 'system'", async () => {
+    await bootstrap(`sqlite:${dbPath}`);
+    const storage = await sqliteAdapter.open({ database: `sqlite:${dbPath}` });
     try {
-      const user = storage.users_by_slug("system");
+      const user = await storage.users_by_slug("system");
       expect(user).not.toBeNull();
     } finally {
-      storage.close();
+      await storage.close();
     }
   });
 });

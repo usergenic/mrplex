@@ -4,7 +4,14 @@
  * Integer ids are internal (design §3.3) and never cross the wire — the kernel
  * translates rows into Version envelopes with opaque `version_id` strings and
  * slug-based references.
+ *
+ * All Storage methods are async. SQLite adapter methods complete
+ * synchronously and resolve on the next microtask; Postgres adapter
+ * methods await real I/O. The uniform signature keeps kernel code
+ * dialect-agnostic (design §7.2, m5-plan WS1).
  */
+
+import type { SearchPlan } from "./search-plan.js";
 
 export type UserRow = {
   id: number;
@@ -57,21 +64,13 @@ export type HistoryOptions = {
   before?: string; // ISO 8601 UTC
 };
 
-export type VersionsSearchInput = {
-  repo_ids: readonly number[];
-  /** Additional WHERE clauses, already ANDed by the kernel. May be empty. */
-  where_sql: string;
-  where_params: readonly (string | number | bigint | null)[];
-  /** FTS5 MATCH string. If present, results order by BM25. */
-  text?: string;
-  limit: number;
-};
-
 /**
  * Chunks (design §3.2, §5.3). One row per chunk of a version's body.
  * `embedding` is null while the row is pending embedding (rare in
  * practice — chunk rows are only inserted alongside their vectors).
- * Content-hash dedup key is (model, text_hash).
+ * Content-hash dedup key is (model, text_hash). Embeddings are
+ * exchanged with the storage layer as Float32Array — the adapter owns
+ * the on-disk representation (byte layout is private to each engine).
  */
 export type ChunkRow = {
   version_id: number;
@@ -79,7 +78,7 @@ export type ChunkRow = {
   text: string;
   text_hash: string;
   model: string;
-  embedding: Buffer | null;
+  embedding: Float32Array | null;
 };
 
 export type ChunkUpsertInput = {
@@ -88,14 +87,12 @@ export type ChunkUpsertInput = {
   text_hash: string;
   model: string;
   /**
-   * Query vector as plain JS numbers. The adapter owns the on-disk
-   * representation (float32 vs float64, endianness, etc.); kernel and
-   * worker code stays backend-agnostic.
-   *
-   * When reusing a dedup-hit vector, callers pass a `Buffer` directly —
-   * the adapter round-trips it back to storage without re-encoding.
+   * Query vector. Callers passing fresh vectors use `readonly number[]`
+   * (that's what the embed hook returns); callers reusing a dedup-hit
+   * vector pass the Float32Array they got back from chunks_by_hash so
+   * the adapter round-trips it without re-encoding.
    */
-  embedding: readonly number[] | Buffer;
+  embedding: readonly number[] | Float32Array;
 };
 
 export type VectorSearchHit = {
@@ -129,6 +126,8 @@ export type BacklogStatus = {
 /**
  * Row shape for api_tokens (see design §3.2 and §8). `scopes` is the JSON
  * text as stored; parsing to StoredScope[] happens at the kernel layer.
+ * `admin` is a real boolean — the adapter owns the mapping from 0/1
+ * (SQLite) or native boolean (Postgres).
  */
 export type TokenRow = {
   id: number;
@@ -136,7 +135,7 @@ export type TokenRow = {
   secret_hash: string;
   label: string | null;
   scopes: string; // JSON text — kernel parses to StoredScope[]
-  admin: number; // 0 | 1 (SQLite has no native boolean)
+  admin: boolean;
   expires_at: string | null;
   revoked_at: string | null;
   created_at: string;
@@ -154,26 +153,32 @@ export type TokenInsertInput = {
 };
 
 export type Storage = {
-  close(): void;
-  migrate(): void;
+  close(): Promise<void>;
+  migrate(): Promise<void>;
 
-  /** Serializable transaction. Nested tx flattens into the outer via savepoints. */
-  tx<T>(fn: () => T): T;
+  /**
+   * Serializable transaction. Nested tx flattens into the outer via
+   * savepoints. Contract: never await foreign I/O inside `fn` — the
+   * tx holds locks and the adapter's REPEATABLE READ retry loop (PG)
+   * must be able to replay the whole body. Kernel tx bodies only call
+   * storage.
+   */
+  tx<T>(fn: () => Promise<T>): Promise<T>;
 
-  users_list(): UserRow[];
-  users_create(input: { slug: string; created_at: string }): UserRow;
-  users_rename(id: number, new_slug: string): UserRow;
-  users_by_slug(slug: string): UserRow | null;
-  users_by_id(id: number): UserRow | null;
+  users_list(): Promise<UserRow[]>;
+  users_create(input: { slug: string; created_at: string }): Promise<UserRow>;
+  users_rename(id: number, new_slug: string): Promise<UserRow>;
+  users_by_slug(slug: string): Promise<UserRow | null>;
+  users_by_id(id: number): Promise<UserRow | null>;
 
-  repos_list(): RepoRow[];
-  repos_create(input: { slug: string; created_at: string }): RepoRow;
-  repos_rename(id: number, new_slug: string): RepoRow;
-  repos_set_path_config(id: number, path_config: string | null): RepoRow;
-  repos_by_slug(slug: string): RepoRow | null;
-  repos_by_id(id: number): RepoRow | null;
+  repos_list(): Promise<RepoRow[]>;
+  repos_create(input: { slug: string; created_at: string }): Promise<RepoRow>;
+  repos_rename(id: number, new_slug: string): Promise<RepoRow>;
+  repos_set_path_config(id: number, path_config: string | null): Promise<RepoRow>;
+  repos_by_slug(slug: string): Promise<RepoRow | null>;
+  repos_by_id(id: number): Promise<RepoRow | null>;
 
-  documents_create(repo_id: number): DocumentRow;
+  documents_create(repo_id: number): Promise<DocumentRow>;
 
   /**
    * Insert a new version and advance the chain atomically (design §7.2.2 #1):
@@ -182,11 +187,11 @@ export type Storage = {
    * "one current per document" and "one live per (repo, path)" invariants
    * at the storage layer (design §7.2.2 #2).
    */
-  version_insert(input: VersionInsertInput): VersionRow;
+  version_insert(input: VersionInsertInput): Promise<VersionRow>;
 
-  version_by_id(id: number): VersionRow | null;
-  version_current(repo_id: number, path: string): VersionRow | null;
-  version_history(document_id: number, opts?: HistoryOptions): VersionRow[];
+  version_by_id(id: number): Promise<VersionRow | null>;
+  version_current(repo_id: number, path: string): Promise<VersionRow | null>;
+  version_history(document_id: number, opts?: HistoryOptions): Promise<VersionRow[]>;
 
   /**
    * All currently-live versions in a repo (i.e. rows where next_id IS NULL).
@@ -194,7 +199,7 @@ export type Storage = {
    * scan (§3.5.3). Riding the partial-index on (repo_id, path) where
    * next_id is null, so O(live-set) per repo.
    */
-  versions_live_by_repo(repo_id: number): VersionRow[];
+  versions_live_by_repo(repo_id: number): Promise<VersionRow[]>;
 
   // Full-text search (design §5.1, §7.2.2). Indexes CURRENT versions
   // only — the versions_search method above filters live rows itself.
@@ -207,21 +212,19 @@ export type Storage = {
   // FTS querying itself lives in versions_search (below) which JOINs
   // fts_docs directly, so kernel.query has one path through the
   // adapter, not two.
-  fts_index(version_id: number, body: string): void;
+  fts_index(version_id: number, body: string): Promise<void>;
 
   /**
-   * Composed query — the kernel orchestrator (§5) hands over a pre-built
-   * WHERE fragment (CEL compilation + scope filter + sigil exclusion, all
-   * ANDed and parameterized) plus optional FTS text and a limit; the
-   * adapter runs it and returns live versions. Ordering per §5.1:
+   * Composed query — the kernel orchestrator (§5) hands over a structured
+   * `SearchPlan` (repo ids + parsed CEL AST + scope regex sources + sigil
+   * exclusions + optional text + candidate whitelist + limit); the adapter
+   * compiles the plan into engine-specific SQL. Ordering per §5.1:
    * text-score if `text` is present, else `$created_at DESC`.
    *
-   * The kernel is responsible for generating a fragment that ONLY uses
-   * `versions.*` (and, for polymorphic frontmatter, `json_each` subqueries
-   * over `versions.frontmatter`). The adapter appends the
-   * `versions.next_id IS NULL AND versions.repo_id IN (…)` prefix.
+   * m5-plan WS2 pushed compilation behind the adapter so the kernel emits
+   * no SQL strings.
    */
-  versions_search(input: VersionsSearchInput): VersionRow[];
+  versions_search(plan: SearchPlan): Promise<VersionRow[]>;
 
   /**
    * Chunks + vectors (design §3.2, §5.3, §7.2.2). Written by the
@@ -232,7 +235,11 @@ export type Storage = {
    * dimensionality; the adapter refuses mixed-dim writes (m4-plan §1,
    * §5.3 "refuse mixed-dim writes to the chunks table").
    */
-  chunks_upsert(version_id: number, model: string, chunks: readonly ChunkUpsertInput[]): void;
+  chunks_upsert(
+    version_id: number,
+    model: string,
+    chunks: readonly ChunkUpsertInput[],
+  ): Promise<void>;
 
   /**
    * Content-hash dedup lookup (§5.3). Returns one row per hash present
@@ -242,20 +249,20 @@ export type Storage = {
   chunks_by_hash(
     model: string,
     text_hashes: readonly string[],
-  ): { text_hash: string; embedding: Buffer }[];
+  ): Promise<{ text_hash: string; embedding: Float32Array }[]>;
 
-  chunks_by_version(version_id: number): ChunkRow[];
+  chunks_by_version(version_id: number): Promise<ChunkRow[]>;
 
   /**
    * Distinct (model, chunk_count) pairs across the chunks table — for
    * `embed status`. `chunk_count` counts rows, not distinct hashes.
    */
-  chunks_model_summary(): { model: string; chunk_count: number }[];
+  chunks_model_summary(): Promise<{ model: string; chunk_count: number }[]>;
 
   /**
    * Brute-force k-NN over current-version chunks with vectors matching
-   * `model`. §7.2.1 pins SQLite at brute-force in v1 — indexed ANN
-   * arrives with M5's pgvector adapter.
+   * `model`. §7.2.1 pins v1 at brute-force — indexed ANN (HNSW/IVFFlat
+   * for pgvector) is a fast-follow.
    *
    * `k` limits distinct-version results, not chunk hits. The adapter
    * owns the version-collapse (best chunk per version) AND the vector
@@ -268,33 +275,33 @@ export type Storage = {
     model: string,
     embedding: readonly number[],
     k: number,
-  ): VectorSearchHit[];
+  ): Promise<VectorSearchHit[]>;
 
   // Embedding backlog (design §5.3). One row per version awaiting or
   // retrying embedding. Enqueue is idempotent-per-version (upsert).
-  backlog_enqueue(version_id: number): void;
+  backlog_enqueue(version_id: number): Promise<void>;
   /** Rows due now (next_retry_at IS NULL or <= now), oldest first. */
-  backlog_dequeue(now: string, limit: number): BacklogRow[];
+  backlog_dequeue(now: string, limit: number): Promise<BacklogRow[]>;
   backlog_retain(input: {
     version_id: number;
     attempts: number;
     last_error: string;
     next_retry_at: string;
-  }): void;
-  backlog_delete(version_id: number): void;
-  backlog_status(now: string): BacklogStatus;
+  }): Promise<void>;
+  backlog_delete(version_id: number): Promise<void>;
+  backlog_status(now: string): Promise<BacklogStatus>;
 
   // Tokens (design §3.2, §8). All queries return null / empty for
   // revoked or expired rows — the adapter does the filter so the kernel
   // never has to remember.
-  tokens_create(input: TokenInsertInput): TokenRow;
-  tokens_by_hash(hash: string): TokenRow | null;
-  tokens_by_id(id: number): TokenRow | null;
-  tokens_list(user_id: number): TokenRow[];
-  tokens_revoke(id: number, revoked_at: string): TokenRow | null;
-  tokens_revoke_by_user(user_id: number, revoked_at: string): void;
+  tokens_create(input: TokenInsertInput): Promise<TokenRow>;
+  tokens_by_hash(hash: string): Promise<TokenRow | null>;
+  tokens_by_id(id: number): Promise<TokenRow | null>;
+  tokens_list(user_id: number): Promise<TokenRow[]>;
+  tokens_revoke(id: number, revoked_at: string): Promise<TokenRow | null>;
+  tokens_revoke_by_user(user_id: number, revoked_at: string): Promise<void>;
   /** Opportunistic, non-transactional per §8.5. */
-  tokens_touch_last_used(id: number, when: string): void;
+  tokens_touch_last_used(id: number, when: string): Promise<void>;
 };
 
 export type OpenConfig = {
@@ -304,5 +311,5 @@ export type OpenConfig = {
 
 export type StorageAdapter = {
   scheme: string; // "sqlite" or "postgres"
-  open(config: OpenConfig): Storage;
+  open(config: OpenConfig): Promise<Storage>;
 };

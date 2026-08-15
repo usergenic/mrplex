@@ -248,23 +248,25 @@ function buildProgram(): Command {
     .description("mint the root admin token on a FRESH database (design §8.3)")
     .action(function (this: Command) {
       const opts = this.optsWithGlobals<GlobalOpts>();
-      try {
-        const result = bootstrap(resolveDatabase(opts));
-        if (opts.json) {
-          process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
-        } else {
-          process.stdout.write(`${result.token}\n`);
-          process.stderr.write(
-            `This is your root admin token. Store it now — it will not be shown again.\n  user:     ${result.user}\n  token_id: ${result.token_id}\n`,
-          );
+      (async () => {
+        try {
+          const result = await bootstrap(resolveDatabase(opts));
+          if (opts.json) {
+            process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+          } else {
+            process.stdout.write(`${result.token}\n`);
+            process.stderr.write(
+              `This is your root admin token. Store it now — it will not be shown again.\n  user:     ${result.user}\n  token_id: ${result.token_id}\n`,
+            );
+          }
+        } catch (err) {
+          if ((err as BootstrapError).name === "BootstrapError") {
+            process.stderr.write(`${(err as Error).message}\n`);
+            process.exit(1);
+          }
+          reportError(err);
         }
-      } catch (err) {
-        if ((err as BootstrapError).name === "BootstrapError") {
-          process.stderr.write(`${(err as Error).message}\n`);
-          process.exit(1);
-        }
-        reportError(err);
-      }
+      })();
     });
 
   // -------- serve --------
@@ -677,7 +679,7 @@ function buildProgram(): Command {
             process.exit(1);
             return;
           }
-          const storage = sqliteAdapter.open({ database: resolveDatabase(gopts) });
+          const storage = await sqliteAdapter.open({ database: resolveDatabase(gopts) });
           const worker = createWorker({ storage, hook });
           try {
             const report = await backfillRepo(storage, localOpts.repo, worker, (m) =>
@@ -693,7 +695,7 @@ function buildProgram(): Command {
             if (report.failed > 0) process.exit(1);
           } finally {
             await worker.stop();
-            storage.close();
+            await storage.close();
           }
         } catch (err) {
           reportError(err);
@@ -706,39 +708,41 @@ function buildProgram(): Command {
     .description("inspect the embedding backlog (m4-plan §5 decision 6)")
     .action(function (this: Command) {
       const gopts = this.optsWithGlobals<GlobalOpts>();
-      try {
-        const storage = sqliteAdapter.open({ database: resolveDatabase(gopts) });
+      (async () => {
         try {
-          const now = new Date().toISOString();
-          const status = storage.backlog_status(now);
-          if (gopts.json) {
-            process.stdout.write(`${JSON.stringify(status, null, 2)}\n`);
-          } else {
-            process.stdout.write(
-              `pending: ${status.pending}\ndue:     ${status.due}\nfailing: ${status.failing}\n`,
-            );
-            if (status.oldest_next_retry_at) {
-              process.stdout.write(`oldest retry: ${status.oldest_next_retry_at}\n`);
-            }
-            if (status.models.length > 0) {
-              process.stdout.write("models:\n");
-              for (const m of status.models) {
-                process.stdout.write(`  ${m.model}  chunks=${m.chunk_count}\n`);
+          const storage = await sqliteAdapter.open({ database: resolveDatabase(gopts) });
+          try {
+            const now = new Date().toISOString();
+            const status = await storage.backlog_status(now);
+            if (gopts.json) {
+              process.stdout.write(`${JSON.stringify(status, null, 2)}\n`);
+            } else {
+              process.stdout.write(
+                `pending: ${status.pending}\ndue:     ${status.due}\nfailing: ${status.failing}\n`,
+              );
+              if (status.oldest_next_retry_at) {
+                process.stdout.write(`oldest retry: ${status.oldest_next_retry_at}\n`);
+              }
+              if (status.models.length > 0) {
+                process.stdout.write("models:\n");
+                for (const m of status.models) {
+                  process.stdout.write(`  ${m.model}  chunks=${m.chunk_count}\n`);
+                }
+              }
+              if (status.recent_errors.length > 0) {
+                process.stdout.write("recent errors:\n");
+                for (const e of status.recent_errors) {
+                  process.stdout.write(`  v${e.version_id}: ${e.last_error}\n`);
+                }
               }
             }
-            if (status.recent_errors.length > 0) {
-              process.stdout.write("recent errors:\n");
-              for (const e of status.recent_errors) {
-                process.stdout.write(`  v${e.version_id}: ${e.last_error}\n`);
-              }
-            }
+          } finally {
+            await storage.close();
           }
-        } finally {
-          storage.close();
+        } catch (err) {
+          reportError(err);
         }
-      } catch (err) {
-        reportError(err);
-      }
+      })();
     });
 
   // -------- tokens --------

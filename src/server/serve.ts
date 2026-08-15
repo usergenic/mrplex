@@ -70,14 +70,16 @@ export async function startServer(config: ServeConfig): Promise<ServeHandle> {
   // Enqueue is unconditional whether or not a hook is configured
   // (m4-plan §5 decision 5) — a hookless deployment still records the
   // backlog so a later `embed backfill` doesn't have to walk history.
-  const storage: Storage = sqliteAdapter.open({
+  const storage: Storage = await sqliteAdapter.open({
     database: normalizeDatabase(config.database),
   });
-  storage.migrate();
+  await storage.migrate();
   const kernel = createKernel({
     storage,
     serverPathConfig: config.serverPathConfig ?? HARDCODED_DEFAULTS,
-    onVersionCommitted: (versionId) => storage.backlog_enqueue(versionId),
+    onVersionCommitted: async (versionId) => {
+      await storage.backlog_enqueue(versionId);
+    },
     queryEmbed: hook
       ? async (rank: string) => {
           const resp = await hook.embed([rank]);
@@ -151,7 +153,7 @@ export async function startServer(config: ServeConfig): Promise<ServeHandle> {
     if (worker) {
       await worker.stop();
     }
-    storage.close();
+    await storage.close();
   };
 
   return {

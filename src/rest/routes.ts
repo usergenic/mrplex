@@ -267,13 +267,13 @@ async function dispatchRepos(
   query: URLSearchParams,
   method: string,
 ): Promise<void> {
-  const actor = actorFromRequest(req, storage);
+  const actor = await actorFromRequest(req, storage);
 
   // GET /repos, POST /repos
   if (segments.length === 1) {
     if (method === "GET") {
       const includeSystem = query.get("include_system") === "true";
-      const result = kernel.repos.list(actor, { include_system: includeSystem });
+      const result = await kernel.repos.list(actor, { include_system: includeSystem });
       writeJson(res, 200, result);
       return;
     }
@@ -282,7 +282,7 @@ async function dispatchRepos(
       if (typeof body.slug !== "string") {
         throw new KernelError("slug_invalid", { reason: "body.slug required (string)" });
       }
-      const result = kernel.repos.create(actor, body.slug);
+      const result = await kernel.repos.create(actor, body.slug);
       writeJson(res, 201, result);
       return;
     }
@@ -295,7 +295,7 @@ async function dispatchRepos(
   // /repos/{repo}
   if (segments.length === 2) {
     if (method === "GET") {
-      writeJson(res, 200, kernel.repos.get(actor, repoSlug));
+      writeJson(res, 200, await kernel.repos.get(actor, repoSlug));
       return;
     }
     if (method === "MOVE") {
@@ -303,11 +303,11 @@ async function dispatchRepos(
       if (dest === null) {
         throw new KernelError("slug_invalid", { reason: "Destination header required" });
       }
-      writeJson(res, 200, kernel.repos.rename(actor, repoSlug, dest));
+      writeJson(res, 200, await kernel.repos.rename(actor, repoSlug, dest));
       return;
     }
     if (method === "DELETE") {
-      writeJson(res, 200, kernel.repos.delete(actor, repoSlug));
+      writeJson(res, 200, await kernel.repos.delete(actor, repoSlug));
       return;
     }
     return methodNotAllowed(res, method, ["GET", "MOVE", "DELETE"]);
@@ -325,7 +325,7 @@ async function dispatchRepos(
       body && Object.prototype.hasOwnProperty.call(body, "path_config")
         ? (body.path_config as PathConfigOverride | null)
         : (body as unknown as PathConfigOverride | null);
-    writeJson(res, 200, kernel.repos.set_path_config(actor, repoSlug, cfg));
+    writeJson(res, 200, await kernel.repos.set_path_config(actor, repoSlug, cfg));
     return;
   }
 
@@ -342,7 +342,7 @@ async function dispatchRepos(
     if (segments.length !== 4) return notFound(res);
     if (method !== "GET") return methodNotAllowed(res, method, ["GET"]);
     const versionId = segments[3] as string;
-    const v = kernel.docs.get_version(actor, repoSlug, versionId);
+    const v = await kernel.docs.get_version(actor, repoSlug, versionId);
     return writeDocResponse(req, res, v);
   }
 
@@ -354,7 +354,7 @@ async function dispatchRepos(
     const path = pathSegs.join("/");
     const limit = readOptionalIntQueryParam(query, "limit");
     const before = query.get("before") ?? undefined;
-    const rows = kernel.docs.history(actor, repoSlug, path, { limit, before });
+    const rows = await kernel.docs.history(actor, repoSlug, path, { limit, before });
     writeJson(res, 200, rows);
     return;
   }
@@ -375,7 +375,7 @@ async function dispatchRepos(
       });
       return;
     }
-    const d = kernel.docs.diff(actor, repoSlug, path, from, to);
+    const d = await kernel.docs.diff(actor, repoSlug, path, from, to);
     // Content negotiation: Accept: text/plain → raw patch, else JSON.
     const accept = (req.headers.accept as string | undefined) ?? "application/json";
     if (accept.includes("text/plain")) {
@@ -401,7 +401,7 @@ async function dispatchDocs(
   method: string,
 ): Promise<void> {
   if (method === "GET") {
-    const v = kernel.docs.get(actor, repoSlug, path);
+    const v = await kernel.docs.get(actor, repoSlug, path);
     return writeDocResponse(req, res, v);
   }
 
@@ -455,7 +455,7 @@ async function dispatchDocs(
         return;
       }
       // Create: an omitted body means "empty document" — no prev to carry from.
-      const v = kernel.docs.create(actor, repoSlug, path, {
+      const v = await kernel.docs.create(actor, repoSlug, path, {
         frontmatter: input.frontmatter as never,
         frontmatter_raw: input.frontmatter_raw,
         body: input.body ?? "",
@@ -477,7 +477,7 @@ async function dispatchDocs(
     if (input.frontmatter !== undefined) putInput.frontmatter = input.frontmatter as never;
     if (input.frontmatter_raw !== undefined) putInput.frontmatter_raw = input.frontmatter_raw;
     if (input.body !== undefined) putInput.body = input.body;
-    const v = kernel.docs.put(actor, repoSlug, ifMatch.version_id, path, putInput);
+    const v = await kernel.docs.put(actor, repoSlug, ifMatch.version_id, path, putInput);
     writeJson(res, 200, v, { ETag: etagOf(v.version_id) });
     return;
   }
@@ -492,7 +492,7 @@ async function dispatchDocs(
     // currently lives at (repo, path). If the doc has moved or been deleted
     // since If-Match was observed, stale_prev with the actual current pointer.
     // If nothing lives at path at all, kernel.docs.get raises doc_not_found (404).
-    const current = kernel.docs.get(actor, repoSlug, path);
+    const current = await kernel.docs.get(actor, repoSlug, path);
     if (current.version_id !== ifMatch.version_id) {
       throw new KernelError("stale_prev", {
         current_version_id: current.version_id,
@@ -500,7 +500,7 @@ async function dispatchDocs(
         submitted_prev_version_id: ifMatch.version_id,
       });
     }
-    const v = kernel.docs.delete(actor, repoSlug, ifMatch.version_id);
+    const v = await kernel.docs.delete(actor, repoSlug, ifMatch.version_id);
     writeJson(res, 200, v, { ETag: etagOf(v.version_id) });
     return;
   }
@@ -517,7 +517,7 @@ async function dispatchDocs(
         reason: "Destination header required (same-repo)",
       });
     }
-    const v = kernel.docs.put(actor, repoSlug, ifMatch.version_id, dest, {});
+    const v = await kernel.docs.put(actor, repoSlug, ifMatch.version_id, dest, {});
     writeJson(res, 200, v, { ETag: etagOf(v.version_id) });
     return;
   }
@@ -558,11 +558,11 @@ async function dispatchUsers(
   segments: string[],
   method: string,
 ): Promise<void> {
-  const actor = actorFromRequest(req, storage);
+  const actor = await actorFromRequest(req, storage);
 
   if (segments.length === 1) {
     if (method === "GET") {
-      writeJson(res, 200, kernel.users.list(actor));
+      writeJson(res, 200, await kernel.users.list(actor));
       return;
     }
     if (method === "POST") {
@@ -570,7 +570,7 @@ async function dispatchUsers(
       if (typeof body.slug !== "string") {
         throw new KernelError("slug_invalid", { reason: "body.slug required (string)" });
       }
-      writeJson(res, 201, kernel.users.create(actor, body.slug));
+      writeJson(res, 201, await kernel.users.create(actor, body.slug));
       return;
     }
     return methodNotAllowed(res, method, ["GET", "POST"]);
@@ -583,11 +583,11 @@ async function dispatchUsers(
       if (dest === null) {
         throw new KernelError("slug_invalid", { reason: "Destination header required" });
       }
-      writeJson(res, 200, kernel.users.rename(actor, userSlug, dest));
+      writeJson(res, 200, await kernel.users.rename(actor, userSlug, dest));
       return;
     }
     if (method === "DELETE") {
-      writeJson(res, 200, kernel.users.delete(actor, userSlug));
+      writeJson(res, 200, await kernel.users.delete(actor, userSlug));
       return;
     }
     return methodNotAllowed(res, method, ["MOVE", "DELETE"]);
@@ -608,11 +608,11 @@ async function dispatchMeTokens(
   segments: string[],
   method: string,
 ): Promise<void> {
-  const actor = actorFromRequest(req, storage);
+  const actor = await actorFromRequest(req, storage);
 
   if (segments.length === 2) {
     if (method === "GET") {
-      writeJson(res, 200, kernel.tokens.list(actor));
+      writeJson(res, 200, await kernel.tokens.list(actor));
       return;
     }
     if (method === "POST") {
@@ -633,10 +633,12 @@ async function dispatchMeTokens(
           : typeof body.expires_at === "string"
             ? body.expires_at
             : null;
-      const result = kernel.tokens.create(actor, (body.label ?? null) as string | null, scopes, {
-        admin,
-        expires_at,
-      });
+      const result = await kernel.tokens.create(
+        actor,
+        (body.label ?? null) as string | null,
+        scopes,
+        { admin, expires_at },
+      );
       writeJson(res, 201, result);
       return;
     }
@@ -646,7 +648,7 @@ async function dispatchMeTokens(
   if (segments.length === 3) {
     const tokenId = segments[2] as string;
     if (method !== "DELETE") return methodNotAllowed(res, method, ["DELETE"]);
-    writeJson(res, 200, kernel.tokens.revoke(actor, tokenId));
+    writeJson(res, 200, await kernel.tokens.revoke(actor, tokenId));
     return;
   }
 
@@ -673,7 +675,7 @@ async function dispatchQuery(
   query: URLSearchParams,
   method: string,
 ): Promise<void> {
-  const actor = actorFromRequest(req, storage);
+  const actor = await actorFromRequest(req, storage);
 
   let spec: QuerySpec;
   if (method === "GET") {

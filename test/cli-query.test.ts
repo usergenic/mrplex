@@ -36,10 +36,10 @@ function run(...args: string[]): { stdout: string; stderr: string; status: numbe
   return { stdout: res.stdout, stderr: res.stderr, status: res.status ?? 1 };
 }
 
-function seedAll(): void {
+async function seedAll(): Promise<void> {
   // Seed at adapter level so we can supply mixed frontmatter shapes.
-  storage.repos_create({ slug: "notes", created_at: "2026-08-14T00:00:00Z" });
-  const rows = storage.repos_by_slug("notes");
+  await storage.repos_create({ slug: "notes", created_at: "2026-08-14T00:00:00Z" });
+  const rows = await storage.repos_by_slug("notes");
   if (!rows) throw new Error("seed");
   notesRepoId = rows.id;
   const rowsList = [
@@ -58,8 +58,8 @@ function seedAll(): void {
   ];
   let clock = 100;
   for (const r of rowsList) {
-    const doc = storage.documents_create(notesRepoId);
-    storage.version_insert({
+    const doc = await storage.documents_create(notesRepoId);
+    await storage.version_insert({
       document_id: doc.id,
       repo_id: notesRepoId,
       prev_id: null,
@@ -73,37 +73,37 @@ function seedAll(): void {
   }
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   workDir = mkdtempSync(join(tmpdir(), "mrplex-cli-query-"));
   mkdirSync(workDir, { recursive: true });
   dbUrl = `sqlite:${join(workDir, "q.db")}`;
-  ({ token: rootToken } = bootstrap(dbUrl));
-  storage = sqliteAdapter.open({ database: dbUrl });
-  alice = storage.users_create({ slug: "alice", created_at: "2026-08-14T00:00:00Z" });
-  seedAll();
-  storage.close();
+  ({ token: rootToken } = await bootstrap(dbUrl));
+  storage = await sqliteAdapter.open({ database: dbUrl });
+  alice = await storage.users_create({ slug: "alice", created_at: "2026-08-14T00:00:00Z" });
+  await seedAll();
+  await storage.close();
 });
 
-afterEach(() => {
+afterEach(async () => {
   rmSync(workDir, { recursive: true, force: true });
 });
 
 describe("cli query", () => {
-  it("filter only — CEL predicate over frontmatter", () => {
+  it("filter only — CEL predicate over frontmatter", async () => {
     const out = run("--json", "query", "--repo", "notes", "--filter", 'status == "published"');
     expect(out.status).toBe(0);
     const results = JSON.parse(out.stdout) as { path: string }[];
     expect(results.map((r) => r.path)).toEqual(["pricing.md"]);
   });
 
-  it("text only — FTS", () => {
+  it("text only — FTS", async () => {
     const out = run("--json", "query", "--repo", "notes", "--text", "welcome");
     expect(out.status).toBe(0);
     const results = JSON.parse(out.stdout) as { path: string }[];
     expect(results.map((r) => r.path)).toEqual(["welcome.md"]);
   });
 
-  it("filter + text compose via AND", () => {
+  it("filter + text compose via AND", async () => {
     const out = run(
       "--json",
       "query",
@@ -119,14 +119,14 @@ describe("cli query", () => {
     expect(results.map((r) => r.path)).toEqual(["pricing.md"]);
   });
 
-  it('list() polymorphism — "guide" in list(tags) matches both scalar and list shapes', () => {
+  it('list() polymorphism — "guide" in list(tags) matches both scalar and list shapes', async () => {
     const out = run("--json", "query", "--repo", "notes", "--filter", '"guide" in list(tags)');
     expect(out.status).toBe(0);
     const results = JSON.parse(out.stdout) as { path: string }[];
     expect(results.map((r) => r.path)).toEqual(["guides/getting-started.md"]);
   });
 
-  it("$path intrinsic", () => {
+  it("$path intrinsic", async () => {
     const out = run(
       "--json",
       "query",
@@ -140,20 +140,20 @@ describe("cli query", () => {
     expect(results.map((r) => r.path)).toEqual(["guides/getting-started.md"]);
   });
 
-  it("--limit caps results", () => {
+  it("--limit caps results", async () => {
     const out = run("--json", "query", "--repo", "notes", "--limit", "2");
     expect(out.status).toBe(0);
     const results = JSON.parse(out.stdout) as unknown[];
     expect(results).toHaveLength(2);
   });
 
-  it("--limit rejects non-positive-integers", () => {
+  it("--limit rejects non-positive-integers", async () => {
     const out = run("query", "--repo", "notes", "--limit", "abc");
     expect(out.status).not.toBe(0);
     expect(out.stderr).toMatch(/positive integer/);
   });
 
-  it("pretty output renders a table", () => {
+  it("pretty output renders a table", async () => {
     const out = run("query", "--repo", "notes", "--filter", 'status == "published"');
     expect(out.status).toBe(0);
     expect(out.stdout).toContain("REPO");
@@ -161,7 +161,7 @@ describe("cli query", () => {
     expect(out.stdout).toContain("pricing.md");
   });
 
-  it("malformed CEL returns filter_invalid, exit 1", () => {
+  it("malformed CEL returns filter_invalid, exit 1", async () => {
     const out = run("query", "--repo", "notes", "--filter", "this is [ not valid CEL");
     expect(out.status).toBe(1);
     expect(out.stderr).toContain("filter_invalid");

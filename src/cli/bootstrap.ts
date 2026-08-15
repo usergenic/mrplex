@@ -35,19 +35,19 @@ export class BootstrapError extends Error {
  * token already exists, then seeds the system user and mints the root
  * admin token. Returns the plaintext secret.
  */
-export function bootstrap(database: string): BootstrapResult {
-  const storage = sqliteAdapter.open({ database });
+export async function bootstrap(database: string): Promise<BootstrapResult> {
+  const storage = await sqliteAdapter.open({ database });
   try {
-    const users = storage.users_list();
+    const users = await storage.users_list();
     if (users.length > 0) {
       throw new BootstrapError(
         "database is not empty (users already exist); refusing to bootstrap",
       );
     }
     const now = new Date().toISOString();
-    const user = storage.users_create({ slug: BOOTSTRAP_USER_SLUG, created_at: now });
+    const user = await storage.users_create({ slug: BOOTSTRAP_USER_SLUG, created_at: now });
     const secret = generateSecret();
-    const token = storage.tokens_create({
+    const token = await storage.tokens_create({
       user_id: user.id,
       secret_hash: hashSecret(secret),
       label: BOOTSTRAP_LABEL,
@@ -58,6 +58,6 @@ export function bootstrap(database: string): BootstrapResult {
     });
     return { token: secret, user: user.slug, token_id: `t${token.id}` };
   } finally {
-    storage.close();
+    await storage.close();
   }
 }

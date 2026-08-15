@@ -136,8 +136,8 @@ export const TOOL_REGISTRY: ToolEntry[] = [
         },
       },
     },
-    handler: (kernel, actor, args) => {
-      const result = kernel.repos.list(actor, {
+    handler: async (kernel, actor, args) => {
+      const result = await kernel.repos.list(actor, {
         include_system: argBoolOpt(args, "include_system") ?? false,
       });
       return { structured: wrapList(result), text: renderRepoList(result) };
@@ -151,8 +151,8 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       properties: { repo: { type: "string", description: "Repo slug." } },
       required: ["repo"],
     },
-    handler: (kernel, actor, args) => {
-      const result = kernel.repos.get(actor, argStr(args, "repo"));
+    handler: async (kernel, actor, args) => {
+      const result = await kernel.repos.get(actor, argStr(args, "repo"));
       return { structured: result, text: renderJson(result) };
     },
   },
@@ -164,8 +164,8 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       properties: { repo: { type: "string", description: "New repo slug." } },
       required: ["repo"],
     },
-    handler: (kernel, actor, args) => {
-      const result = kernel.repos.create(actor, argStr(args, "repo"));
+    handler: async (kernel, actor, args) => {
+      const result = await kernel.repos.create(actor, argStr(args, "repo"));
       return { structured: result, text: `created ${result.repo}` };
     },
   },
@@ -180,8 +180,12 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       },
       required: ["repo", "new_repo"],
     },
-    handler: (kernel, actor, args) => {
-      const result = kernel.repos.rename(actor, argStr(args, "repo"), argStr(args, "new_repo"));
+    handler: async (kernel, actor, args) => {
+      const result = await kernel.repos.rename(
+        actor,
+        argStr(args, "repo"),
+        argStr(args, "new_repo"),
+      );
       return { structured: result, text: `renamed to ${result.repo}` };
     },
   },
@@ -193,8 +197,8 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       properties: { repo: { type: "string" } },
       required: ["repo"],
     },
-    handler: (kernel, actor, args) => {
-      const result = kernel.repos.delete(actor, argStr(args, "repo"));
+    handler: async (kernel, actor, args) => {
+      const result = await kernel.repos.delete(actor, argStr(args, "repo"));
       return { structured: result, text: `deleted (now ${result.repo})` };
     },
   },
@@ -219,9 +223,9 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       },
       required: ["repo", "config"],
     },
-    handler: (kernel, actor, args) => {
+    handler: async (kernel, actor, args) => {
       const cfg = args.config as PathConfigOverride | null;
-      const result = kernel.repos.set_path_config(actor, argStr(args, "repo"), cfg);
+      const result = await kernel.repos.set_path_config(actor, argStr(args, "repo"), cfg);
       return { structured: result, text: `warnings: ${result.warnings.length}` };
     },
   },
@@ -231,8 +235,8 @@ export const TOOL_REGISTRY: ToolEntry[] = [
     name: "users_list",
     description: "List users.",
     inputSchema: { type: "object", properties: {} },
-    handler: (kernel, actor) => {
-      const result = kernel.users.list(actor);
+    handler: async (kernel, actor) => {
+      const result = await kernel.users.list(actor);
       return { structured: wrapList(result), text: renderUserList(result) };
     },
   },
@@ -244,8 +248,8 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       properties: { user: { type: "string" } },
       required: ["user"],
     },
-    handler: (kernel, actor, args) => {
-      const result = kernel.users.create(actor, argStr(args, "user"));
+    handler: async (kernel, actor, args) => {
+      const result = await kernel.users.create(actor, argStr(args, "user"));
       return { structured: result, text: `created ${result.user}` };
     },
   },
@@ -257,8 +261,12 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       properties: { user: { type: "string" }, new_user: { type: "string" } },
       required: ["user", "new_user"],
     },
-    handler: (kernel, actor, args) => {
-      const result = kernel.users.rename(actor, argStr(args, "user"), argStr(args, "new_user"));
+    handler: async (kernel, actor, args) => {
+      const result = await kernel.users.rename(
+        actor,
+        argStr(args, "user"),
+        argStr(args, "new_user"),
+      );
       return { structured: result, text: `renamed to ${result.user}` };
     },
   },
@@ -270,8 +278,8 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       properties: { user: { type: "string" } },
       required: ["user"],
     },
-    handler: (kernel, actor, args) => {
-      const result = kernel.users.delete(actor, argStr(args, "user"));
+    handler: async (kernel, actor, args) => {
+      const result = await kernel.users.delete(actor, argStr(args, "user"));
       return { structured: result, text: `deleted (now ${result.user})` };
     },
   },
@@ -288,8 +296,8 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       },
       required: ["repo", "path"],
     },
-    handler: (kernel, actor, args) => {
-      const v = kernel.docs.get(actor, argStr(args, "repo"), argStr(args, "path"));
+    handler: async (kernel, actor, args) => {
+      const v = await kernel.docs.get(actor, argStr(args, "repo"), argStr(args, "path"));
       return { structured: v, text: renderVersion(v) };
     },
   },
@@ -304,8 +312,12 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       },
       required: ["repo", "version_id"],
     },
-    handler: (kernel, actor, args) => {
-      const v = kernel.docs.get_version(actor, argStr(args, "repo"), argStr(args, "version_id"));
+    handler: async (kernel, actor, args) => {
+      const v = await kernel.docs.get_version(
+        actor,
+        argStr(args, "repo"),
+        argStr(args, "version_id"),
+      );
       return { structured: v, text: renderVersion(v) };
     },
   },
@@ -322,8 +334,8 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       },
       required: ["repo", "path"],
     },
-    handler: (kernel, actor, args) => {
-      const rows = kernel.docs.history(actor, argStr(args, "repo"), argStr(args, "path"), {
+    handler: async (kernel, actor, args) => {
+      const rows = await kernel.docs.history(actor, argStr(args, "repo"), argStr(args, "path"), {
         limit: argIntOpt(args, "limit"),
         before: argStrOpt(args, "before"),
       });
@@ -344,8 +356,8 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       },
       required: ["repo", "path", "from", "to"],
     },
-    handler: (kernel, actor, args) => {
-      const d = kernel.docs.diff(
+    handler: async (kernel, actor, args) => {
+      const d = await kernel.docs.diff(
         actor,
         argStr(args, "repo"),
         argStr(args, "path"),
@@ -370,8 +382,8 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       },
       required: ["repo", "path", "body"],
     },
-    handler: (kernel, actor, args) => {
-      const v = kernel.docs.create(actor, argStr(args, "repo"), argStr(args, "path"), {
+    handler: async (kernel, actor, args) => {
+      const v = await kernel.docs.create(actor, argStr(args, "repo"), argStr(args, "path"), {
         frontmatter: args.frontmatter as never,
         frontmatter_raw: argStrOpt(args, "frontmatter_raw"),
         body: argStr(args, "body"),
@@ -395,7 +407,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       },
       required: ["repo", "path", "prev_version_id"],
     },
-    handler: (kernel, actor, args) => {
+    handler: async (kernel, actor, args) => {
       const input: {
         frontmatter?: unknown;
         frontmatter_raw?: string;
@@ -404,7 +416,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       if (args.frontmatter !== undefined) input.frontmatter = args.frontmatter;
       if (typeof args.frontmatter_raw === "string") input.frontmatter_raw = args.frontmatter_raw;
       if (typeof args.body === "string") input.body = args.body;
-      const v = kernel.docs.put(
+      const v = await kernel.docs.put(
         actor,
         argStr(args, "repo"),
         argStr(args, "prev_version_id"),
@@ -425,8 +437,12 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       },
       required: ["repo", "prev_version_id"],
     },
-    handler: (kernel, actor, args) => {
-      const v = kernel.docs.delete(actor, argStr(args, "repo"), argStr(args, "prev_version_id"));
+    handler: async (kernel, actor, args) => {
+      const v = await kernel.docs.delete(
+        actor,
+        argStr(args, "repo"),
+        argStr(args, "prev_version_id"),
+      );
       return { structured: v, text: renderVersion(v) };
     },
   },
@@ -436,8 +452,8 @@ export const TOOL_REGISTRY: ToolEntry[] = [
     name: "tokens_list",
     description: "List your tokens.",
     inputSchema: { type: "object", properties: {} },
-    handler: (kernel, actor) => {
-      const rows = kernel.tokens.list(actor);
+    handler: async (kernel, actor) => {
+      const rows = await kernel.tokens.list(actor);
       return { structured: wrapList(rows), text: renderTokenList(rows) };
     },
   },
@@ -461,9 +477,9 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       },
       required: ["label", "scopes"],
     },
-    handler: (kernel, actor, args) => {
+    handler: async (kernel, actor, args) => {
       const scopes = (args.scopes ?? []) as ScopeInput[];
-      const result = kernel.tokens.create(actor, argStr(args, "label"), scopes, {
+      const result = await kernel.tokens.create(actor, argStr(args, "label"), scopes, {
         admin: argBoolOpt(args, "admin") ?? false,
         expires_at: argStrOpt(args, "expires_at") ?? null,
       });
@@ -478,8 +494,8 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       properties: { token_id: { type: "string" } },
       required: ["token_id"],
     },
-    handler: (kernel, actor, args) => {
-      const t = kernel.tokens.revoke(actor, argStr(args, "token_id"));
+    handler: async (kernel, actor, args) => {
+      const t = await kernel.tokens.revoke(actor, argStr(args, "token_id"));
       return { structured: t, text: `revoked ${t.id}` };
     },
   },

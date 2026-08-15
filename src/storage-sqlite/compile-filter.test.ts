@@ -9,24 +9,24 @@
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { sqliteAdapter } from "../../storage-sqlite/adapter.js";
-import type { Storage, UserRow } from "../../storage/types.js";
-import { KernelError } from "../errors.js";
-import { parseCel } from "./cel-parse.js";
-import { compileFilter } from "./compile-sqlite.js";
+import { sqliteAdapter } from "./adapter.js";
+import type { Storage, UserRow } from "../storage/types.js";
+import { KernelError } from "../kernel/errors.js";
+import { parseCel } from "../kernel/query/cel-parse.js";
+import { compileFilter } from "./compile-filter.js";
 
 let storage: Storage;
 let user: UserRow;
 let repoId: number;
 
-function seed(
+async function seed(
   entries: { path: string; frontmatter: Record<string, unknown>; body?: string }[],
-): number[] {
+): Promise<number[]> {
   const ids: number[] = [];
   let clock = 0;
   for (const e of entries) {
-    const doc = storage.documents_create(repoId);
-    const v = storage.version_insert({
+    const doc = await storage.documents_create(repoId);
+    const v = await storage.version_insert({
       document_id: doc.id,
       repo_id: repoId,
       prev_id: null,
@@ -44,7 +44,8 @@ function seed(
 
 function runQuery(filter: string): number[] {
   const ast = parseCel(filter);
-  const compiled = compileFilter(ast.expr!);
+  if (!ast.expr) throw new Error("empty filter");
+  const compiled = compileFilter(ast.expr);
   // Get access to raw db via a small dance — we need the connection for
   // ad-hoc prepared statements. The Storage interface doesn't expose it,
   // but the SqliteStorage impl uses better-sqlite3; we invoke via a
@@ -75,16 +76,16 @@ function runOnFreshHandle(where: string, params: unknown[]): number[] {
   return rows.map((r) => r.id);
 }
 
-beforeEach(() => {
-  storage = sqliteAdapter.open({
+beforeEach(async () => {
+  storage = await sqliteAdapter.open({
     database: `sqlite:${join(tmpdir(), `mrplex-compile-${Date.now()}-${Math.random()}.db`)}`,
   });
-  user = storage.users_create({ slug: "alice", created_at: "2026-08-14T00:00:00Z" });
-  repoId = storage.repos_create({ slug: "notes", created_at: "2026-08-14T00:00:01Z" }).id;
+  user = await storage.users_create({ slug: "alice", created_at: "2026-08-14T00:00:00Z" });
+  repoId = (await storage.repos_create({ slug: "notes", created_at: "2026-08-14T00:00:01Z" })).id;
 });
 
-afterEach(() => {
-  storage.close();
+afterEach(async () => {
+  await storage.close();
 });
 
 // -----------------------------------------------------------------------------
@@ -92,8 +93,8 @@ afterEach(() => {
 // -----------------------------------------------------------------------------
 
 describe("comparisons on frontmatter fields", () => {
-  it("== on string equality", () => {
-    const [a, b] = seed([
+  it("== on string equality", async () => {
+    const [a, b] = await seed([
       { path: "a.md", frontmatter: { status: "draft" } },
       { path: "b.md", frontmatter: { status: "published" } },
     ]);
@@ -101,8 +102,8 @@ describe("comparisons on frontmatter fields", () => {
     expect(runQuery('status != "draft"')).toEqual([b]);
   });
 
-  it("<, <=, >, >= on numbers", () => {
-    const [a, b, c] = seed([
+  it("<, <=, >, >= on numbers", async () => {
+    const [a, b, c] = await seed([
       { path: "a.md", frontmatter: { count: 1 } },
       { path: "b.md", frontmatter: { count: 5 } },
       { path: "c.md", frontmatter: { count: 10 } },
@@ -111,8 +112,8 @@ describe("comparisons on frontmatter fields", () => {
     expect(runQuery("count <= 5")).toEqual([a, b]);
   });
 
-  it("&& and || combine", () => {
-    const [a, b, c] = seed([
+  it("&& and || combine", async () => {
+    const [a, b, c] = await seed([
       { path: "a.md", frontmatter: { status: "draft", pinned: true } },
       { path: "b.md", frontmatter: { status: "published", pinned: false } },
       { path: "c.md", frontmatter: { status: "draft", pinned: false } },
@@ -121,16 +122,16 @@ describe("comparisons on frontmatter fields", () => {
     expect(runQuery('status == "published" || pinned == true')).toEqual([a, b]);
   });
 
-  it("! negates", () => {
-    const [a, b] = seed([
+  it("! negates", async () => {
+    const [a, b] = await seed([
       { path: "a.md", frontmatter: { pinned: true } },
       { path: "b.md", frontmatter: { pinned: false } },
     ]);
     expect(runQuery("!(pinned == true)")).toEqual([b]);
   });
 
-  it("missing frontmatter key → predicate false", () => {
-    const [a] = seed([{ path: "a.md", frontmatter: { other: "x" } }]);
+  it("missing frontmatter key → predicate false", async () => {
+    const [a] = await seed([{ path: "a.md", frontmatter: { other: "x" } }]);
     void a;
     expect(runQuery('status == "draft"')).toEqual([]);
   });
@@ -141,8 +142,8 @@ describe("comparisons on frontmatter fields", () => {
 // -----------------------------------------------------------------------------
 
 describe("intrinsics", () => {
-  it("$path.startsWith(...)", () => {
-    const [a, _b, c] = seed([
+  it("$path.startsWith(...)", async () => {
+    const [a, _b, c] = await seed([
       { path: "drafts/one.md", frontmatter: {} },
       { path: "notes/two.md", frontmatter: {} },
       { path: "drafts/three.md", frontmatter: {} },
@@ -151,8 +152,8 @@ describe("intrinsics", () => {
     expect(runQuery('$path.startsWith("drafts/")')).toEqual([a, c]);
   });
 
-  it("$created_at comparison", () => {
-    const [a, b] = seed([
+  it("$created_at comparison", async () => {
+    const [a, b] = await seed([
       { path: "a.md", frontmatter: {} },
       { path: "b.md", frontmatter: {} },
     ]);
@@ -162,7 +163,7 @@ describe("intrinsics", () => {
     expect(runQuery('$created_at <= "2026-08-14T00:00:01.000Z"')).toEqual([a, b]);
   });
 
-  it("unknown $-intrinsic → filter_invalid", () => {
+  it("unknown $-intrinsic → filter_invalid", async () => {
     try {
       runQuery("$bogus == 1");
       throw new Error("expected throw");
@@ -178,8 +179,8 @@ describe("intrinsics", () => {
 // -----------------------------------------------------------------------------
 
 describe("list() polymorphism", () => {
-  it('"pricing" in list(tags) matches both scalar and list frontmatter', () => {
-    const [a, b, _c] = seed([
+  it('"pricing" in list(tags) matches both scalar and list frontmatter', async () => {
+    const [a, b, _c] = await seed([
       { path: "a.md", frontmatter: { tags: "pricing" } }, // scalar
       { path: "b.md", frontmatter: { tags: ["pricing", "saas"] } }, // list
       { path: "c.md", frontmatter: { tags: ["other"] } },
@@ -188,8 +189,8 @@ describe("list() polymorphism", () => {
     expect(runQuery('"pricing" in list(tags)')).toEqual([a, b]);
   });
 
-  it("size(list(tags)) counts scalar as 1, list as its length, missing as 0", () => {
-    const [_a, b, _c] = seed([
+  it("size(list(tags)) counts scalar as 1, list as its length, missing as 0", async () => {
+    const [_a, b, _c] = await seed([
       { path: "a.md", frontmatter: { tags: "one" } }, // 1
       { path: "b.md", frontmatter: { tags: ["a", "b", "c"] } }, // 3
       { path: "c.md", frontmatter: {} }, // 0
@@ -199,8 +200,8 @@ describe("list() polymorphism", () => {
     expect(runQuery("size(list(tags)) > 2")).toEqual([b]);
   });
 
-  it("list(tags).all(t, t.startsWith('p'))", () => {
-    const [a, _b] = seed([
+  it("list(tags).all(t, t.startsWith('p'))", async () => {
+    const [a, _b] = await seed([
       { path: "a.md", frontmatter: { tags: ["pricing", "product"] } },
       { path: "b.md", frontmatter: { tags: ["pricing", "saas"] } },
     ]);
@@ -208,8 +209,8 @@ describe("list() polymorphism", () => {
     expect(runQuery("list(tags).all(t, t.startsWith('p'))")).toEqual([a]);
   });
 
-  it("list(tags).exists(t, t == 'x')", () => {
-    const [a, _b, c] = seed([
+  it("list(tags).exists(t, t == 'x')", async () => {
+    const [a, _b, c] = await seed([
       { path: "a.md", frontmatter: { tags: ["x", "y"] } },
       { path: "b.md", frontmatter: { tags: ["y"] } },
       { path: "c.md", frontmatter: { tags: "x" } }, // scalar
@@ -218,7 +219,7 @@ describe("list() polymorphism", () => {
     expect(runQuery("list(tags).exists(t, t == 'x')")).toEqual([a, c]);
   });
 
-  it("@in without list() → filter_invalid", () => {
+  it("@in without list() → filter_invalid", async () => {
     try {
       runQuery('"x" in tags');
       throw new Error("expected throw");
@@ -233,8 +234,8 @@ describe("list() polymorphism", () => {
 // -----------------------------------------------------------------------------
 
 describe("string methods", () => {
-  it("startsWith on a frontmatter string", () => {
-    const [a, _b] = seed([
+  it("startsWith on a frontmatter string", async () => {
+    const [a, _b] = await seed([
       { path: "a.md", frontmatter: { title: "Welcome" } },
       { path: "b.md", frontmatter: { title: "Farewell" } },
     ]);
@@ -242,8 +243,8 @@ describe("string methods", () => {
     expect(runQuery('title.startsWith("Wel")')).toEqual([a]);
   });
 
-  it("contains on $body", () => {
-    const [a, _b] = seed([
+  it("contains on $body", async () => {
+    const [a, _b] = await seed([
       { path: "a.md", frontmatter: {}, body: "the quick fox" },
       { path: "b.md", frontmatter: {}, body: "the slow turtle" },
     ]);
@@ -251,9 +252,9 @@ describe("string methods", () => {
     expect(runQuery('contains($body, "quick")')).toEqual([a]);
   });
 
-  it("startsWith literal is LIKE-escaped for wildcard characters", () => {
+  it("startsWith literal is LIKE-escaped for wildcard characters", async () => {
     // A literal '%' should NOT be treated as a wildcard.
-    const [a, _b] = seed([
+    const [a, _b] = await seed([
       { path: "a.md", frontmatter: { title: "50% off" } },
       { path: "b.md", frontmatter: { title: "50x off" } },
     ]);
@@ -261,8 +262,8 @@ describe("string methods", () => {
     expect(runQuery('title.startsWith("50%")')).toEqual([a]);
   });
 
-  it("matches regex via the regexp user function", () => {
-    const [a, _b] = seed([
+  it("matches regex via the regexp user function", async () => {
+    const [a, _b] = await seed([
       { path: "a.md", frontmatter: { slug: "v1.2.3" } },
       { path: "b.md", frontmatter: { slug: "abc" } },
     ]);
@@ -270,12 +271,12 @@ describe("string methods", () => {
     expect(runQuery('slug.matches("^v\\\\d+\\\\.\\\\d+\\\\.\\\\d+$")')).toEqual([a]);
   });
 
-  it("matches is ReDoS-safe (RE2JS linear-time — a catastrophic pattern completes instantly)", () => {
+  it("matches is ReDoS-safe (RE2JS linear-time — a catastrophic pattern completes instantly)", async () => {
     // This pattern + input would take multiple SECONDS in JS's built-in
     // RegExp (exponential backtracking). RE2JS returns in microseconds.
     // If we ever regress the regexp UDF to JS RegExp, this test hangs the
     // whole vitest run — canary by design.
-    const [_a] = seed([{ path: "a.md", frontmatter: { slug: `${"a".repeat(30)}b` } }]);
+    const [_a] = await seed([{ path: "a.md", frontmatter: { slug: `${"a".repeat(30)}b` } }]);
     void _a;
     const start = Date.now();
     const result = runQuery('slug.matches("^(a+)+$")');
@@ -292,8 +293,8 @@ describe("string methods", () => {
 // -----------------------------------------------------------------------------
 
 describe("SQL safety", () => {
-  it("string literals are parameterized (SQL injection would appear as a literal match)", () => {
-    seed([{ path: "a.md", frontmatter: { title: "hi" } }]);
+  it("string literals are parameterized (SQL injection would appear as a literal match)", async () => {
+    await seed([{ path: "a.md", frontmatter: { title: "hi" } }]);
     // If the compiler naively interpolated the string, the trailing '; DROP TABLE
     // would execute — the test would fail because versions no longer exists.
     // With parameterization, the "trailing DROP" is just part of the string

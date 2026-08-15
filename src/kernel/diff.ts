@@ -6,13 +6,6 @@
  * must belong to the same document at `(repo, path)`; otherwise the
  * `version_not_in_document` error we reserved back in M1 finally fires.
  *
- * Wire shape (m4-plan §5 decision 8):
- *   {
- *     repo, path,
- *     from_version_id, to_version_id,
- *     patch,           // unified diff, {path}@{version_id} headers
- *   }
- *
  * Read scope is checked on the lookup path AND both version paths
  * (m4-plan §5 decision 10) — a doc renamed out of the caller's scope
  * doesn't leak history through diff.
@@ -35,20 +28,11 @@ export type UnifiedDiff = {
 
 export type DiffDeps = {
   storage: Storage;
-  /**
-   * Callback that produces the (repo_id → repo_slug) lookup. In practice
-   * the kernel passes its own `resolveRepo(actor, slug, "read")`
-   * pattern, which handles authorize + repo_not_found for us.
-   */
-  resolveReadRepo: (actor: Actor, slug: string) => { id: number };
-  /**
-   * Ask the shared kernel helper to authorize a read on this path — the
-   * write-not-required path scope check (§8.2).
-   */
+  resolveReadRepo: (actor: Actor, slug: string) => Promise<{ id: number }>;
   authorizeReadPath: (actor: Actor, repo_id: number, path: string) => void;
 };
 
-export function runDiff(
+export async function runDiff(
   actor: Actor,
   input: {
     repo: string;
@@ -57,20 +41,17 @@ export function runDiff(
     to_version_id: string;
   },
   deps: DiffDeps,
-): UnifiedDiff {
-  const repo = deps.resolveReadRepo(actor, input.repo);
+): Promise<UnifiedDiff> {
+  const repo = await deps.resolveReadRepo(actor, input.repo);
   deps.authorizeReadPath(actor, repo.id, input.path);
 
-  // Current document at (repo, path) — anchors the identity we require
-  // both endpoints to share. doc_not_found if the live path is missing.
-  const current = deps.storage.version_current(repo.id, input.path);
+  const current = await deps.storage.version_current(repo.id, input.path);
   if (!current) throw docNotFound(input.repo, input.path);
   const documentId = current.document_id;
 
-  const from = decodeAndFetch(deps.storage, input.from_version_id);
-  const to = decodeAndFetch(deps.storage, input.to_version_id);
+  const from = await decodeAndFetch(deps.storage, input.from_version_id);
+  const to = await decodeAndFetch(deps.storage, input.to_version_id);
 
-  // Both versions must belong to the same document as (repo, path).
   if (from.document_id !== documentId) {
     throw versionNotInDocument(input.from_version_id, input.repo, input.path);
   }
@@ -78,14 +59,9 @@ export function runDiff(
     throw versionNotInDocument(input.to_version_id, input.repo, input.path);
   }
   if (from.repo_id !== repo.id || to.repo_id !== repo.id) {
-    // Defensive: the document_id check should have caught this, but
-    // pin the invariant.
     throw versionNotInDocument(input.from_version_id, input.repo, input.path);
   }
 
-  // §8.2 — path globs match at the path each version was at. Re-check
-  // read scope on each version's own path so a caller whose scope no
-  // longer covers a historical path can't diff into it.
   deps.authorizeReadPath(actor, repo.id, from.path);
   deps.authorizeReadPath(actor, repo.id, to.path);
 
@@ -107,10 +83,10 @@ export function runDiff(
   };
 }
 
-function decodeAndFetch(storage: Storage, versionId: string): VersionRow {
+async function decodeAndFetch(storage: Storage, versionId: string): Promise<VersionRow> {
   const id = decodeVersionId(versionId);
   if (id === null) throw versionNotFound(versionId);
-  const row = storage.version_by_id(id);
+  const row = await storage.version_by_id(id);
   if (!row) throw versionNotFound(versionId);
   return row;
 }
@@ -119,5 +95,4 @@ function serializeVersion(v: VersionRow): string {
   return joinFrontmatter({ frontmatter_raw: v.frontmatter_raw, body: v.body });
 }
 
-// Re-export so callers who want the constructor for tests get it here.
 export { KernelError };

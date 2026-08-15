@@ -60,19 +60,19 @@ export function hashesEqual(a: string, b: string): boolean {
  * Best-effort `last_used_at` update per design §8.5 — not transactional,
  * doesn't fail the auth call if it errors.
  */
-export function resolveActor(secret: string, storage: Storage): Actor | null {
+export async function resolveActor(secret: string, storage: Storage): Promise<Actor | null> {
   const hash = hashSecret(secret);
-  const row = storage.tokens_by_hash(hash);
+  const row = await storage.tokens_by_hash(hash);
   if (!row) return null;
   const parsed = parseStoredScopes(row.scopes);
   const actor: Actor = {
     user_id: row.user_id,
     scopes: parsed,
-    admin: row.admin === 1,
+    admin: row.admin,
     token_id: row.id,
   };
   try {
-    storage.tokens_touch_last_used(row.id, new Date().toISOString());
+    await storage.tokens_touch_last_used(row.id, new Date().toISOString());
   } catch {
     // Best-effort per §8.5; auth still succeeds.
   }

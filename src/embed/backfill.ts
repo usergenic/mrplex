@@ -30,17 +30,14 @@ export async function backfillRepo(
   worker: Worker,
   onProgress?: (msg: string) => void,
 ): Promise<BackfillReport> {
-  const repo = storage.repos_by_slug(repoSlug);
+  const repo = await storage.repos_by_slug(repoSlug);
   if (!repo) throw new Error(`repo not found: ${repoSlug}`);
-  const live = storage.versions_live_by_repo(repo.id);
+  const live = await storage.versions_live_by_repo(repo.id);
   let enqueued = 0;
   for (const version of live) {
-    // Every current version is a candidate — sigil exclusion is a
-    // query-time concern (§5.1), not a storage one, so :deleted/…
-    // rows get chunks too and are filtered out when queried.
-    const existing = storage.chunks_by_version(version.id);
+    const existing = await storage.chunks_by_version(version.id);
     if (existing.length === 0) {
-      storage.backlog_enqueue(version.id);
+      await storage.backlog_enqueue(version.id);
       enqueued++;
     }
   }

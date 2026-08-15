@@ -34,14 +34,17 @@ export function resolveTokenString(cliFlag: string | undefined): string | null {
  * error with `.code === "unauthorized"` (exit code 3) if no token is
  * configured or the token doesn't resolve.
  */
-export function resolveCliActor(cliFlag: string | undefined, storage: Storage): Actor {
+export async function resolveCliActor(
+  cliFlag: string | undefined,
+  storage: Storage,
+): Promise<Actor> {
   const secret = resolveTokenString(cliFlag);
   if (secret === null) {
     throw makeUnauthorized(
       "no token — set MRPLEX_TOKEN, use --token, or `mrplex config set-token`",
     );
   }
-  const actor = resolveActor(secret, storage);
+  const actor = await resolveActor(secret, storage);
   if (!actor) {
     throw makeUnauthorized("token unknown, revoked, or expired");
   }

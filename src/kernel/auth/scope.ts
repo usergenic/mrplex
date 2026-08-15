@@ -39,7 +39,7 @@ const asList = (v: string | string[] | undefined): string[] =>
  * the repo pattern list) short-circuits to the dynamic all-repos wildcard,
  * which covers repos created after issuance. Non-`"*"` patterns are snapshots.
  */
-export function resolveScopeInput(input: ScopeInput, storage: Storage): StoredScope {
+export async function resolveScopeInput(input: ScopeInput, storage: Storage): Promise<StoredScope> {
   const repoPatterns = asList(input.repo);
   if (repoPatterns.length === 0) {
     throw new Error("scope entry has no repo pattern");
@@ -48,7 +48,7 @@ export function resolveScopeInput(input: ScopeInput, storage: Storage): StoredSc
   if (repoPatterns.includes("*")) {
     repos = "*";
   } else {
-    const allRepos = storage.repos_list();
+    const allRepos = await storage.repos_list();
     const matched = new Set<number>();
     for (const pattern of repoPatterns) {
       for (const repo of allRepos) {
@@ -67,8 +67,13 @@ export function resolveScopeInput(input: ScopeInput, storage: Storage): StoredSc
   return out;
 }
 
-export function resolveScopeInputs(inputs: ScopeInput[], storage: Storage): StoredScope[] {
-  return inputs.map((i) => resolveScopeInput(i, storage));
+export async function resolveScopeInputs(
+  inputs: ScopeInput[],
+  storage: Storage,
+): Promise<StoredScope[]> {
+  const out: StoredScope[] = [];
+  for (const i of inputs) out.push(await resolveScopeInput(i, storage));
+  return out;
 }
 
 // -----------------------------------------------------------------------------

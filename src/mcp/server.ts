@@ -53,7 +53,7 @@ export async function mountMcpStreamableHttp(config: McpConfig): Promise<McpMoun
     // into the low-level Server callbacks.
     let actor: Actor | null = null;
     try {
-      actor = actorFromRequest(req, storage);
+      actor = await actorFromRequest(req, storage);
     } catch (err) {
       // No token — refuse before the SDK even parses the frame. Streamable
       // HTTP auth is HTTP-native (§6.2), so returning 401 here is correct.
@@ -174,7 +174,7 @@ export async function startMcpStdio(config: {
   storage: Storage;
   token: string;
 }): Promise<StdioMount> {
-  const actor: Actor = resolveBearerActor(config.token, config.storage);
+  const actor: Actor = await resolveBearerActor(config.token, config.storage);
   const server = buildMcpServer(config.kernel, () => actor);
   const transport = new StdioServerTransport();
   await server.connect(transport);
