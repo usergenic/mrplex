@@ -166,13 +166,15 @@ CI runs typecheck + lint + tests on Ubuntu & macOS × Node 20 & 22, plus a `ci-p
 ### Postgres locally
 
 ```bash
-# Start a throwaway Postgres+pgvector.
-docker compose -f docker-compose.test.yml up -d
+# Start a persistent Postgres+pgvector (data survives `pg:down`).
+npm run pg:up
 
 # Point mrplex at it (`--database` also honored per-command).
 export MRPLEX_DATABASE=postgres://mrplex:mrplex@localhost:5432/mrplex
 mrplex bootstrap
 mrplex serve
+
+# Other lifecycle scripts: `pg:down` (stop), `pg:reset` (wipe volume), `pg:logs`.
 
 # Run the parity suite against the live PG (adds ~16 kernel tests).
 MRPLEX_TEST_POSTGRES_URL=postgres://mrplex:mrplex@localhost:5432/mrplex npm test
