@@ -89,6 +89,7 @@ type GlobalOpts = {
   json?: boolean;
   token?: string;
   server?: string;
+  repo?: string;
 };
 
 function resolveDatabase(opts: GlobalOpts): string {
@@ -101,6 +102,24 @@ function resolveDatabase(opts: GlobalOpts): string {
 function resolveServer(opts: GlobalOpts): string | undefined {
   const cfg = loadConfig();
   const value = opts.server ?? process.env.MRPLEX_SERVER ?? cfg.server;
+  return value;
+}
+
+/**
+ * Resolve the target repo slug for `docs *` commands — flag → env → config.
+ * Throws a friendly cli-usage error if none is set; the CLI turns that into
+ * a non-zero exit.
+ */
+function resolveRepoSlug(opts: GlobalOpts): string {
+  const cfg = loadConfig();
+  const value = opts.repo ?? process.env.MRPLEX_REPO ?? cfg.repo;
+  if (!value) {
+    const err = new Error(
+      "no repo — set MRPLEX_REPO, use -r/--repo, or `mrplex config set-repo <slug>`",
+    );
+    (err as unknown as { code: string }).code = "cli_usage";
+    throw err;
+  }
   return value;
 }
 
@@ -179,7 +198,7 @@ function reportError(err: unknown): never {
     process.stderr.write(`${(err as Error).message}\n`);
     process.exit(10);
   }
-  if (code === "cli_conflict") {
+  if (code === "cli_conflict" || code === "cli_usage") {
     process.stderr.write(`${(err as Error).message}\n`);
     process.exit(1);
   }
@@ -235,6 +254,9 @@ function buildProgram(): Command {
       new Option("--server <url>", "talk to a remote mrplex server (mutex with --database)").env(
         "MRPLEX_SERVER",
       ),
+    )
+    .addOption(
+      new Option("-r, --repo <slug>", "target repo for `docs *` commands").env("MRPLEX_REPO"),
     )
     .option("--json", "emit raw JSON instead of pretty output", false)
     .exitOverride((err) => {
@@ -363,6 +385,14 @@ function buildProgram(): Command {
       process.stderr.write("config: server set\n");
     });
   cfg
+    .command("set-repo <slug>")
+    .description("write the default -r/--repo slug to the CLI config")
+    .action((slug: string) => {
+      const c: CliConfig = { ...loadConfig(), repo: slug };
+      saveConfig(c);
+      process.stderr.write("config: repo set\n");
+    });
+  cfg
     .command("show")
     .description("print the current CLI config")
     .action(function (this: Command) {
@@ -372,7 +402,7 @@ function buildProgram(): Command {
         process.stdout.write(`${JSON.stringify(c, null, 2)}\n`);
       } else {
         process.stdout.write(
-          `database: ${c.database ?? "(unset)"}\nserver:   ${c.server ?? "(unset)"}\ntoken:    ${c.token ? "(set)" : "(unset)"}\n`,
+          `database: ${c.database ?? "(unset)"}\nserver:   ${c.server ?? "(unset)"}\nrepo:     ${c.repo ?? "(unset)"}\ntoken:    ${c.token ? "(set)" : "(unset)"}\n`,
         );
       }
     });
@@ -494,35 +524,40 @@ function buildProgram(): Command {
     });
 
   // -------- docs --------
+  // The target repo is a global (-r/--repo, MRPLEX_REPO, or config `repo`);
+  // `docs *` commands take only <path> because most sessions live inside one repo.
   const docs = program.command("docs").description("document ops");
   docs
-    .command("get <repo> <path>")
+    .command("get <path>")
     .description("read the current version at <path>")
-    .action(function (this: Command, repo: string, path: string) {
+    .action(function (this: Command, path: string) {
       withClient(this, async (client, opts) => {
+        const repo = resolveRepoSlug(opts);
         const result = await client.docs.get(repo, path);
         emit(result, opts, renderVersionAsMarkdown(result));
       }).catch(reportError);
     });
 
   docs
-    .command("get-version <repo> <version-id>")
+    .command("get-version <version-id>")
     .description("read a specific version by id")
-    .action(function (this: Command, repo: string, versionId: string) {
+    .action(function (this: Command, versionId: string) {
       withClient(this, async (client, opts) => {
+        const repo = resolveRepoSlug(opts);
         const result = await client.docs.get_version(repo, versionId);
         emit(result, opts, renderVersionAsMarkdown(result));
       }).catch(reportError);
     });
 
   docs
-    .command("history <repo> <path>")
+    .command("history <path>")
     .description("list versions of a document newest-first")
     .option("--limit <n>", "limit to N most-recent (positive integer)", parsePositiveInt)
     .option("--before <ts>", "only versions with created_at < <ts>")
-    .action(function (this: Command, repo: string, path: string) {
+    .action(function (this: Command, path: string) {
       const localOpts = this.opts<{ limit?: number; before?: string }>();
       withClient(this, async (client, opts) => {
+        const repo = resolveRepoSlug(opts);
         const result = await client.docs.history(repo, path, {
           limit: localOpts.limit,
           before: localOpts.before,
@@ -532,13 +567,14 @@ function buildProgram(): Command {
     });
 
   docs
-    .command("diff <repo> <path>")
+    .command("diff <path>")
     .description("unified diff between two versions of a document (§4.3)")
     .requiredOption("--from <version-id>", "source version id")
     .requiredOption("--to <version-id>", "target version id")
-    .action(function (this: Command, repo: string, path: string) {
+    .action(function (this: Command, path: string) {
       const localOpts = this.opts<{ from: string; to: string }>();
       withClient(this, async (client, opts) => {
+        const repo = resolveRepoSlug(opts);
         const result = await client.docs.diff(repo, path, localOpts.from, localOpts.to);
         if (opts.json) {
           process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
@@ -550,12 +586,13 @@ function buildProgram(): Command {
     });
 
   docs
-    .command("create <repo> <path>")
+    .command("create <path>")
     .description("create a new document (fails if the path is taken)")
     .option("--from-file <file>", "read the markdown from a file or '-' for stdin")
-    .action(function (this: Command, repo: string, path: string) {
+    .action(function (this: Command, path: string) {
       const localOpts = this.opts<{ fromFile?: string }>();
       withClient(this, async (client, opts) => {
+        const repo = resolveRepoSlug(opts);
         const { frontmatter_raw, body } = readDocumentInput(localOpts.fromFile);
         const result = await client.docs.create(repo, path, { frontmatter_raw, body });
         emitVersionWrite(result, opts);
@@ -563,13 +600,14 @@ function buildProgram(): Command {
     });
 
   docs
-    .command("put <repo> <path>")
+    .command("put <path>")
     .description("update or move a document — path may differ from prev's path")
     .requiredOption("--prev <version-id>", "current version id (from get / history)")
     .option("--from-file <file>", "read the markdown from a file or '-' for stdin")
-    .action(function (this: Command, repo: string, path: string) {
+    .action(function (this: Command, path: string) {
       const localOpts = this.opts<{ prev: string; fromFile?: string }>();
       withClient(this, async (client, opts) => {
+        const repo = resolveRepoSlug(opts);
         const input: { frontmatter_raw?: string; body?: string } = {};
         if (localOpts.fromFile) {
           const parsed = readDocumentInput(localOpts.fromFile);
@@ -582,24 +620,26 @@ function buildProgram(): Command {
     });
 
   docs
-    .command("delete <repo> <path>")
+    .command("delete <path>")
     .description("delete a document — moves to :deleted/… (idempotent)")
     .requiredOption("--prev <version-id>", "current version id (from get / history)")
-    .action(function (this: Command, _repo: string, _path: string) {
+    .action(function (this: Command, _path: string) {
       const localOpts = this.opts<{ prev: string }>();
       withClient(this, async (client, opts) => {
-        const result = await client.docs.delete(_repo, localOpts.prev);
+        const repo = resolveRepoSlug(opts);
+        const result = await client.docs.delete(repo, localOpts.prev);
         emitVersionWrite(result, opts);
       }).catch(reportError);
     });
 
   docs
-    .command("mv <repo> <from-path> <to-path>")
+    .command("mv <from-path> <to-path>")
     .description("move a document — sugar for put at <to-path> with body unchanged")
     .requiredOption("--prev <version-id>", "current version id (from get / history)")
-    .action(function (this: Command, repo: string, _fromPath: string, toPath: string) {
+    .action(function (this: Command, _fromPath: string, toPath: string) {
       const localOpts = this.opts<{ prev: string }>();
       withClient(this, async (client, opts) => {
+        const repo = resolveRepoSlug(opts);
         const result = await client.docs.put(repo, localOpts.prev, toPath, {});
         emitVersionWrite(result, opts);
       }).catch(reportError);
@@ -610,7 +650,7 @@ function buildProgram(): Command {
     .command("query")
     .description("search documents — CEL filter + FTS text + rank (design §5)")
     .option(
-      "--repo <slug-or-glob>",
+      "-r, --repo <slug-or-glob>",
       "repo slug or glob; repeat the flag to query multiple (default: all in scope)",
       (value: string, prev: string[] | undefined) => [...(prev ?? []), value],
     )
@@ -655,7 +695,7 @@ function buildProgram(): Command {
   embed
     .command("backfill")
     .description("re-chunk + re-embed current versions missing chunks (§5.3)")
-    .requiredOption("--repo <slug>", "repo to backfill")
+    .requiredOption("-r, --repo <slug>", "repo to backfill")
     .option("--embed-url <url>", "HTTP embedding endpoint")
     .option("--embed-cmd <cmd>", "subprocess embedding command (JSON-lines over stdio)")
     .action(function (this: Command) {
@@ -773,17 +813,20 @@ function buildProgram(): Command {
     .option("--scope <spec>", "repo-scoped capability, repeatable — see help", parseScope, [])
     .option("--admin", "mint an admin token (requires the caller to be admin)", false)
     .option("--expires <ts>", "ISO 8601 expiry")
+    .option("--for-user <slug>", "mint on behalf of this user (admin only)")
     .action(function (this: Command) {
       const localOpts = this.opts<{
         label: string;
         scope: ScopeInput[];
         admin: boolean;
         expires?: string;
+        forUser?: string;
       }>();
       withClient(this, async (client, opts) => {
         const result = await client.tokens.create(localOpts.label, localOpts.scope, {
           admin: localOpts.admin,
           expires_at: localOpts.expires ?? null,
+          for_user: localOpts.forUser ?? null,
         });
         if (opts.json) {
           process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);

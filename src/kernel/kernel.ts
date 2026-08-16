@@ -113,7 +113,7 @@ export type Kernel = {
       actor: Actor,
       label: string | null,
       scopes: ScopeInput[],
-      opts?: { admin?: boolean; expires_at?: string | null },
+      opts?: { admin?: boolean; expires_at?: string | null; for_user?: string | null },
     ): Promise<TokenCreateResult>;
     revoke(actor: Actor, token_id: string): Promise<Token>;
   };
@@ -611,9 +611,22 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
         if (!actor.admin) {
           assertChildScopeSubset(actor.scopes, resolvedScopes);
         }
+        // for_user: admin can mint on behalf of another user (design §8 —
+        // bootstrapping a new user's first token). Anyone else silently
+        // targets themselves; explicitly naming a different user is
+        // forbidden.
+        let targetUserId = actor.user_id;
+        if (opts?.for_user) {
+          const target = await storage.users_by_slug(opts.for_user);
+          if (!target) throw userNotFound(opts.for_user);
+          if (target.id !== actor.user_id && !actor.admin) {
+            throw new KernelError("forbidden", {});
+          }
+          targetUserId = target.id;
+        }
         const secret = generateSecret();
         const row = await storage.tokens_create({
-          user_id: actor.user_id,
+          user_id: targetUserId,
           secret_hash: hashSecret(secret),
           label,
           scopes: serializeStoredScopes(resolvedScopes),

@@ -90,7 +90,11 @@ afterEach(async () => {
 
 describe("CLI --server round-trip", () => {
   it("repos create/list via --server", () => {
-    const env: Record<string, string> = { MRPLEX_TOKEN: rootToken, XDG_CONFIG_HOME: workDir };
+    const env: Record<string, string> = {
+      MRPLEX_TOKEN: rootToken,
+      MRPLEX_REPO: "notes",
+      XDG_CONFIG_HOME: workDir,
+    };
     let r = runCli(["--server", baseUrl, "repos", "create", "notes"], env);
     expect(r.status).toBe(0);
     expect(r.stdout).toContain("created repo notes");
@@ -103,7 +107,11 @@ describe("CLI --server round-trip", () => {
   });
 
   it("docs create + get via --server matches local", () => {
-    const env: Record<string, string> = { MRPLEX_TOKEN: rootToken, XDG_CONFIG_HOME: workDir };
+    const env: Record<string, string> = {
+      MRPLEX_TOKEN: rootToken,
+      MRPLEX_REPO: "notes",
+      XDG_CONFIG_HOME: workDir,
+    };
     runCli(["--server", baseUrl, "repos", "create", "notes"], env);
 
     // Create via remote using --from-file with markdown-with-frontmatter.
@@ -112,7 +120,7 @@ describe("CLI --server round-trip", () => {
     writeFileSync(docPath, original);
 
     let r = runCli(
-      ["--server", baseUrl, "docs", "create", "notes", "hello.md", "--from-file", docPath],
+      ["--server", baseUrl, "docs", "create", "hello.md", "--from-file", docPath],
       env,
     );
     expect(r.status).toBe(0);
@@ -120,22 +128,26 @@ describe("CLI --server round-trip", () => {
     expect(versionId).toMatch(/^v\d+$/);
 
     // Read via remote — pretty output is the markdown itself.
-    r = runCli(["--server", baseUrl, "docs", "get", "notes", "hello.md"], env);
+    r = runCli(["--server", baseUrl, "docs", "get", "hello.md"], env);
     expect(r.status).toBe(0);
     expect(r.stdout).toBe(original);
 
     // Compare with local read on the same db.
-    const local = runCli(["--database", dbUrl, "docs", "get", "notes", "hello.md"], env);
+    const local = runCli(["--database", dbUrl, "docs", "get", "hello.md"], env);
     expect(local.status).toBe(0);
     expect(local.stdout).toBe(r.stdout);
   });
 
   it("query via --server", () => {
-    const env: Record<string, string> = { MRPLEX_TOKEN: rootToken, XDG_CONFIG_HOME: workDir };
+    const env: Record<string, string> = {
+      MRPLEX_TOKEN: rootToken,
+      MRPLEX_REPO: "notes",
+      XDG_CONFIG_HOME: workDir,
+    };
     runCli(["--server", baseUrl, "repos", "create", "notes"], env);
     const docPath = join(workDir, "doc.md");
     writeFileSync(docPath, "---\nstatus: published\n---\nhi\n");
-    runCli(["--server", baseUrl, "docs", "create", "notes", "a.md", "--from-file", docPath], env);
+    runCli(["--server", baseUrl, "docs", "create", "a.md", "--from-file", docPath], env);
 
     const r = runCli(
       [
@@ -157,47 +169,26 @@ describe("CLI --server round-trip", () => {
   });
 
   it("stale_prev over remote surfaces as exit 2 with code", () => {
-    const env: Record<string, string> = { MRPLEX_TOKEN: rootToken, XDG_CONFIG_HOME: workDir };
+    const env: Record<string, string> = {
+      MRPLEX_TOKEN: rootToken,
+      MRPLEX_REPO: "notes",
+      XDG_CONFIG_HOME: workDir,
+    };
     runCli(["--server", baseUrl, "repos", "create", "notes"], env);
     const docPath = join(workDir, "doc.md");
     writeFileSync(docPath, "one\n");
-    runCli(
-      ["--server", baseUrl, "docs", "create", "notes", "hello.md", "--from-file", docPath],
-      env,
-    );
+    runCli(["--server", baseUrl, "docs", "create", "hello.md", "--from-file", docPath], env);
 
     // Update to v2, then try to put again with v1 — stale.
     writeFileSync(docPath, "two\n");
     runCli(
-      [
-        "--server",
-        baseUrl,
-        "docs",
-        "put",
-        "notes",
-        "hello.md",
-        "--prev",
-        "v1",
-        "--from-file",
-        docPath,
-      ],
+      ["--server", baseUrl, "docs", "put", "hello.md", "--prev", "v1", "--from-file", docPath],
       env,
     );
 
     writeFileSync(docPath, "three\n");
     const r = runCli(
-      [
-        "--server",
-        baseUrl,
-        "docs",
-        "put",
-        "notes",
-        "hello.md",
-        "--prev",
-        "v1",
-        "--from-file",
-        docPath,
-      ],
+      ["--server", baseUrl, "docs", "put", "hello.md", "--prev", "v1", "--from-file", docPath],
       env,
     );
     expect(r.status).toBe(2);
@@ -207,14 +198,22 @@ describe("CLI --server round-trip", () => {
   });
 
   it("--database + --server → exit 1 with clear message", () => {
-    const env: Record<string, string> = { MRPLEX_TOKEN: rootToken, XDG_CONFIG_HOME: workDir };
+    const env: Record<string, string> = {
+      MRPLEX_TOKEN: rootToken,
+      MRPLEX_REPO: "notes",
+      XDG_CONFIG_HOME: workDir,
+    };
     const r = runCli(["--database", dbUrl, "--server", baseUrl, "repos", "list"], env);
     expect(r.status).toBe(1);
     expect(r.stderr).toContain("mutually exclusive");
   });
 
   it("bad --server URL → exit 10 (network)", () => {
-    const env: Record<string, string> = { MRPLEX_TOKEN: "fake", XDG_CONFIG_HOME: workDir };
+    const env: Record<string, string> = {
+      MRPLEX_TOKEN: "fake",
+      MRPLEX_REPO: "notes",
+      XDG_CONFIG_HOME: workDir,
+    };
     const r = runCli(["--server", "http://127.0.0.1:59999", "repos", "list"], env);
     expect(r.status).toBe(10);
     expect(r.stderr).toContain("network:");

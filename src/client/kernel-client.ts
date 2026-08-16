@@ -64,7 +64,7 @@ export type KernelClient = {
     create(
       label: string | null,
       scopes: ScopeInput[],
-      opts?: { admin?: boolean; expires_at?: string | null },
+      opts?: { admin?: boolean; expires_at?: string | null; for_user?: string | null },
     ): Promise<TokenCreateResult>;
     revoke(token_id: string): Promise<Token>;
   };

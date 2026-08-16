@@ -30,24 +30,43 @@ npm install
 npm link          # puts `mrplex` on your PATH; alternatively, `npm install -g` after publish
 ```
 
-Point every command at the same database + token by exporting once:
+Point every command at the same database, token, and target repo by exporting once:
 
 ```bash
 export MRPLEX_DATABASE=./mrplex.db
 export MRPLEX_TOKEN=$(mrplex bootstrap)   # mints the root admin token exactly once
+export MRPLEX_REPO=notes                  # default repo for `docs *` commands
 ```
 
-Create a user + repo, then walk a doc through its lifecycle:
+`docs *` commands read the target repo from `MRPLEX_REPO`; override any call
+with `-r / --repo <slug>`.
+
+**Prefer a config file to environment variables?** `mrplex config set-*` writes
+`$XDG_CONFIG_HOME/mrplex/config.json` (defaults to `~/.config/mrplex/config.json`;
+token stored chmod 600):
 
 ```bash
-mrplex users create alice
+mrplex config set-database ./mrplex.db
+mrplex config set-token "$(mrplex bootstrap)"
+mrplex config set-repo notes
+mrplex config set-server http://127.0.0.1:8321   # optional — for remote mode
+mrplex config show                               # summary; token shown as (set) / (unset), never plaintext
+```
+
+Each setting is resolved **flag → env → config file → hardcoded default**, so a
+one-off `-r other-repo` or `--server https://…` overrides the persisted value
+without editing anything.
+
+Create the repo and walk a doc through its lifecycle:
+
+```bash
 mrplex repos create notes
 
 # create → update → move → delete → restore
 V=$(printf '%s\n' '---' 'title: Hello' '---' '' 'body v1' \
-    | mrplex --json docs create notes hello.md --from-file - | jq -r .version_id)
+    | mrplex --json docs create hello.md --from-file - | jq -r .version_id)
 
-V=$(mrplex --json docs put notes hello.md --prev "$V" --from-file - <<'EOF' | jq -r .version_id
+V=$(mrplex --json docs put hello.md --prev "$V" --from-file - <<'EOF' | jq -r .version_id
 ---
 title: Hello
 ---
@@ -55,18 +74,36 @@ body v2
 EOF
 )
 
-V=$(mrplex --json docs mv notes hello.md greetings/hi.md --prev "$V" | jq -r .version_id)
-V=$(mrplex --json docs delete notes greetings/hi.md --prev "$V" | jq -r .version_id)
-V=$(mrplex --json docs put notes greetings/hi.md --prev "$V" | jq -r .version_id)
+V=$(mrplex --json docs mv hello.md greetings/hi.md --prev "$V" | jq -r .version_id)
+V=$(mrplex --json docs delete greetings/hi.md --prev "$V" | jq -r .version_id)
+V=$(mrplex --json docs put greetings/hi.md --prev "$V" | jq -r .version_id)
 
 # History now has 5 versions in reverse chain order:
-mrplex docs history notes greetings/hi.md
+mrplex docs history greetings/hi.md
 ```
 
-Mint a scoped token for an agent:
+Mint a narrower token for an agent (subset of your own scope):
 
 ```bash
 mrplex tokens create --label "obsidian-plugin" --scope "notes:read=**,write=inbox/**"
+```
+
+Multi-user: the admin creates each user and mints their first token; hand it to
+them out-of-band. From then on the user manages their own tokens (list,
+revoke, mint sub-tokens no wider than what they hold).
+
+```bash
+mrplex users create alice
+ALICE_TOKEN=$(mrplex --json tokens create \
+    --for-user alice \
+    --label "alice-primary" \
+    --scope "notes:read=**,write=inbox/**" \
+  | jq -r .token)
+
+# Alice now uses her own token — no admin bit, scope only on notes/inbox.
+MRPLEX_TOKEN=$ALICE_TOKEN mrplex docs create inbox/hi.md --from-file - <<< $'---\n---\nhi\n'
+MRPLEX_TOKEN=$ALICE_TOKEN mrplex tokens create \
+    --label "alice-obsidian" --scope "notes:read=**,write=inbox/**"
 ```
 
 Query — CEL filters + FTS + rank composed:
@@ -98,8 +135,8 @@ mrplex query --repo notes \
 Diff any two versions of a document — history + diff give you the versioned reader:
 
 ```bash
-mrplex docs history notes greetings/hi.md
-mrplex docs diff notes greetings/hi.md --from v1 --to v3
+mrplex docs history greetings/hi.md
+mrplex docs diff greetings/hi.md --from v1 --to v3
 ```
 
 Serve the HTTP surfaces and drive the CLI remotely:
@@ -109,9 +146,9 @@ Serve the HTTP surfaces and drive the CLI remotely:
 mrplex serve --port 8321 &
 
 # Same commands, now over the network — --server takes precedence over --database
-mrplex --server http://127.0.0.1:8321 docs get notes greetings/hi.md
-mrplex --server http://127.0.0.1:8321 query --repo notes --filter 'status == "published"'
-mrplex --server http://127.0.0.1:8321 docs diff notes greetings/hi.md --from v1 --to v3
+mrplex --server http://127.0.0.1:8321 docs get greetings/hi.md
+mrplex --server http://127.0.0.1:8321 query -r notes --filter 'status == "published"'
+mrplex --server http://127.0.0.1:8321 docs diff greetings/hi.md --from v1 --to v3
 ```
 
 > Prefer not to `npm link`? Use `npx mrplex …` from the repo, or add

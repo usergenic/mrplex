@@ -166,6 +166,8 @@ function buildRemoteClient(client: Client): KernelClient {
           ...(opts?.admin !== undefined && { admin: opts.admin }),
           ...(opts?.expires_at !== undefined &&
             opts.expires_at !== null && { expires_at: opts.expires_at }),
+          ...(opts?.for_user !== undefined &&
+            opts.for_user !== null && { for_user: opts.for_user }),
         }),
       revoke: (id) => call<Token>("tokens_revoke", { token_id: id }),
     },

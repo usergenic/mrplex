@@ -474,6 +474,10 @@ export const TOOL_REGISTRY: ToolEntry[] = [
         },
         admin: { type: "boolean" },
         expires_at: { type: "string", description: "ISO-8601" },
+        for_user: {
+          type: "string",
+          description: "Mint on behalf of this user slug (admin only).",
+        },
       },
       required: ["label", "scopes"],
     },
@@ -482,6 +486,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       const result = await kernel.tokens.create(actor, argStr(args, "label"), scopes, {
         admin: argBoolOpt(args, "admin") ?? false,
         expires_at: argStrOpt(args, "expires_at") ?? null,
+        for_user: argStrOpt(args, "for_user") ?? null,
       });
       return { structured: result, text: renderTokenCreate(result) };
     },
