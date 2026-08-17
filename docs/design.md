@@ -823,17 +823,19 @@ mrplex users create <slug>
 mrplex users rename <slug> <new-slug>
 mrplex users delete <slug>                                        # system-namespace rename + revokes their tokens (§3.4)
 
-mrplex docs get <repo> <path>
-mrplex docs get-version <repo> <version-id>
-mrplex docs history <repo> <path> [--limit N] [--before <ts>]
-mrplex docs diff <repo> <path> --from <v> --to <v>
+                                                                  # `docs *` reads the target repo from -r/--repo, MRPLEX_REPO,
+                                                                  # or `config set-repo`; no positional <repo> argument.
+mrplex docs get <path>
+mrplex docs get-version <version-id>
+mrplex docs history <path> [--limit N] [--before <ts>]
+mrplex docs diff <path> --from <v> --to <v>
 
-mrplex docs create <repo> <path> [--from-file FILE | -]           # body from file or stdin
-mrplex docs put <repo> <path> --prev <version-id> [--from-file FILE | -]
+mrplex docs create <path> [--from-file FILE | -]                  # body from file or stdin
+mrplex docs put <path> --prev <version-id> [--from-file FILE | -]
                                                                   # <path> may differ from prev's path → move (optionally + content change)
                                                                   # to restore a deleted doc, use put with --prev = trashed version id
-mrplex docs delete <repo> <path> --prev <version-id>
-mrplex docs mv <repo> <from-path> <to-path> --prev <version-id>   # sugar: put to <to-path> with unchanged content
+mrplex docs delete --prev <version-id>                            # target is fully addressed by --prev
+mrplex docs mv <to-path> --prev <version-id>                      # sugar: put to <to-path> with unchanged content
 
 mrplex query [--repo <slug-or-glob>] [--filter EXPR] [--text Q] [--rank Q] [--limit N]
                                                                   # --repo omitted = every repo in the token's scope (§5.1)
@@ -850,6 +852,7 @@ mrplex tokens revoke <token-id>
 
 - `--server <url>` (default from config) — the mrplex endpoint. When absent and a local SQLite file exists, run against it directly.
 - `--token <token>` (default from config or `MRPLEX_TOKEN` env) — bearer token.
+- `-r, --repo <slug>` (default from `MRPLEX_REPO` env or config `repo`) — target repo for `docs *` commands. `query` and `embed backfill` keep their own `--repo` because their semantics differ (multi-repo glob and required, respectively).
 - `--json` — emit raw JSON instead of pretty output. Enables piping into `jq`.
 
 **Input conventions:**
@@ -956,7 +959,7 @@ Bootstrap root token: `{ admin: true, scopes: [{ repo: "*", read: "**", write: "
 
 ```rpc
 mrplex.tokens.list()                                        → Token[]         -- current user's tokens
-mrplex.tokens.create(label, scopes, expires_at?)            → { token, meta } -- token shown once, in plaintext
+mrplex.tokens.create(label, scopes, expires_at?, for_user?) → { token, meta } -- token shown once, in plaintext
 mrplex.tokens.revoke(token_id)                              → Token
 ```
 
@@ -969,6 +972,10 @@ DELETE /me/tokens/{id}                                      → Token
 ```
 
 Server-side, `api_tokens` (§3.2) holds `secret_hash` (never the plaintext), `label`, `scopes`, `expires_at`, `revoked_at`, `last_used_at`.
+
+**Self-management is identity-based, not scope-gated.** Every authenticated user can `tokens.list`, `tokens.revoke`, and `tokens.create` against their own token set regardless of what their scopes cover; the kernel keys these ops off `actor.user_id`, and `tokens.create` mints under `actor.user_id` by default. Sub-tokens minted by a non-admin must be a subset of the caller's own scopes and cannot set the admin bit (§8.2 subset rule) — the safety property that lets self-mint be unconditional. This axis is deliberately outside the scope grammar: scopes govern *what data you can touch*, identity governs *what identity you can speak for*.
+
+**Cross-user token minting** (bootstrapping a new user's first bearer) is admin-only. The optional `for_user` argument on `tokens.create` names a target user slug; if it differs from `actor.user_id`, the caller must carry the admin bit. This is the only supported path from "user exists" to "user has a working token" — hand the plaintext to the user out-of-band (encrypted email, secret manager, in-person) and they self-serve from there.
 
 Bootstrap: server creation seeds a `system` user and issues one root token (`{ admin: true, scopes: [{ repo: "*", read: "**", write: "**" }] }`, per §8.2) printed to the operator once at first launch. Everything else can be created from there.
 

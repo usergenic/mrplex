@@ -28,6 +28,9 @@ function run(...args: string[]): { stdout: string; stderr: string; status: numbe
   const env: Record<string, string> = {
     ...(process.env as Record<string, string>),
     MRPLEX_TOKEN: rootToken,
+    // Most `docs *` tests target the seeded `notes` repo; individual tests
+    // override with an explicit `-r <slug>` when they need something else.
+    MRPLEX_REPO: "notes",
     // Point config at the workdir so per-user ~/.config doesn't leak into tests.
     XDG_CONFIG_HOME: workDir,
   };
@@ -71,7 +74,7 @@ describe("cli", () => {
   });
 
   it("docs get — returns pretty markdown with frontmatter", () => {
-    const out = run("docs", "get", "notes", "welcome.md");
+    const out = run("docs", "get", "welcome.md");
     expect(out.status).toBe(0);
     expect(out.stdout).toMatch(/^---\n/);
     expect(out.stdout).toContain("title: Welcome");
@@ -79,7 +82,7 @@ describe("cli", () => {
   });
 
   it("docs get --json — returns a Version envelope", () => {
-    const out = run("--json", "docs", "get", "notes", "welcome.md");
+    const out = run("--json", "docs", "get", "welcome.md");
     expect(out.status).toBe(0);
     const v = JSON.parse(out.stdout);
     expect(v.repo).toBe("notes");
@@ -90,40 +93,40 @@ describe("cli", () => {
   });
 
   it("docs history — newest-first with the current-marker", () => {
-    const out = run("docs", "history", "notes", "welcome.md");
+    const out = run("docs", "history", "welcome.md");
     expect(out.status).toBe(0);
     // Two lines of data (the second welcome revision has 2 versions).
     expect(out.stdout).toMatch(/current/);
   });
 
   it("doc_not_found exits 4", () => {
-    const out = run("docs", "get", "notes", "missing.md");
+    const out = run("docs", "get", "missing.md");
     expect(out.status).toBe(4);
     expect(out.stderr).toContain("doc_not_found");
   });
 
   it("repo_not_found exits 4", () => {
-    const out = run("docs", "get", "nope", "welcome.md");
+    const out = run("-r", "nope", "docs", "get", "welcome.md");
     expect(out.status).toBe(4);
     expect(out.stderr).toContain("repo_not_found");
   });
 
   it("version_not_found exits 4 for malformed id", () => {
-    const out = run("docs", "get-version", "notes", "not-a-version");
+    const out = run("docs", "get-version", "not-a-version");
     expect(out.status).toBe(4);
     expect(out.stderr).toContain("version_not_found");
   });
 
   it("--limit rejects non-integer / partial-parse / non-positive values", () => {
     for (const bad of ["2x", "abc", "0", "-1", "1.5", ""]) {
-      const out = run("docs", "history", "notes", "welcome.md", "--limit", bad);
+      const out = run("docs", "history", "welcome.md", "--limit", bad);
       expect(out.status).not.toBe(0);
       expect(out.stderr).toMatch(/positive integer/);
     }
   });
 
   it("docs get emits exactly one trailing newline (no blank line at end)", () => {
-    const out = run("docs", "get", "notes", "welcome.md");
+    const out = run("docs", "get", "welcome.md");
     expect(out.status).toBe(0);
     // Body already ends in \n; the CLI must add zero extras.
     expect(out.stdout.endsWith("\n")).toBe(true);

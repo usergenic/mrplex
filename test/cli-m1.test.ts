@@ -33,6 +33,9 @@ function run(
     ...opts?.env,
   };
   if (token) env.MRPLEX_TOKEN = token;
+  // Default MRPLEX_REPO=notes: every scenario in this file uses the `notes`
+  // repo. Callers can override via `opts.env` when needed.
+  if (env.MRPLEX_REPO === undefined) env.MRPLEX_REPO = "notes";
   // Isolate the CLI config to the workdir so per-user ~/.config doesn't leak
   // in between test runs.
   env.XDG_CONFIG_HOME = workDir;
@@ -69,7 +72,7 @@ describe("cli m1 — end-to-end flow", () => {
     expect(run(["repos", "create", "notes"]).status).toBe(0);
 
     // docs create — read frontmatter from stdin.
-    const created = run(["--json", "docs", "create", "notes", "hello.md", "--from-file", "-"], {
+    const created = run(["--json", "docs", "create", "hello.md", "--from-file", "-"], {
       stdin: "---\ntitle: Hello\n---\nbody v1\n",
     });
     expect(created.status).toBe(0);
@@ -79,7 +82,7 @@ describe("cli m1 — end-to-end flow", () => {
 
     // docs put — update the body.
     const put = run(
-      ["--json", "docs", "put", "notes", "hello.md", "--prev", v1.version_id, "--from-file", "-"],
+      ["--json", "docs", "put", "hello.md", "--prev", v1.version_id, "--from-file", "-"],
       { stdin: "---\ntitle: Hello\n---\nbody v2\n" },
     );
     expect(put.status).toBe(0);
@@ -87,50 +90,25 @@ describe("cli m1 — end-to-end flow", () => {
     expect(v2.body).toBe("body v2\n");
 
     // docs mv — move to a new path.
-    const mv = run([
-      "--json",
-      "docs",
-      "mv",
-      "notes",
-      "hello.md",
-      "greetings/hi.md",
-      "--prev",
-      v2.version_id,
-    ]);
+    const mv = run(["--json", "docs", "mv", "greetings/hi.md", "--prev", v2.version_id]);
     expect(mv.status).toBe(0);
     const v3 = JSON.parse(mv.stdout) as { version_id: string; path: string };
     expect(v3.path).toBe("greetings/hi.md");
 
     // docs delete.
-    const del = run([
-      "--json",
-      "docs",
-      "delete",
-      "notes",
-      "greetings/hi.md",
-      "--prev",
-      v3.version_id,
-    ]);
+    const del = run(["--json", "docs", "delete", "--prev", v3.version_id]);
     expect(del.status).toBe(0);
     const v4 = JSON.parse(del.stdout) as { version_id: string; path: string };
     expect(v4.path).toMatch(/^:deleted\//);
 
     // docs put — restore.
-    const restore = run([
-      "--json",
-      "docs",
-      "put",
-      "notes",
-      "greetings/hi.md",
-      "--prev",
-      v4.version_id,
-    ]);
+    const restore = run(["--json", "docs", "put", "greetings/hi.md", "--prev", v4.version_id]);
     expect(restore.status).toBe(0);
     const v5 = JSON.parse(restore.stdout) as { version_id: string; path: string };
     expect(v5.path).toBe("greetings/hi.md");
 
     // docs history — should have 5 entries in reverse chain order.
-    const hist = run(["--json", "docs", "history", "notes", "greetings/hi.md"]);
+    const hist = run(["--json", "docs", "history", "greetings/hi.md"]);
     expect(hist.status).toBe(0);
     const history = JSON.parse(hist.stdout) as { version_id: string; path: string }[];
     expect(history).toHaveLength(5);
@@ -139,21 +117,20 @@ describe("cli m1 — end-to-end flow", () => {
 
   it("stale_prev exits 2 with current attached", () => {
     expect(run(["repos", "create", "notes"]).status).toBe(0);
-    const created = run(["--json", "docs", "create", "notes", "x.md", "--from-file", "-"], {
+    const created = run(["--json", "docs", "create", "x.md", "--from-file", "-"], {
       stdin: "---\n---\nv1\n",
     });
     const v1 = JSON.parse(created.stdout) as { version_id: string };
     // First put advances.
     const put1 = run(
-      ["--json", "docs", "put", "notes", "x.md", "--prev", v1.version_id, "--from-file", "-"],
+      ["--json", "docs", "put", "x.md", "--prev", v1.version_id, "--from-file", "-"],
       { stdin: "---\n---\nv2\n" },
     );
     expect(put1.status).toBe(0);
     // Second put with the STALE v1 → exit 2.
-    const put2 = run(
-      ["docs", "put", "notes", "x.md", "--prev", v1.version_id, "--from-file", "-"],
-      { stdin: "---\n---\nv3\n" },
-    );
+    const put2 = run(["docs", "put", "x.md", "--prev", v1.version_id, "--from-file", "-"], {
+      stdin: "---\n---\nv3\n",
+    });
     expect(put2.status).toBe(2);
     expect(put2.stderr).toContain("stale_prev");
     expect(put2.stderr).toContain("current_version_id");
@@ -161,7 +138,7 @@ describe("cli m1 — end-to-end flow", () => {
 
   it("path_invalid exits 1", () => {
     expect(run(["repos", "create", "notes"]).status).toBe(0);
-    const res = run(["docs", "create", "notes", ":deleted/nope.md", "--from-file", "-"], {
+    const res = run(["docs", "create", ":deleted/nope.md", "--from-file", "-"], {
       stdin: "---\n---\nb\n",
     });
     expect(res.status).toBe(1);

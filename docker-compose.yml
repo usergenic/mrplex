@@ -1,0 +1,22 @@
+name: mrplex
+
+services:
+  postgres:
+    profiles: ["postgres"]
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: mrplex
+      POSTGRES_PASSWORD: mrplex
+      POSTGRES_DB: mrplex
+    ports:
+      - "5432:5432"
+    volumes:
+      - mrplex-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mrplex"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+volumes:
+  mrplex-pgdata:

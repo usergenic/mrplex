@@ -16,7 +16,11 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "cli": "tsx src/cli/main.ts",
-    "seed": "tsx scripts/seed.ts"
+    "seed": "tsx scripts/seed.ts",
+    "pg:up": "docker compose --profile postgres up -d",
+    "pg:down": "docker compose --profile postgres down",
+    "pg:reset": "docker compose --profile postgres down -v && docker compose --profile postgres up -d",
+    "pg:logs": "docker compose --profile postgres logs -f postgres"
   },
   "engines": {
     "node": ">=20.11.0"

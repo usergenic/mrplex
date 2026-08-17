@@ -307,4 +307,59 @@ describe("tokens.create/list/revoke", () => {
     const revoked = await kernel.tokens.revoke(bobActor, `t${bobToken.id}`);
     expect(revoked.id).toBe(`t${bobToken.id}`);
   });
+
+  it("for_user: admin mints on behalf of another user; token resolves as that user", async () => {
+    const bob = await kernel.users.create(admin, "bob");
+    const bobRow = await storage.users_by_slug(bob.user);
+    if (!bobRow) throw new Error("seed");
+    const { token, meta } = await kernel.tokens.create(
+      admin,
+      "bob-primary",
+      [{ repo: "*", read: "**" }],
+      { for_user: "bob" },
+    );
+    expect(meta.label).toBe("bob-primary");
+    const resolved = await resolveActor(token, storage);
+    expect(resolved?.user_id).toBe(bobRow.id);
+    expect(resolved?.admin).toBe(false);
+  });
+
+  it("for_user: unknown user → user_not_found", async () => {
+    await expect(
+      kernel.tokens.create(admin, "nope", [{ repo: "*", read: "**" }], { for_user: "ghost" }),
+    ).rejects.toMatchObject({ code: "user_not_found" });
+  });
+
+  it("for_user: non-admin forbidden when target differs from self", async () => {
+    const bob = await kernel.users.create(admin, "bob");
+    void bob;
+    const nonAdmin: Actor = {
+      user_id: admin.user_id,
+      admin: false,
+      scopes: [{ repos: "*", read: ["**"] }],
+    };
+    await expect(
+      kernel.tokens.create(nonAdmin, "t", [{ repo: "*", read: "**" }], { for_user: "bob" }),
+    ).rejects.toMatchObject({ code: "forbidden" });
+  });
+
+  it("for_user: non-admin naming self is allowed (no-op)", async () => {
+    // Seed a non-admin user 'carol' + a scope so her subset check passes.
+    const carol = await kernel.users.create(admin, "carol");
+    const carolRow = await storage.users_by_slug(carol.user);
+    if (!carolRow) throw new Error("seed");
+    const carolActor: Actor = {
+      user_id: carolRow.id,
+      admin: false,
+      scopes: [{ repos: "*", read: ["**"] }],
+    };
+    const { token } = await kernel.tokens.create(
+      carolActor,
+      "carol-self",
+      [{ repo: "*", read: "**" }],
+      { for_user: "carol" },
+    );
+    const resolved = await resolveActor(token, storage);
+    expect(resolved?.user_id).toBe(carolRow.id);
+  });
 });

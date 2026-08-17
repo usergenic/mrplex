@@ -386,6 +386,76 @@ describe("REST query", () => {
   });
 });
 
+describe("REST /me/tokens POST", () => {
+  it("mints a token for the caller (no for_user)", async () => {
+    const r = await fetch(`${base}/me/tokens`, {
+      method: "POST",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ label: "self", scopes: [{ repo: "*", read: "**" }] }),
+    });
+    expect(r.status).toBe(201);
+    const created = await readJson<{ token: string; meta: { id: string; label: string } }>(r);
+    expect(created.token).toMatch(/^mrplex_/);
+    expect(created.meta.label).toBe("self");
+  });
+
+  it("for_user: admin mints on behalf of another user", async () => {
+    await fetch(`${base}/users`, {
+      method: "POST",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ slug: "alice" }),
+    });
+    const r = await fetch(`${base}/me/tokens`, {
+      method: "POST",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({
+        label: "alice-primary",
+        scopes: [{ repo: "*", read: "**" }],
+        for_user: "alice",
+      }),
+    });
+    expect(r.status).toBe(201);
+    const created = await readJson<{ token: string; meta: { id: string; label: string } }>(r);
+    expect(created.meta.label).toBe("alice-primary");
+    // The minted token authenticates as alice — /me/tokens list must show
+    // exactly the one token we just created for her.
+    const list = await fetch(`${base}/me/tokens`, {
+      headers: { Authorization: `Bearer ${created.token}` },
+    });
+    expect(list.status).toBe(200);
+    const rows = await readJson<{ id: string }[]>(list);
+    expect(rows.map((r) => r.id)).toEqual([created.meta.id]);
+  });
+
+  it("for_user: unknown user → 404 user_not_found", async () => {
+    const r = await fetch(`${base}/me/tokens`, {
+      method: "POST",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({
+        label: "ghost",
+        scopes: [{ repo: "*", read: "**" }],
+        for_user: "ghost",
+      }),
+    });
+    expect(r.status).toBe(404);
+    expect((await readJson<{ code: string }>(r)).code).toBe("user_not_found");
+  });
+
+  it("for_user: wrong-type → 400 filter_invalid (not silently ignored)", async () => {
+    const r = await fetch(`${base}/me/tokens`, {
+      method: "POST",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({
+        label: "bad",
+        scopes: [{ repo: "*", read: "**" }],
+        for_user: 42,
+      }),
+    });
+    expect(r.status).toBe(400);
+    expect((await readJson<{ code: string }>(r)).code).toBe("filter_invalid");
+  });
+});
+
 describe("REST error mapping", () => {
   it("doc_not_found → 404", async () => {
     await fetch(`${base}/repos`, {

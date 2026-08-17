@@ -621,6 +621,7 @@ async function dispatchMeTokens(
         scopes?: unknown;
         admin?: unknown;
         expires_at?: unknown;
+        for_user?: unknown;
       };
       if (typeof body.label !== "string" && body.label !== null) {
         throw new KernelError("filter_invalid", { reason: "body.label required (string | null)" });
@@ -633,11 +634,24 @@ async function dispatchMeTokens(
           : typeof body.expires_at === "string"
             ? body.expires_at
             : null;
+      // for_user: admin-only cross-user mint (design §8.3). Kernel enforces
+      // the admin bit; we only shape-check here.
+      if (
+        body.for_user !== undefined &&
+        body.for_user !== null &&
+        typeof body.for_user !== "string"
+      ) {
+        throw new KernelError("filter_invalid", {
+          reason: "body.for_user must be a string (user slug) or omitted",
+        });
+      }
+      const for_user =
+        typeof body.for_user === "string" && body.for_user.length > 0 ? body.for_user : null;
       const result = await kernel.tokens.create(
         actor,
         (body.label ?? null) as string | null,
         scopes,
-        { admin, expires_at },
+        { admin, expires_at, for_user },
       );
       writeJson(res, 201, result);
       return;

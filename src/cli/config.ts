@@ -19,6 +19,7 @@ export type CliConfig = {
   database?: string;
   server?: string;
   token?: string;
+  repo?: string;
 };
 
 export function configPath(): string {
