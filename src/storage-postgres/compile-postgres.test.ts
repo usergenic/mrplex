@@ -177,13 +177,13 @@ if (!PG_URL) {
         );
       });
 
-      it("$created_at comparison", async () => {
+      it("$updated_at comparison", async () => {
         const [a, b] = await seed([
           { path: "a.md", frontmatter: {} },
           { path: "b.md", frontmatter: {} },
         ]);
-        expect(await runQuery('$created_at < "2026-08-14T00:00:01.000Z"')).toEqual([a]);
-        expect(await runQuery('$created_at <= "2026-08-14T00:00:01.000Z"')).toEqual(
+        expect(await runQuery('$updated_at < "2026-08-14T00:00:01.000Z"')).toEqual([a]);
+        expect(await runQuery('$updated_at <= "2026-08-14T00:00:01.000Z"')).toEqual(
           [a, b].slice().sort((x, y) => (x as number) - (y as number)),
         );
       });

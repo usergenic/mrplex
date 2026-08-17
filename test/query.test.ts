@@ -270,7 +270,7 @@ describe("query — multi-repo", () => {
 // -----------------------------------------------------------------------------
 
 describe("query — ordering + limit", () => {
-  it("orders by $created_at desc when no text", async () => {
+  it("orders by $updated_at desc when no text", async () => {
     // Create in order — created_at increments per docs.create call.
     const v1 = await seedDoc("notes", "a.md", {}, "");
     const v2 = await seedDoc("notes", "b.md", {}, "");

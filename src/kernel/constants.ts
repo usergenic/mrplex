@@ -9,8 +9,8 @@
  *
  * Two surfaces share it:
  *
- *   • Query filter syntax — `$path`, `$created_at`, and other intrinsics
- *     recognized by the CEL parser (see ../kernel/query/cel-parse.ts).
+ *   • Query filter syntax — `$path`, `$updated_at`, `$body`, and other
+ *     intrinsics recognized by the CEL parser (see ../kernel/query/cel-parse.ts).
  *   • Frontmatter system properties — `$version` and (future) `$author`,
  *     `$updated_at`, etc., injected into GET responses and stripped on
  *     write (see ../markdown/frontmatter.ts).

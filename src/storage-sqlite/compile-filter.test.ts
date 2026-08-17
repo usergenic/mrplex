@@ -152,15 +152,15 @@ describe("intrinsics", () => {
     expect(runQuery('$path.startsWith("drafts/")')).toEqual([a, c]);
   });
 
-  it("$created_at comparison", async () => {
+  it("$updated_at comparison", async () => {
     const [a, b] = await seed([
       { path: "a.md", frontmatter: {} },
       { path: "b.md", frontmatter: {} },
     ]);
     // JS Date.toISOString emits "...:00.000Z" — string-compare uses the
     // literal representation. Match the exact format the seeder produced.
-    expect(runQuery('$created_at < "2026-08-14T00:00:01.000Z"')).toEqual([a]);
-    expect(runQuery('$created_at <= "2026-08-14T00:00:01.000Z"')).toEqual([a, b]);
+    expect(runQuery('$updated_at < "2026-08-14T00:00:01.000Z"')).toEqual([a]);
+    expect(runQuery('$updated_at <= "2026-08-14T00:00:01.000Z"')).toEqual([a, b]);
   });
 
   it("unknown $-intrinsic → filter_invalid", async () => {

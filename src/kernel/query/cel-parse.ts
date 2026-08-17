@@ -8,11 +8,12 @@
  * parser choices. If we later need to swap to `cel-go`/WASM for M5 parity,
  * only this file changes; the compiler doesn't.
  *
- * The design's `$`-prefixed intrinsics (`$path`, `$created_at`) are not
- * legal identifiers in standard CEL. Rather than patch the grammar, we
- * preprocess: `$foo` → `__mrplex_i_foo` before parsing, and the AST walker
- * recognizes the prefix (see ../query/intrinsics.ts). The preprocessor is
- * string-literal-aware so `contains(body, "$foo")` is untouched.
+ * The design's `$`-prefixed intrinsics (`$path`, `$updated_at`, `$body`)
+ * are not legal identifiers in standard CEL. Rather than patch the grammar,
+ * we preprocess: `$foo` → `__mrplex_i_foo` before parsing, and the storage
+ * compilers under storage-sqlite / storage-postgres resolve the mangled
+ * names to columns. The preprocessor is string-literal-aware so
+ * `contains(body, "$foo")` is untouched.
  */
 
 import { parse } from "@bufbuild/cel";

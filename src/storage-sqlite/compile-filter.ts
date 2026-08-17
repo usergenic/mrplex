@@ -8,8 +8,11 @@
  * Design-mandated ergonomics:
  *   • Bare identifiers refer to frontmatter keys, compiled to
  *     `json_extract(versions.frontmatter, '$."name"')`.
- *   • `$path`, `$created_at` — kernel-owned intrinsics, compiled to
- *     `versions.path` / `versions.created_at` (§5.1).
+ *   • `$path`, `$updated_at` — kernel-owned intrinsics, compiled to
+ *     `versions.path` / `versions.created_at` (§5.1). `$updated_at` names
+ *     the intrinsic from the caller's mental model — queries always see
+ *     current versions, so the version's created_at IS the doc's last
+ *     update time.
  *   • `list(x)` — a compile-time hint that the enclosing expression should
  *     compile against scalar OR list frontmatter shapes (§5.2).
  *   • Missing key → false predicate (m2-plan §5 decision).
@@ -41,7 +44,11 @@ export function compileFilter(expr: CelExpr): SqlFragment {
 
 const INTRINSIC_COLUMNS: Record<string, string> = {
   path: "versions.path",
-  created_at: "versions.created_at",
+  // `$updated_at` reads as "the timestamp of the current version" — which is
+  // what filters see (`next_id IS NULL` is implicit). The underlying column
+  // is `versions.created_at` (when this version row was written), but from
+  // a query-writer's mental model that's the doc's last update time.
+  updated_at: "versions.created_at",
   // The document body — a text column, addressable via $body for the
   // consistency of the $-prefixed convention. Design §5.1's example
   // `contains(body, "pricing")` is updated to `$body`.
