@@ -526,13 +526,21 @@ function buildProgram(): Command {
   // -------- docs --------
   // The target repo is a global (-r/--repo, MRPLEX_REPO, or config `repo`);
   // `docs *` commands take only <path> because most sessions live inside one repo.
+  // Each action resolves the repo BEFORE `withClient` opens a connection — in
+  // remote mode that avoids a wasted network round-trip when the slug is unset.
   const docs = program.command("docs").description("document ops");
   docs
     .command("get <path>")
     .description("read the current version at <path>")
     .action(function (this: Command, path: string) {
+      const globals = this.optsWithGlobals<GlobalOpts>();
+      let repo: string;
+      try {
+        repo = resolveRepoSlug(globals);
+      } catch (err) {
+        reportError(err);
+      }
       withClient(this, async (client, opts) => {
-        const repo = resolveRepoSlug(opts);
         const result = await client.docs.get(repo, path);
         emit(result, opts, renderVersionAsMarkdown(result));
       }).catch(reportError);
@@ -542,8 +550,14 @@ function buildProgram(): Command {
     .command("get-version <version-id>")
     .description("read a specific version by id")
     .action(function (this: Command, versionId: string) {
+      const globals = this.optsWithGlobals<GlobalOpts>();
+      let repo: string;
+      try {
+        repo = resolveRepoSlug(globals);
+      } catch (err) {
+        reportError(err);
+      }
       withClient(this, async (client, opts) => {
-        const repo = resolveRepoSlug(opts);
         const result = await client.docs.get_version(repo, versionId);
         emit(result, opts, renderVersionAsMarkdown(result));
       }).catch(reportError);
@@ -556,8 +570,14 @@ function buildProgram(): Command {
     .option("--before <ts>", "only versions with created_at < <ts>")
     .action(function (this: Command, path: string) {
       const localOpts = this.opts<{ limit?: number; before?: string }>();
+      const globals = this.optsWithGlobals<GlobalOpts>();
+      let repo: string;
+      try {
+        repo = resolveRepoSlug(globals);
+      } catch (err) {
+        reportError(err);
+      }
       withClient(this, async (client, opts) => {
-        const repo = resolveRepoSlug(opts);
         const result = await client.docs.history(repo, path, {
           limit: localOpts.limit,
           before: localOpts.before,
@@ -573,8 +593,14 @@ function buildProgram(): Command {
     .requiredOption("--to <version-id>", "target version id")
     .action(function (this: Command, path: string) {
       const localOpts = this.opts<{ from: string; to: string }>();
+      const globals = this.optsWithGlobals<GlobalOpts>();
+      let repo: string;
+      try {
+        repo = resolveRepoSlug(globals);
+      } catch (err) {
+        reportError(err);
+      }
       withClient(this, async (client, opts) => {
-        const repo = resolveRepoSlug(opts);
         const result = await client.docs.diff(repo, path, localOpts.from, localOpts.to);
         if (opts.json) {
           process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
@@ -591,8 +617,14 @@ function buildProgram(): Command {
     .option("--from-file <file>", "read the markdown from a file or '-' for stdin")
     .action(function (this: Command, path: string) {
       const localOpts = this.opts<{ fromFile?: string }>();
+      const globals = this.optsWithGlobals<GlobalOpts>();
+      let repo: string;
+      try {
+        repo = resolveRepoSlug(globals);
+      } catch (err) {
+        reportError(err);
+      }
       withClient(this, async (client, opts) => {
-        const repo = resolveRepoSlug(opts);
         const { frontmatter_raw, body } = readDocumentInput(localOpts.fromFile);
         const result = await client.docs.create(repo, path, { frontmatter_raw, body });
         emitVersionWrite(result, opts);
@@ -606,8 +638,14 @@ function buildProgram(): Command {
     .option("--from-file <file>", "read the markdown from a file or '-' for stdin")
     .action(function (this: Command, path: string) {
       const localOpts = this.opts<{ prev: string; fromFile?: string }>();
+      const globals = this.optsWithGlobals<GlobalOpts>();
+      let repo: string;
+      try {
+        repo = resolveRepoSlug(globals);
+      } catch (err) {
+        reportError(err);
+      }
       withClient(this, async (client, opts) => {
-        const repo = resolveRepoSlug(opts);
         const input: { frontmatter_raw?: string; body?: string } = {};
         if (localOpts.fromFile) {
           const parsed = readDocumentInput(localOpts.fromFile);
@@ -620,26 +658,38 @@ function buildProgram(): Command {
     });
 
   docs
-    .command("delete <path>")
+    .command("delete")
     .description("delete a document — moves to :deleted/… (idempotent)")
     .requiredOption("--prev <version-id>", "current version id (from get / history)")
-    .action(function (this: Command, _path: string) {
+    .action(function (this: Command) {
       const localOpts = this.opts<{ prev: string }>();
+      const globals = this.optsWithGlobals<GlobalOpts>();
+      let repo: string;
+      try {
+        repo = resolveRepoSlug(globals);
+      } catch (err) {
+        reportError(err);
+      }
       withClient(this, async (client, opts) => {
-        const repo = resolveRepoSlug(opts);
         const result = await client.docs.delete(repo, localOpts.prev);
         emitVersionWrite(result, opts);
       }).catch(reportError);
     });
 
   docs
-    .command("mv <from-path> <to-path>")
+    .command("mv <to-path>")
     .description("move a document — sugar for put at <to-path> with body unchanged")
     .requiredOption("--prev <version-id>", "current version id (from get / history)")
-    .action(function (this: Command, _fromPath: string, toPath: string) {
+    .action(function (this: Command, toPath: string) {
       const localOpts = this.opts<{ prev: string }>();
+      const globals = this.optsWithGlobals<GlobalOpts>();
+      let repo: string;
+      try {
+        repo = resolveRepoSlug(globals);
+      } catch (err) {
+        reportError(err);
+      }
       withClient(this, async (client, opts) => {
-        const repo = resolveRepoSlug(opts);
         const result = await client.docs.put(repo, localOpts.prev, toPath, {});
         emitVersionWrite(result, opts);
       }).catch(reportError);

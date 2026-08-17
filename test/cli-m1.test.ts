@@ -90,21 +90,13 @@ describe("cli m1 — end-to-end flow", () => {
     expect(v2.body).toBe("body v2\n");
 
     // docs mv — move to a new path.
-    const mv = run([
-      "--json",
-      "docs",
-      "mv",
-      "hello.md",
-      "greetings/hi.md",
-      "--prev",
-      v2.version_id,
-    ]);
+    const mv = run(["--json", "docs", "mv", "greetings/hi.md", "--prev", v2.version_id]);
     expect(mv.status).toBe(0);
     const v3 = JSON.parse(mv.stdout) as { version_id: string; path: string };
     expect(v3.path).toBe("greetings/hi.md");
 
     // docs delete.
-    const del = run(["--json", "docs", "delete", "greetings/hi.md", "--prev", v3.version_id]);
+    const del = run(["--json", "docs", "delete", "--prev", v3.version_id]);
     expect(del.status).toBe(0);
     const v4 = JSON.parse(del.stdout) as { version_id: string; path: string };
     expect(v4.path).toMatch(/^:deleted\//);

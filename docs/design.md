@@ -834,8 +834,8 @@ mrplex docs create <path> [--from-file FILE | -]                  # body from fi
 mrplex docs put <path> --prev <version-id> [--from-file FILE | -]
                                                                   # <path> may differ from prev's path → move (optionally + content change)
                                                                   # to restore a deleted doc, use put with --prev = trashed version id
-mrplex docs delete <path> --prev <version-id>
-mrplex docs mv <from-path> <to-path> --prev <version-id>          # sugar: put to <to-path> with unchanged content
+mrplex docs delete --prev <version-id>                            # target is fully addressed by --prev
+mrplex docs mv <to-path> --prev <version-id>                      # sugar: put to <to-path> with unchanged content
 
 mrplex query [--repo <slug-or-glob>] [--filter EXPR] [--text Q] [--rank Q] [--limit N]
                                                                   # --repo omitted = every repo in the token's scope (§5.1)

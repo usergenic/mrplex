@@ -74,8 +74,8 @@ body v2
 EOF
 )
 
-V=$(mrplex --json docs mv hello.md greetings/hi.md --prev "$V" | jq -r .version_id)
-V=$(mrplex --json docs delete greetings/hi.md --prev "$V" | jq -r .version_id)
+V=$(mrplex --json docs mv greetings/hi.md --prev "$V" | jq -r .version_id)
+V=$(mrplex --json docs delete --prev "$V" | jq -r .version_id)
 V=$(mrplex --json docs put greetings/hi.md --prev "$V" | jq -r .version_id)
 
 # History now has 5 versions in reverse chain order:
