@@ -21,9 +21,25 @@
  */
 
 import { parse as parseYaml } from "yaml";
+import { INTRINSIC_SIGIL } from "../kernel/constants.js";
 
 const DELIM = "---";
 const DELIM_LINE = `${DELIM}\n`;
+
+/**
+ * Match a line that starts with a system-property key: `<sigil>identifier:`
+ * at column 0, followed by a colon. Kept intentionally strict — only
+ * top-level scalar keys are treated as system props, so nested `$foo:`
+ * inside a map body (which would start with whitespace) is untouched.
+ */
+const SYSTEM_PROP_LINE = new RegExp(
+  `^${escapeRegex(INTRINSIC_SIGIL)}([A-Za-z_][A-Za-z0-9_]*):[^\\n]*(?:\\n|$)`,
+  "gm",
+);
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 export type Split = { frontmatter_raw: string; body: string };
 
@@ -97,4 +113,54 @@ export function parse(frontmatterRaw: string): FrontmatterJson {
     throw new FrontmatterInvalidError("frontmatter must parse to a map");
   }
   return parsed as FrontmatterJson;
+}
+
+/**
+ * Append a system property (`$key: value`) as a plain text line to raw YAML
+ * source. Non-destructive — never round-trips through the YAML parser, so
+ * existing comments, key order, and whitespace are preserved byte-exact.
+ *
+ * `value` must be a simple scalar (string / number / boolean). Strings are
+ * emitted unquoted; callers are responsible for supplying values that are
+ * safe as bare YAML scalars (all current system props — version ids, ISO
+ * timestamps, user slugs — satisfy this).
+ */
+export function appendSystemProperty(
+  frontmatterRaw: string,
+  key: string,
+  value: string | number | boolean,
+): string {
+  const line = `${INTRINSIC_SIGIL}${key}: ${value}\n`;
+  if (frontmatterRaw === "") return line;
+  const base = frontmatterRaw.endsWith("\n") ? frontmatterRaw : `${frontmatterRaw}\n`;
+  return `${base}${line}`;
+}
+
+/**
+ * Strip every `$key: value` line from raw YAML source and return the parsed
+ * key→value map alongside the cleaned source. Non-destructive on the
+ * remainder — only the matched lines are removed, everything else stays
+ * byte-exact.
+ *
+ * Values are returned as trimmed strings (leading/trailing whitespace after
+ * the colon removed). Callers coerce as needed.
+ */
+export function extractSystemProperties(frontmatterRaw: string): {
+  raw: string;
+  props: Record<string, string>;
+} {
+  if (frontmatterRaw === "" || !frontmatterRaw.includes(INTRINSIC_SIGIL)) {
+    return { raw: frontmatterRaw, props: {} };
+  }
+  const props: Record<string, string> = {};
+  const cleaned = frontmatterRaw.replace(SYSTEM_PROP_LINE, (line, key: string) => {
+    const colonIdx = line.indexOf(":");
+    const value = line
+      .slice(colonIdx + 1)
+      .replace(/\n$/, "")
+      .trim();
+    props[key] = value;
+    return "";
+  });
+  return { raw: cleaned, props };
 }

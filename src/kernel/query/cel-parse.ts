@@ -17,6 +17,7 @@
 
 import { parse } from "@bufbuild/cel";
 import type { ParsedExpr } from "@bufbuild/cel-spec/cel/expr/syntax_pb.js";
+import { INTRINSIC_SIGIL } from "../constants.js";
 import { KernelError } from "../errors.js";
 
 /**
@@ -56,7 +57,7 @@ export function preprocessDollarIdents(source: string): string {
       i++;
       continue;
     }
-    if (ch === "$") {
+    if (ch === INTRINSIC_SIGIL) {
       const match = source.slice(i + 1).match(/^([A-Za-z_][A-Za-z0-9_]*)/);
       if (match?.[1]) {
         out += INTRINSIC_PREFIX + match[1];

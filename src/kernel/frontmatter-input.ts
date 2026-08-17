@@ -14,7 +14,12 @@
  */
 
 import { stringify as stringifyYaml } from "yaml";
-import { type FrontmatterJson, parse as parseFrontmatter } from "../markdown/frontmatter.js";
+import {
+  type FrontmatterJson,
+  extractSystemProperties,
+  parse as parseFrontmatter,
+} from "../markdown/frontmatter.js";
+import { INTRINSIC_SIGIL } from "./constants.js";
 import { KernelError } from "./errors.js";
 
 export type FrontmatterInput = {
@@ -51,7 +56,11 @@ export function canonicalizeFrontmatter(input: FrontmatterInput): CanonicalFront
   }
 
   if (hasRaw) {
-    const raw = input.frontmatter_raw as string;
+    // Strip system properties (`$*`) before parsing/storing. Surfaces that
+    // support the $version round-trip already peel it off; this is
+    // belt-and-braces so no surface can accidentally poison storage with
+    // reserved keys.
+    const raw = stripSystemProps(input.frontmatter_raw as string);
     try {
       const parsed = parseFrontmatter(raw);
       return { frontmatter: parsed, frontmatter_raw: raw };
@@ -63,12 +72,17 @@ export function canonicalizeFrontmatter(input: FrontmatterInput): CanonicalFront
   }
 
   // Structured branch — serialize to canonical YAML.
-  const structured = input.frontmatter as FrontmatterJson;
-  if (structured === null || typeof structured !== "object" || Array.isArray(structured)) {
+  const structuredInput = input.frontmatter as FrontmatterJson;
+  if (
+    structuredInput === null ||
+    typeof structuredInput !== "object" ||
+    Array.isArray(structuredInput)
+  ) {
     throw new KernelError("frontmatter_invalid", {
       reason: "structured frontmatter must be a map",
     });
   }
+  const structured = stripSystemKeys(structuredInput);
   // Empty map → empty raw (round-trips as "no frontmatter block" via the
   // markdown/frontmatter.split rule).
   if (Object.keys(structured).length === 0) {
@@ -76,4 +90,16 @@ export function canonicalizeFrontmatter(input: FrontmatterInput): CanonicalFront
   }
   const rawFromStructured = stringifyYaml(structured);
   return { frontmatter: structured, frontmatter_raw: rawFromStructured };
+}
+
+function stripSystemProps(raw: string): string {
+  return extractSystemProperties(raw).raw;
+}
+
+function stripSystemKeys(obj: FrontmatterJson): FrontmatterJson {
+  const out: FrontmatterJson = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (!k.startsWith(INTRINSIC_SIGIL)) out[k] = v;
+  }
+  return out;
 }
