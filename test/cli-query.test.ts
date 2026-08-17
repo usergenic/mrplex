@@ -24,7 +24,7 @@ let alice: UserRow;
 let notesRepoId: number;
 
 function run(...args: string[]): { stdout: string; stderr: string; status: number } {
-  const res = spawnSync("npx", ["--no-install", "tsx", CLI, "--database", dbUrl, ...args], {
+  const res = spawnSync("node", ["--import", "tsx", CLI, "--database", dbUrl, ...args], {
     cwd: REPO_ROOT,
     encoding: "utf8",
     env: {
