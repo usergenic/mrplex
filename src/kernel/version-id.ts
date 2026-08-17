@@ -2,7 +2,7 @@
  * Opaque `version_id` wire encoding. Design §3.3 says clients echo these back
  * and never construct or parse them; the server owns the representation.
  *
- * M0 decision (see docs/m0-plan.md §5): `v{integer}` — trivially readable
+ * M0 decision (see docs/archive/m0-plan.md §5): `v{integer}` — trivially readable
  * during dev/debug, opaque by *contract*, and already the form the design's
  * deletion-path examples use (`:deleted/…/foo-v45129.md`).
  */

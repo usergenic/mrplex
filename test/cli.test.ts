@@ -1,7 +1,7 @@
 /**
  * CLI smoke tests. Exercise the end-to-end path from a seeded database
  * through the CLI to stdout/stderr + exit code — the definition-of-done
- * transcript from docs/m0-plan.md §6 (plus M1's bootstrap-first posture).
+ * transcript from docs/archive/m0-plan.md §6 (plus M1's bootstrap-first posture).
  *
  * M1 removes the SYSTEM_ACTOR anonymous fallback: the CLI now requires a
  * real bearer token, so beforeEach() bootstraps the root token before the
