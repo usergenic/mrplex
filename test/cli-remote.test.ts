@@ -127,15 +127,24 @@ describe("CLI --server round-trip", () => {
     const versionId = r.stdout.trim();
     expect(versionId).toMatch(/^v\d+$/);
 
-    // Read via remote — pretty output is the markdown itself.
-    r = runCli(["--server", baseUrl, "docs", "get", "hello.md"], env);
+    // Read via remote — pretty output is the markdown itself. --raw suppresses
+    // server-injected $version so we can compare byte-exact against `original`.
+    r = runCli(["--server", baseUrl, "docs", "get", "--raw", "hello.md"], env);
     expect(r.status).toBe(0);
     expect(r.stdout).toBe(original);
 
-    // Compare with local read on the same db.
-    const local = runCli(["--database", dbUrl, "docs", "get", "hello.md"], env);
+    // Compare with local read on the same db (also --raw).
+    const local = runCli(["--database", dbUrl, "docs", "get", "--raw", "hello.md"], env);
     expect(local.status).toBe(0);
     expect(local.stdout).toBe(r.stdout);
+
+    // Default (no --raw) injects $version — verify remote and local agree.
+    const remoteDefault = runCli(["--server", baseUrl, "docs", "get", "hello.md"], env);
+    const localDefault = runCli(["--database", dbUrl, "docs", "get", "hello.md"], env);
+    expect(remoteDefault.status).toBe(0);
+    expect(localDefault.status).toBe(0);
+    expect(remoteDefault.stdout).toContain(`$version: ${versionId}`);
+    expect(remoteDefault.stdout).toBe(localDefault.stdout);
   });
 
   it("query via --server", () => {

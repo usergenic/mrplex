@@ -11,9 +11,11 @@ import { resolveActor } from "../kernel/auth/tokens.js";
 import { KernelError } from "../kernel/errors.js";
 import type { Kernel } from "../kernel/kernel.js";
 import { createKernel } from "../kernel/kernel.js";
+import type { Version } from "../kernel/wire.js";
+import { appendSystemProperty } from "../markdown/frontmatter.js";
 import { openStorage } from "../storage/registry.js";
 import type { Storage } from "../storage/types.js";
-import type { KernelClient } from "./kernel-client.js";
+import type { DocGetOptions, KernelClient } from "./kernel-client.js";
 
 export type LocalClientConfig = {
   /** sqlite:./path.db or postgres://…; the CLI resolves this. */
@@ -82,8 +84,10 @@ function buildClient(
       delete: (slug) => kernel.users.delete(actor, slug),
     },
     docs: {
-      get: (repo, path) => kernel.docs.get(actor, repo, path),
-      get_version: (repo, vid) => kernel.docs.get_version(actor, repo, vid),
+      get: async (repo, path, opts) =>
+        maybeInjectVersion(await kernel.docs.get(actor, repo, path), opts),
+      get_version: async (repo, vid, opts) =>
+        maybeInjectVersion(await kernel.docs.get_version(actor, repo, vid), opts),
       history: (repo, path, opts) => kernel.docs.history(actor, repo, path, opts),
       diff: (repo, path, from, to) => kernel.docs.diff(actor, repo, path, from, to),
       create: (repo, path, input) => kernel.docs.create(actor, repo, path, input),
@@ -108,5 +112,13 @@ function buildClient(
       }
       await storage.close();
     },
+  };
+}
+
+function maybeInjectVersion(v: Version, opts: DocGetOptions | undefined): Version {
+  if (opts?.raw) return v;
+  return {
+    ...v,
+    frontmatter_raw: appendSystemProperty(v.frontmatter_raw, "version", v.version_id),
   };
 }

@@ -21,6 +21,15 @@ export type HistoryOptions = { limit?: number; before?: string };
 export type SetPathConfigResult = { repo: Repo; warnings: PathWarning[] };
 export type TokenCreateResult = { token: string; meta: Token };
 
+/**
+ * Options for document reads. `raw` suppresses server-injected system
+ * properties (`$version`, and — later — `$author`, `$updated_at`, …) so
+ * callers see the exact stored `frontmatter_raw`. Defaults to false —
+ * injection is on by default because the round-trip is useful more often
+ * than not.
+ */
+export type DocGetOptions = { raw?: boolean };
+
 export type KernelClient = {
   repos: {
     list(opts?: { include_system?: boolean }): Promise<Repo[]>;
@@ -37,8 +46,8 @@ export type KernelClient = {
     delete(slug: string): Promise<User>;
   };
   docs: {
-    get(repo: string, path: string): Promise<Version>;
-    get_version(repo: string, version_id: string): Promise<Version>;
+    get(repo: string, path: string, opts?: DocGetOptions): Promise<Version>;
+    get_version(repo: string, version_id: string, opts?: DocGetOptions): Promise<Version>;
     history(repo: string, path: string, opts?: HistoryOptions): Promise<Version[]>;
     diff(
       repo: string,
