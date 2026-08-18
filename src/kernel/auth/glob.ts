@@ -1,15 +1,20 @@
 /**
  * Gitignore-style glob matching (design §8.2).
  *
- * Semantics:
- *   `**`      matches any sequence of characters (including `/`) — any subtree
- *   `*`       matches within a path segment (no `/`)
- *   `?`       matches a single character (no `/`)
- *   `!glob`   negates — handled at the LIST level, not the individual glob
- *   literals  everything else, including `.`, is a literal char
+ * Semantics — faithful to git's gitignore(5):
+ *   `**`         matches any sequence of characters (including `/`)
+ *   `**\/`       zero or more path segments (including none)
+ *   `/**` (end)  everything strictly inside the preceding directory
+ *   `*`          matches within a path segment (no `/`)
+ *   `?`          matches a single character (no `/`)
+ *   leading `/`  anchors the pattern to the root; the `/` is not part
+ *                of the matched string
+ *   no `/` in    pattern is a basename — matches at any depth
+ *     pattern
+ *   `!glob`      negates — handled at the LIST level, not the individual glob
+ *   literals     everything else, including `.`, is a literal char
  *
- * Kept small on purpose: no `[abc]` character classes (not in the design),
- * no advanced features. Verifiable against the design's examples end-to-end.
+ * Kept small on purpose: no `[abc]` character classes.
  */
 
 /**
@@ -20,31 +25,57 @@
  * to re-derive it from RegExp.source.
  */
 export function globToRegexSource(glob: string): string {
+  const hasLeadingSlash = glob.startsWith("/");
+  const rest = hasLeadingSlash ? glob.slice(1) : glob;
+  const isBareBasename = !rest.includes("/");
+  // Bare `**` already expands to `.*`, which subsumes `(?:.*/)?` — skip the
+  // redundant prefix rather than emitting dead regex text.
+  const anyDepthPrefix = isBareBasename && !hasLeadingSlash && rest !== "**" ? "(?:.*/)?" : "";
+
   let source = "";
-  for (let i = 0; i < glob.length; i++) {
-    const ch = glob[i] as string;
-    if (ch === "*" && glob[i + 1] === "*") {
+  let i = 0;
+  while (i < rest.length) {
+    // `**/` — zero or more path segments (including none)
+    if (rest.slice(i, i + 3) === "**/") {
+      source += "(?:.*/)?";
+      i += 3;
+      continue;
+    }
+    // Trailing `/**` — everything strictly inside the preceding dir
+    if (rest.slice(i, i + 3) === "/**" && i + 3 === rest.length) {
+      source += "/.*";
+      i += 3;
+      continue;
+    }
+    // Bare `**` — any run of characters, including `/`
+    if (rest[i] === "*" && rest[i + 1] === "*") {
       source += ".*";
-      i++;
+      i += 2;
       continue;
     }
-    if (ch === "*") {
+    // `*` — within a segment
+    if (rest[i] === "*") {
       source += "[^/]*";
+      i += 1;
       continue;
     }
-    if (ch === "?") {
+    // `?` — single char, not `/`
+    if (rest[i] === "?") {
       source += "[^/]";
+      i += 1;
       continue;
     }
-    // Escape regex special chars — critically `.`, which we want to be a
-    // literal dot in path globs, not "any char".
+    const ch = rest[i] as string;
+    // Escape regex specials — critically `.`, which is a literal in globs.
     if ("[](){}+^$.|\\".includes(ch)) {
       source += `\\${ch}`;
+      i += 1;
       continue;
     }
     source += ch;
+    i += 1;
   }
-  return source;
+  return anyDepthPrefix + source;
 }
 
 /**

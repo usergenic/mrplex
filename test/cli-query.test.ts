@@ -140,6 +140,43 @@ describe("cli query", () => {
     expect(results.map((r) => r.path)).toEqual(["guides/getting-started.md"]);
   });
 
+  it("--path bare basename matches at any depth", async () => {
+    const out = run("--json", "query", "--repo", "notes", "--path", "getting-started.md");
+    expect(out.status).toBe(0);
+    const results = JSON.parse(out.stdout) as { path: string }[];
+    expect(results.map((r) => r.path)).toEqual(["guides/getting-started.md"]);
+  });
+
+  it("--path leading / anchors to root", async () => {
+    const out = run("--json", "query", "--repo", "notes", "--path", "/welcome.md");
+    expect(out.status).toBe(0);
+    const results = JSON.parse(out.stdout) as { path: string }[];
+    expect(results.map((r) => r.path)).toEqual(["welcome.md"]);
+  });
+
+  it("--path segment glob does not cross /", async () => {
+    const out = run("--json", "query", "--repo", "notes", "--path", "guides/*");
+    expect(out.status).toBe(0);
+    const results = JSON.parse(out.stdout) as { path: string }[];
+    expect(results.map((r) => r.path)).toEqual(["guides/getting-started.md"]);
+  });
+
+  it("--path composes with --filter via AND", async () => {
+    const out = run(
+      "--json",
+      "query",
+      "--repo",
+      "notes",
+      "--path",
+      "*.md",
+      "--filter",
+      'status == "published"',
+    );
+    expect(out.status).toBe(0);
+    const results = JSON.parse(out.stdout) as { path: string }[];
+    expect(results.map((r) => r.path)).toEqual(["pricing.md"]);
+  });
+
   it("--limit caps results", async () => {
     const out = run("--json", "query", "--repo", "notes", "--limit", "2");
     expect(out.status).toBe(0);

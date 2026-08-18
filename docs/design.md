@@ -917,7 +917,13 @@ Every field is polymorphic scalar-or-list, matching the §5.2 convention. At the
 - **`write`** — `docs.create`, `docs.put`, `docs.delete`. Path must match a `write` glob. **Does not imply `read`** — a token that wants both lists both.
 - **`admin: true`** — `repos.create` / `repos.rename` / `repos.delete` / `repos.set_path_config`, all `users.*` (including `users.delete`), and management of tokens other than the caller's own. Not scoped to a repo (there is no repo yet for `repos.create`, and `users.*` isn't repo-shaped). Repo config and deletion are admin-gated rather than write-scoped because they affect every writer of the repo, not just the caller's paths. `[OPEN]` A per-repo `manage` action for delegating repo administration (config, delete) without full server admin, if the need emerges.
 
-**Glob semantics:** gitignore-style. `**` matches any subtree, `*` matches within a path segment, `!pattern` negates. Literals are just globs with no metacharacters.
+**Glob semantics:** gitignore-style, faithful to `gitignore(5)`.
+
+- `**` matches any run of characters, including `/`. In the forms `**/foo` and `a/**/z` the `**/` segment stands for **zero or more** intermediate directories — so `**/foo.md` matches both `foo.md` and `a/b/foo.md`, and `a/**/z` matches `a/z`, `a/x/z`, `a/x/y/z`.
+- `*` matches within a single path segment (never crosses `/`); `?` matches one non-`/` character.
+- **Anchoring.** A pattern that contains no `/` is a **basename** and matches at any depth: `horses.md` matches `horses.md`, `notes/horses.md`, and `a/b/horses.md`. A pattern with `/` anywhere except the trailing position (and any pattern with a **leading** `/`) is anchored to the repo root: `/horses.md` matches only root-level, `drafts/foo.md` matches only that exact path. Trailing `/**` includes everything strictly under the directory (does not include the directory itself, and mrplex paths are always files anyway).
+- `!pattern` negates. Order matters: last matching entry in a list wins.
+- Literals with no metacharacters are just anchored strings — including `.`, which is a literal dot, not "any char."
 
 - Repo patterns are evaluated once, at token creation (above), against repo slugs. Since slugs contain no `/`, `*` is the canonical wildcard at the repo level; reserve `**` for paths.
 - Path globs match against **the path at the version being accessed** — so `read: "drafts/**"` still reads historical states of a doc that has since been renamed out of `drafts/`.

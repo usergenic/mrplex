@@ -20,6 +20,7 @@ import { openRemoteClient } from "../client/remote-mcp.js";
 import { backfillRepo } from "../embed/backfill.js";
 import { createHookFromConfig, resolveEmbedConfig } from "../embed/config.js";
 import { createWorker } from "../embed/worker.js";
+import { globToRegexSource } from "../kernel/auth/glob.js";
 import type { ScopeInput } from "../kernel/auth/scope.js";
 import { KernelError } from "../kernel/errors.js";
 import { extractSystemProperties, split as splitFrontmatter } from "../markdown/frontmatter.js";
@@ -41,6 +42,28 @@ import {
 // -----------------------------------------------------------------------------
 // Utility parsers + helpers
 // -----------------------------------------------------------------------------
+
+// Emit `s` as a double-quoted CEL string literal. globToRegexSource output is
+// a regex source, so the characters we can encounter that need escaping in a
+// CEL "..." literal are `\` (regex escape marker) and `"` (literal terminator);
+// glob syntax has no way to produce a raw newline. If globToRegexSource ever
+// starts emitting new escapables, extend this set.
+function celStringLiteral(s: string): string {
+  const escaped = s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  return `"${escaped}"`;
+}
+
+// Compile a --path glob arg into a CEL $path.matches() expression and AND
+// it with --filter (if any). Glob semantics match design §8.2.
+function combinePathAndFilter(
+  pathGlob: string | undefined,
+  filter: string | undefined,
+): string | undefined {
+  if (!pathGlob) return filter;
+  const rx = `^${globToRegexSource(pathGlob)}$`;
+  const pathExpr = `$path.matches(${celStringLiteral(rx)})`;
+  return filter ? `(${pathExpr}) && (${filter})` : pathExpr;
+}
 
 function parsePositiveInt(value: string, _prev: unknown): number {
   if (!/^\d+$/.test(value)) {
@@ -735,6 +758,10 @@ function buildProgram(): Command {
       (value: string, prev: string[] | undefined) => [...(prev ?? []), value],
     )
     .option("--filter <expr>", "CEL filter expression")
+    .option(
+      "--path <glob>",
+      "gitignore-style path glob (bare name → any depth, leading `/` → root)",
+    )
     .option("--text <query>", "FTS5 query over body")
     .option("--rank <query>", "semantic rank via embeddings (§5.1); requires an embed hook")
     .option("--limit <n>", "max results (positive integer; default 50)", parsePositiveInt)
@@ -744,6 +771,7 @@ function buildProgram(): Command {
       const localOpts = this.opts<{
         repo?: string[];
         filter?: string;
+        path?: string;
         text?: string;
         rank?: string;
         limit?: number;
@@ -753,7 +781,7 @@ function buildProgram(): Command {
       withClient(this, async (client, opts) => {
         const result = await client.query({
           repo: localOpts.repo,
-          filter: localOpts.filter,
+          filter: combinePathAndFilter(localOpts.path, localOpts.filter),
           text: localOpts.text,
           rank: localOpts.rank,
           limit: localOpts.limit,

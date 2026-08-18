@@ -124,6 +124,16 @@ mrplex query --repo notes --filter '"pricing" in list(tags)'
 # $-prefixed intrinsics
 mrplex query --repo notes --filter '$path.startsWith("guides/")'
 
+# Path glob — gitignore-style (design §8.2)
+mrplex query --repo notes --path 'horses.md'      # bare name → any depth
+mrplex query --repo notes --path '/horses.md'     # leading / → root only
+mrplex query --repo notes --path '**/horses.md'   # any depth incl. root
+mrplex query --repo notes --path 'guides/*'       # one level under guides/
+mrplex query --repo notes --path 'drafts/**'      # anywhere under drafts/
+
+# --path composes with --filter (AND)
+mrplex query --repo notes --path '*.md' --filter 'status == "published"'
+
 # Semantic rank (requires an embedding hook — see below)
 mrplex query --repo notes --rank 'tiered SaaS pricing'
 
