@@ -28,7 +28,9 @@ export function globToRegexSource(glob: string): string {
   const hasLeadingSlash = glob.startsWith("/");
   const rest = hasLeadingSlash ? glob.slice(1) : glob;
   const isBareBasename = !rest.includes("/");
-  const anyDepthPrefix = isBareBasename && !hasLeadingSlash ? "(?:.*/)?" : "";
+  // Bare `**` already expands to `.*`, which subsumes `(?:.*/)?` — skip the
+  // redundant prefix rather than emitting dead regex text.
+  const anyDepthPrefix = isBareBasename && !hasLeadingSlash && rest !== "**" ? "(?:.*/)?" : "";
 
   let source = "";
   let i = 0;

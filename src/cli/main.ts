@@ -43,6 +43,16 @@ import {
 // Utility parsers + helpers
 // -----------------------------------------------------------------------------
 
+// Emit `s` as a double-quoted CEL string literal. globToRegexSource output is
+// a regex source, so the characters we can encounter that need escaping in a
+// CEL "..." literal are `\` (regex escape marker) and `"` (literal terminator);
+// glob syntax has no way to produce a raw newline. If globToRegexSource ever
+// starts emitting new escapables, extend this set.
+function celStringLiteral(s: string): string {
+  const escaped = s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  return `"${escaped}"`;
+}
+
 // Compile a --path glob arg into a CEL $path.matches() expression and AND
 // it with --filter (if any). Glob semantics match design §8.2.
 function combinePathAndFilter(
@@ -51,8 +61,7 @@ function combinePathAndFilter(
 ): string | undefined {
   if (!pathGlob) return filter;
   const rx = `^${globToRegexSource(pathGlob)}$`;
-  const escaped = rx.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-  const pathExpr = `$path.matches("${escaped}")`;
+  const pathExpr = `$path.matches(${celStringLiteral(rx)})`;
   return filter ? `(${pathExpr}) && (${filter})` : pathExpr;
 }
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { compileGlob, pathMatchesGlobs, slugMatchesPattern } from "./glob.js";
+import { compileGlob, globToRegexSource, pathMatchesGlobs, slugMatchesPattern } from "./glob.js";
 
 describe("compileGlob", () => {
   describe("** (any subtree)", () => {
@@ -8,6 +8,11 @@ describe("compileGlob", () => {
       expect(rx.test("foo.md")).toBe(true);
       expect(rx.test("a/b/c.md")).toBe(true);
       expect(rx.test("")).toBe(true);
+    });
+
+    it("bare ** compiles without a redundant any-depth prefix", () => {
+      // `(?:.*/)?` is subsumed by the trailing `.*` — emitting it is dead text.
+      expect(globToRegexSource("**")).toBe(".*");
     });
 
     it("drafts/** matches everything strictly inside drafts/", () => {
