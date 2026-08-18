@@ -50,9 +50,9 @@ function combinePathAndFilter(
   filter: string | undefined,
 ): string | undefined {
   if (!pathGlob) return filter;
-  const rx = "^" + globToRegexSource(pathGlob) + "$";
+  const rx = `^${globToRegexSource(pathGlob)}$`;
   const escaped = rx.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-  const pathExpr = '$path.matches("' + escaped + '")';
+  const pathExpr = `$path.matches("${escaped}")`;
   return filter ? `(${pathExpr}) && (${filter})` : pathExpr;
 }
 
