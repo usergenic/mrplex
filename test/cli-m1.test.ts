@@ -39,7 +39,7 @@ function run(
   // Isolate the CLI config to the workdir so per-user ~/.config doesn't leak
   // in between test runs.
   env.XDG_CONFIG_HOME = workDir;
-  const res = spawnSync("npx", ["--no-install", "tsx", CLI, "--database", dbUrl, ...args], {
+  const res = spawnSync("node", ["--import", "tsx", CLI, "--database", dbUrl, ...args], {
     cwd: REPO_ROOT,
     encoding: "utf8",
     input: opts?.stdin,

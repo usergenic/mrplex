@@ -22,7 +22,7 @@ import { createHookFromConfig, resolveEmbedConfig } from "../embed/config.js";
 import { createWorker } from "../embed/worker.js";
 import type { ScopeInput } from "../kernel/auth/scope.js";
 import { KernelError } from "../kernel/errors.js";
-import { split as splitFrontmatter } from "../markdown/frontmatter.js";
+import { extractSystemProperties, split as splitFrontmatter } from "../markdown/frontmatter.js";
 import { startMcpStdio } from "../mcp/server.js";
 import { startServer } from "../server/serve.js";
 import { normalizeDatabaseUrl, openStorage } from "../storage/registry.js";
@@ -532,7 +532,13 @@ function buildProgram(): Command {
   docs
     .command("get <path>")
     .description("read the current version at <path>")
+    .option(
+      "--raw",
+      "suppress server-injected $version (and other $* system properties) in the output",
+      false,
+    )
     .action(function (this: Command, path: string) {
+      const localOpts = this.opts<{ raw?: boolean }>();
       const globals = this.optsWithGlobals<GlobalOpts>();
       let repo: string;
       try {
@@ -541,7 +547,7 @@ function buildProgram(): Command {
         reportError(err);
       }
       withClient(this, async (client, opts) => {
-        const result = await client.docs.get(repo, path);
+        const result = await client.docs.get(repo, path, { raw: localOpts.raw === true });
         emit(result, opts, renderVersionAsMarkdown(result));
       }).catch(reportError);
     });
@@ -549,7 +555,13 @@ function buildProgram(): Command {
   docs
     .command("get-version <version-id>")
     .description("read a specific version by id")
+    .option(
+      "--raw",
+      "suppress server-injected $version (and other $* system properties) in the output",
+      false,
+    )
     .action(function (this: Command, versionId: string) {
+      const localOpts = this.opts<{ raw?: boolean }>();
       const globals = this.optsWithGlobals<GlobalOpts>();
       let repo: string;
       try {
@@ -558,7 +570,9 @@ function buildProgram(): Command {
         reportError(err);
       }
       withClient(this, async (client, opts) => {
-        const result = await client.docs.get_version(repo, versionId);
+        const result = await client.docs.get_version(repo, versionId, {
+          raw: localOpts.raw === true,
+        });
         emit(result, opts, renderVersionAsMarkdown(result));
       }).catch(reportError);
     });
@@ -634,10 +648,13 @@ function buildProgram(): Command {
   docs
     .command("put <path>")
     .description("update or move a document — path may differ from prev's path")
-    .requiredOption("--prev <version-id>", "current version id (from get / history)")
+    .option(
+      "--prev <version-id>",
+      "current version id (from get / history) — optional if the input's frontmatter carries `$version: <id>`",
+    )
     .option("--from-file <file>", "read the markdown from a file or '-' for stdin")
     .action(function (this: Command, path: string) {
-      const localOpts = this.opts<{ prev: string; fromFile?: string }>();
+      const localOpts = this.opts<{ prev?: string; fromFile?: string }>();
       const globals = this.optsWithGlobals<GlobalOpts>();
       let repo: string;
       try {
@@ -647,12 +664,25 @@ function buildProgram(): Command {
       }
       withClient(this, async (client, opts) => {
         const input: { frontmatter_raw?: string; body?: string } = {};
+        let embeddedVersion: string | undefined;
         if (localOpts.fromFile) {
           const parsed = readDocumentInput(localOpts.fromFile);
-          input.frontmatter_raw = parsed.frontmatter_raw;
+          const { raw: cleaned, props } = extractSystemProperties(parsed.frontmatter_raw);
+          input.frontmatter_raw = cleaned;
           input.body = parsed.body;
+          if (typeof props.version === "string" && props.version.length > 0) {
+            embeddedVersion = props.version;
+          }
         }
-        const result = await client.docs.put(repo, localOpts.prev, path, input);
+        const prev = localOpts.prev ?? embeddedVersion;
+        if (prev === undefined) {
+          const err = new Error(
+            "no prev version — pass --prev, or provide `$version: <id>` in the input frontmatter",
+          );
+          (err as unknown as { code: string }).code = "cli_usage";
+          throw err;
+        }
+        const result = await client.docs.put(repo, prev, path, input);
         emitVersionWrite(result, opts);
       }).catch(reportError);
     });

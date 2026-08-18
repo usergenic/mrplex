@@ -14,8 +14,8 @@ describe("preprocessDollarIdents", () => {
   });
 
   it("mangles multiple $identifiers", () => {
-    expect(preprocessDollarIdents("$path == '/' || $created_at < '2026'")).toBe(
-      `${INTRINSIC_PREFIX}path == '/' || ${INTRINSIC_PREFIX}created_at < '2026'`,
+    expect(preprocessDollarIdents("$path == '/' || $updated_at < '2026'")).toBe(
+      `${INTRINSIC_PREFIX}path == '/' || ${INTRINSIC_PREFIX}updated_at < '2026'`,
     );
   });
 

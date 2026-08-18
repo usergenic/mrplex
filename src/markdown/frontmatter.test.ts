@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { FrontmatterInvalidError, join, parse, split } from "./frontmatter.js";
+import {
+  FrontmatterInvalidError,
+  appendSystemProperty,
+  extractSystemProperties,
+  join,
+  parse,
+  split,
+} from "./frontmatter.js";
 
 describe("split", () => {
   it("returns pure body when no frontmatter block is present", () => {
@@ -117,5 +124,82 @@ describe("parse", () => {
 
   it("throws frontmatter_invalid when the top level is a scalar", () => {
     expect(() => parse("just a string\n")).toThrow(FrontmatterInvalidError);
+  });
+});
+
+describe("appendSystemProperty", () => {
+  it("returns a single line when raw is empty", () => {
+    expect(appendSystemProperty("", "version", "v42")).toBe("$version: v42\n");
+  });
+
+  it("appends to non-empty raw with an existing trailing newline", () => {
+    expect(appendSystemProperty("title: hi\n", "version", "v42")).toBe(
+      "title: hi\n$version: v42\n",
+    );
+  });
+
+  it("ensures a trailing newline when raw lacks one", () => {
+    expect(appendSystemProperty("title: hi", "version", "v42")).toBe("title: hi\n$version: v42\n");
+  });
+
+  it("emits numbers and booleans unquoted", () => {
+    expect(appendSystemProperty("", "count", 3)).toBe("$count: 3\n");
+    expect(appendSystemProperty("", "flag", true)).toBe("$flag: true\n");
+  });
+});
+
+describe("extractSystemProperties", () => {
+  it("returns raw unchanged and an empty map when no $-keys are present", () => {
+    expect(extractSystemProperties("title: hi\n")).toEqual({
+      raw: "title: hi\n",
+      props: {},
+    });
+  });
+
+  it("returns raw unchanged when raw is empty", () => {
+    expect(extractSystemProperties("")).toEqual({ raw: "", props: {} });
+  });
+
+  it("strips a trailing $version line and returns the value", () => {
+    expect(extractSystemProperties("title: hi\n$version: v42\n")).toEqual({
+      raw: "title: hi\n",
+      props: { version: "v42" },
+    });
+  });
+
+  it("strips a leading $version line", () => {
+    expect(extractSystemProperties("$version: v42\ntitle: hi\n")).toEqual({
+      raw: "title: hi\n",
+      props: { version: "v42" },
+    });
+  });
+
+  it("strips multiple system properties in one pass", () => {
+    expect(extractSystemProperties("$version: v42\ntitle: hi\n$author: alice\n")).toEqual({
+      raw: "title: hi\n",
+      props: { version: "v42", author: "alice" },
+    });
+  });
+
+  it("does not strip nested $-keys inside a map body (indented)", () => {
+    const raw = "meta:\n  $note: keep me\n";
+    expect(extractSystemProperties(raw)).toEqual({ raw, props: {} });
+  });
+
+  it("preserves user-authored content byte-exact around a stripped line", () => {
+    // Comment above, list below — none of it touched.
+    const raw = "# a comment\ntitle: hi\n$version: v42\ntags:\n  - a\n  - b\n";
+    const { raw: cleaned, props } = extractSystemProperties(raw);
+    expect(cleaned).toBe("# a comment\ntitle: hi\ntags:\n  - a\n  - b\n");
+    expect(props).toEqual({ version: "v42" });
+  });
+
+  it("round-trips: extract(append(x, k, v)) recovers x and {k: v}", () => {
+    const original = "title: hi\ntags: [a, b]\n";
+    const withProp = appendSystemProperty(original, "version", "v99");
+    expect(extractSystemProperties(withProp)).toEqual({
+      raw: original,
+      props: { version: "v99" },
+    });
   });
 });

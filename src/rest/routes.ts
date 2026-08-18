@@ -21,6 +21,7 @@ import type { Kernel } from "../kernel/kernel.js";
 import type { PathConfigOverride } from "../kernel/path-config.js";
 import type { QuerySpec } from "../kernel/query/query.js";
 import type { Version } from "../kernel/wire.js";
+import { appendSystemProperty, extractSystemProperties } from "../markdown/frontmatter.js";
 import { actorFromRequest } from "../server/auth.js";
 import { httpErrorForThrowable } from "../server/http-error.js";
 import type { Storage } from "../storage/types.js";
@@ -334,7 +335,7 @@ async function dispatchRepos(
     const pathSegs = segments.slice(3);
     if (pathSegs.length === 0) return notFound(res);
     const path = pathSegs.join("/");
-    return dispatchDocs(req, res, kernel, actor, repoSlug, path, method);
+    return dispatchDocs(req, res, kernel, actor, repoSlug, path, method, query);
   }
 
   // /repos/{repo}/versions/{version_id}
@@ -343,7 +344,7 @@ async function dispatchRepos(
     if (method !== "GET") return methodNotAllowed(res, method, ["GET"]);
     const versionId = segments[3] as string;
     const v = await kernel.docs.get_version(actor, repoSlug, versionId);
-    return writeDocResponse(req, res, v);
+    return writeDocResponse(req, res, v, systemPropsMode(query));
   }
 
   // /repos/{repo}/history/{path...}
@@ -399,27 +400,16 @@ async function dispatchDocs(
   repoSlug: string,
   path: string,
   method: string,
+  query: URLSearchParams,
 ): Promise<void> {
   if (method === "GET") {
     const v = await kernel.docs.get(actor, repoSlug, path);
-    return writeDocResponse(req, res, v);
+    return writeDocResponse(req, res, v, systemPropsMode(query));
   }
 
   if (method === "PUT") {
-    const ifMatch = parseIfMatch(req.headers["if-match"] as string | undefined);
+    const ifMatchHeader = parseIfMatch(req.headers["if-match"] as string | undefined);
     const ifNoneMatch = parseIfNoneMatch(req.headers["if-none-match"] as string | undefined);
-
-    if (ifNoneMatch === null && ifMatch === null) {
-      writePreconditionRequired(
-        res,
-        "PUT requires If-Match: <version_id> (update) OR If-None-Match: * (create)",
-      );
-      return;
-    }
-    if (ifNoneMatch !== null && ifMatch !== null) {
-      writePreconditionRequired(res, "supply either If-Match or If-None-Match, not both");
-      return;
-    }
 
     const ct = chooseDocWriteContentType(req.headers["content-type"] as string | undefined);
     const raw = await readBody(req);
@@ -447,6 +437,37 @@ async function dispatchDocs(
           typeof parsed.frontmatter_raw === "string" ? parsed.frontmatter_raw : undefined,
         body: parsed.body,
       };
+    }
+
+    // Peel any system properties out of the raw frontmatter before it reaches
+    // the kernel. `$version` (if present, and no If-Match header) supplies the
+    // optimistic-concurrency prev — enabling the "GET → edit body → PUT" loop
+    // without tracking a separate version id.
+    let embeddedVersion: string | undefined;
+    if (input.frontmatter_raw !== undefined) {
+      const { raw: cleaned, props } = extractSystemProperties(input.frontmatter_raw);
+      input.frontmatter_raw = cleaned;
+      if (typeof props.version === "string" && props.version.length > 0) {
+        embeddedVersion = props.version;
+      }
+    }
+
+    const ifMatch =
+      ifMatchHeader ??
+      (embeddedVersion !== undefined
+        ? ({ kind: "version", version_id: embeddedVersion } as const)
+        : null);
+
+    if (ifNoneMatch === null && ifMatch === null) {
+      writePreconditionRequired(
+        res,
+        "PUT requires If-Match: <version_id> (update) OR If-None-Match: * (create)",
+      );
+      return;
+    }
+    if (ifNoneMatch !== null && ifMatch !== null) {
+      writePreconditionRequired(res, "supply either If-Match or If-None-Match, not both");
+      return;
     }
 
     if (ifNoneMatch !== null) {
@@ -529,21 +550,45 @@ async function dispatchDocs(
  * Common Version response: JSON envelope or markdown per `Accept`. Honors
  * `If-None-Match` on the current version_id → 304 (§6.3 [OPEN] resolved
  * by m3-plan decision 8).
+ *
+ * `mode` controls system-property injection into `frontmatter_raw` (and the
+ * corresponding markdown rendering). Default = inject `$version`; `raw`
+ * suppresses everything so callers see the exact stored bytes.
  */
-function writeDocResponse(req: IncomingMessage, res: ServerResponse, v: Version): void {
+function writeDocResponse(
+  req: IncomingMessage,
+  res: ServerResponse,
+  v: Version,
+  mode: SystemPropsMode,
+): void {
   const accept = chooseDocReadAccept(req.headers.accept as string | undefined);
   const inm = parseIfNoneMatch(req.headers["if-none-match"] as string | undefined);
   if (inm !== null && inm.kind === "version" && inm.version_id === v.version_id) {
     writeEmpty(res, 304, { ETag: etagOf(v.version_id) });
     return;
   }
+  const fmRaw =
+    mode === "raw"
+      ? v.frontmatter_raw
+      : appendSystemProperty(v.frontmatter_raw, "version", v.version_id);
   if (accept === "markdown") {
-    writeMarkdown(res, 200, renderMarkdown(v.frontmatter_raw, v.body), {
+    writeMarkdown(res, 200, renderMarkdown(fmRaw, v.body), {
       ETag: etagOf(v.version_id),
     });
     return;
   }
-  writeJson(res, 200, v, { ETag: etagOf(v.version_id) });
+  writeJson(res, 200, { ...v, frontmatter_raw: fmRaw }, { ETag: etagOf(v.version_id) });
+}
+
+type SystemPropsMode = "default" | "raw";
+
+function systemPropsMode(query: URLSearchParams): SystemPropsMode {
+  // `?raw` (bare) or `?raw=<anything except "0"/"false">` opts out of injection.
+  if (!query.has("raw")) return "default";
+  const v = query.get("raw");
+  if (v === null || v === "") return "raw";
+  if (v === "0" || v === "false") return "default";
+  return "raw";
 }
 
 // -----------------------------------------------------------------------------

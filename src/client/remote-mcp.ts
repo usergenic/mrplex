@@ -128,8 +128,14 @@ function buildRemoteClient(client: Client): KernelClient {
       delete: (slug) => call<User>("users_delete", { user: slug }),
     },
     docs: {
-      get: (repo, path) => call<Version>("docs_get", { repo, path }),
-      get_version: (repo, vid) => call<Version>("docs_get_version", { repo, version_id: vid }),
+      get: (repo, path, opts) =>
+        call<Version>("docs_get", { repo, path, ...(opts?.raw && { raw: true }) }),
+      get_version: (repo, vid, opts) =>
+        call<Version>("docs_get_version", {
+          repo,
+          version_id: vid,
+          ...(opts?.raw && { raw: true }),
+        }),
       history: (repo, path, opts?: HistoryOptions) =>
         callList<Version>("docs_history", {
           repo,

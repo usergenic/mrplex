@@ -168,7 +168,8 @@ function compileScopeGlobs(globs: readonly string[], b: Builder): string {
 
 const INTRINSIC_COLUMNS: Record<string, string> = {
   path: "versions.path",
-  created_at: "versions.created_at",
+  // See compile-filter.ts for the $updated_at naming rationale.
+  updated_at: "versions.created_at",
   body: "versions.body",
 };
 

@@ -105,6 +105,72 @@ describe("MCP tools/call round-trip", () => {
   });
 });
 
+describe("MCP $version round-trip", () => {
+  it("docs_get injects $version into frontmatter_raw by default; raw suppresses it", async () => {
+    await client.callTool({ name: "repos_create", arguments: { repo: "notes" } });
+    await client.callTool({
+      name: "docs_create",
+      arguments: {
+        repo: "notes",
+        path: "a.md",
+        body: "hi",
+        frontmatter: { status: "draft" },
+      },
+    });
+    const injected = await client.callTool({
+      name: "docs_get",
+      arguments: { repo: "notes", path: "a.md" },
+    });
+    const iRaw = (injected.structuredContent as { frontmatter_raw: string }).frontmatter_raw;
+    expect(iRaw).toContain("$version: v1");
+
+    const rawResp = await client.callTool({
+      name: "docs_get",
+      arguments: { repo: "notes", path: "a.md", raw: true },
+    });
+    const rRaw = (rawResp.structuredContent as { frontmatter_raw: string }).frontmatter_raw;
+    expect(rRaw).not.toContain("$version");
+  });
+
+  it("docs_put uses embedded $version when prev_version_id is omitted", async () => {
+    await client.callTool({ name: "repos_create", arguments: { repo: "notes" } });
+    await client.callTool({
+      name: "docs_create",
+      arguments: {
+        repo: "notes",
+        path: "a.md",
+        body: "hi",
+        frontmatter: { status: "draft" },
+      },
+    });
+    const got = await client.callTool({
+      name: "docs_get",
+      arguments: { repo: "notes", path: "a.md" },
+    });
+    const gotFm = (got.structuredContent as { frontmatter_raw: string }).frontmatter_raw;
+    // Feed the injected frontmatter_raw straight back into docs_put with no prev.
+    const put = await client.callTool({
+      name: "docs_put",
+      arguments: {
+        repo: "notes",
+        path: "a.md",
+        frontmatter_raw: gotFm,
+        body: "edited",
+      },
+    });
+    expect(put.isError).toBeFalsy();
+    const v = put.structuredContent as { version_id: string; frontmatter_raw: string };
+    expect(v.version_id).toBe("v2");
+    // Stored frontmatter must not carry $version — verify via raw read.
+    const rawResp = await client.callTool({
+      name: "docs_get",
+      arguments: { repo: "notes", path: "a.md", raw: true },
+    });
+    const rRaw = (rawResp.structuredContent as { frontmatter_raw: string }).frontmatter_raw;
+    expect(rRaw).not.toContain("$version");
+  });
+});
+
 describe("MCP in-band errors", () => {
   it("stale prev_version_id → isError: true with parseable payload", async () => {
     await client.callTool({ name: "repos_create", arguments: { repo: "notes" } });

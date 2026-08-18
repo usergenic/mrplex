@@ -18,6 +18,8 @@ import type { ScopeInput } from "../kernel/auth/scope.js";
 import type { Kernel } from "../kernel/kernel.js";
 import type { PathConfigOverride } from "../kernel/path-config.js";
 import type { QuerySpec } from "../kernel/query/query.js";
+import type { Version } from "../kernel/wire.js";
+import { appendSystemProperty, extractSystemProperties } from "../markdown/frontmatter.js";
 import {
   renderJson,
   renderRepoList,
@@ -116,6 +118,18 @@ function argIntOpt(args: Record<string, unknown>, key: string): number | undefin
     throw new Error(`tool arg "${key}" must be an integer`);
   }
   return v;
+}
+
+/**
+ * Add `$version: <version_id>` to `frontmatter_raw` unless the caller asked
+ * for raw output. Non-destructive — plain text append, no YAML round-trip.
+ */
+function withInjectedVersion(v: Version, raw: boolean): Version {
+  if (raw) return v;
+  return {
+    ...v,
+    frontmatter_raw: appendSystemProperty(v.frontmatter_raw, "version", v.version_id),
+  };
 }
 
 // -----------------------------------------------------------------------------
@@ -287,18 +301,24 @@ export const TOOL_REGISTRY: ToolEntry[] = [
   // ---- docs ----
   {
     name: "docs_get",
-    description: "Read the current version of a document at (repo, path).",
+    description:
+      "Read the current version of a document at (repo, path). Returned `frontmatter_raw` has `$version: <version_id>` appended so a subsequent `docs_put` can reuse it as `prev_version_id` (unless `raw: true`).",
     inputSchema: {
       type: "object",
       properties: {
         repo: { type: "string" },
         path: { type: "string" },
+        raw: {
+          type: "boolean",
+          description: "Suppress server-injected `$*` system properties in frontmatter_raw.",
+        },
       },
       required: ["repo", "path"],
     },
     handler: async (kernel, actor, args) => {
       const v = await kernel.docs.get(actor, argStr(args, "repo"), argStr(args, "path"));
-      return { structured: v, text: renderVersion(v) };
+      const out = withInjectedVersion(v, args.raw === true);
+      return { structured: out, text: renderVersion(out) };
     },
   },
   {
@@ -309,6 +329,10 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       properties: {
         repo: { type: "string" },
         version_id: { type: "string" },
+        raw: {
+          type: "boolean",
+          description: "Suppress server-injected `$*` system properties in frontmatter_raw.",
+        },
       },
       required: ["repo", "version_id"],
     },
@@ -318,7 +342,8 @@ export const TOOL_REGISTRY: ToolEntry[] = [
         argStr(args, "repo"),
         argStr(args, "version_id"),
       );
-      return { structured: v, text: renderVersion(v) };
+      const out = withInjectedVersion(v, args.raw === true);
+      return { structured: out, text: renderVersion(out) };
     },
   },
   {
@@ -394,18 +419,22 @@ export const TOOL_REGISTRY: ToolEntry[] = [
   {
     name: "docs_put",
     description:
-      "Update or move a document. `path` may differ from prev's path (= move). Exactly one of `frontmatter` | `frontmatter_raw` if changing frontmatter; both may be omitted to keep prev's frontmatter (§3.2).",
+      "Update or move a document. `path` may differ from prev's path (= move). Exactly one of `frontmatter` | `frontmatter_raw` if changing frontmatter; both may be omitted to keep prev's frontmatter (§3.2). `prev_version_id` may be omitted if `frontmatter_raw` embeds `$version: <id>` (from a prior docs_get).",
     inputSchema: {
       type: "object",
       properties: {
         repo: { type: "string" },
         path: { type: "string", description: "Destination path (may differ from prev's path)." },
-        prev_version_id: { type: "string" },
+        prev_version_id: {
+          type: "string",
+          description:
+            "Optional if `frontmatter_raw` contains `$version: <id>`; explicit value wins.",
+        },
         body: { type: "string" },
         frontmatter: { type: "object", additionalProperties: true },
         frontmatter_raw: { type: "string" },
       },
-      required: ["repo", "path", "prev_version_id"],
+      required: ["repo", "path"],
     },
     handler: async (kernel, actor, args) => {
       const input: {
@@ -416,10 +445,28 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       if (args.frontmatter !== undefined) input.frontmatter = args.frontmatter;
       if (typeof args.frontmatter_raw === "string") input.frontmatter_raw = args.frontmatter_raw;
       if (typeof args.body === "string") input.body = args.body;
+
+      // Peel `$version` (and any other `$*`) out of raw frontmatter first — it
+      // supplies the prev_version_id fallback and must never reach storage.
+      let embeddedVersion: string | undefined;
+      if (input.frontmatter_raw !== undefined) {
+        const { raw: cleaned, props } = extractSystemProperties(input.frontmatter_raw);
+        input.frontmatter_raw = cleaned;
+        if (typeof props.version === "string" && props.version.length > 0) {
+          embeddedVersion = props.version;
+        }
+      }
+      const prev = argStrOpt(args, "prev_version_id") ?? embeddedVersion;
+      if (prev === undefined) {
+        throw new Error(
+          "prev_version_id is required (either as an argument or as `$version` in frontmatter_raw)",
+        );
+      }
+
       const v = await kernel.docs.put(
         actor,
         argStr(args, "repo"),
-        argStr(args, "prev_version_id"),
+        prev,
         argStr(args, "path"),
         input as never,
       );

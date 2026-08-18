@@ -1,7 +1,7 @@
 /**
  * CLI smoke tests. Exercise the end-to-end path from a seeded database
  * through the CLI to stdout/stderr + exit code — the definition-of-done
- * transcript from docs/m0-plan.md §6 (plus M1's bootstrap-first posture).
+ * transcript from docs/archive/m0-plan.md §6 (plus M1's bootstrap-first posture).
  *
  * M1 removes the SYSTEM_ACTOR anonymous fallback: the CLI now requires a
  * real bearer token, so beforeEach() bootstraps the root token before the
@@ -34,7 +34,9 @@ function run(...args: string[]): { stdout: string; stderr: string; status: numbe
     // Point config at the workdir so per-user ~/.config doesn't leak into tests.
     XDG_CONFIG_HOME: workDir,
   };
-  const res = spawnSync("npx", ["--no-install", "tsx", CLI, "--database", dbUrl, ...args], {
+  // `node --import tsx` avoids the npx safe-chain warning that some npx
+  // versions print to stdout and contaminate test assertions.
+  const res = spawnSync("node", ["--import", "tsx", CLI, "--database", dbUrl, ...args], {
     cwd: REPO_ROOT,
     encoding: "utf8",
     env,
@@ -49,7 +51,7 @@ beforeEach(async () => {
   // Bootstrap FIRST so an admin token exists, then seed adapter-level data.
   const { token } = await bootstrap(dbUrl);
   rootToken = token;
-  const seed = spawnSync("npx", ["--no-install", "tsx", SEED, "--database", dbUrl], {
+  const seed = spawnSync("node", ["--import", "tsx", SEED, "--database", dbUrl], {
     cwd: REPO_ROOT,
     encoding: "utf8",
   });
@@ -134,19 +136,15 @@ describe("cli", () => {
   });
 
   it("no token → exit 3 (unauthorized) — the removed fallback", () => {
-    const res = spawnSync(
-      "npx",
-      ["--no-install", "tsx", CLI, "--database", dbUrl, "repos", "list"],
-      {
-        cwd: REPO_ROOT,
-        encoding: "utf8",
-        env: {
-          ...(process.env as Record<string, string>),
-          MRPLEX_TOKEN: "",
-          XDG_CONFIG_HOME: workDir,
-        },
+    const res = spawnSync("node", ["--import", "tsx", CLI, "--database", dbUrl, "repos", "list"], {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+      env: {
+        ...(process.env as Record<string, string>),
+        MRPLEX_TOKEN: "",
+        XDG_CONFIG_HOME: workDir,
       },
-    );
+    });
     expect(res.status).toBe(3);
     expect(res.stderr).toContain("unauthorized");
   });

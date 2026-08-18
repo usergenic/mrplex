@@ -210,13 +210,21 @@ describe("REST docs — content negotiation", () => {
     });
   });
 
-  it("Accept: text/markdown returns byte-exact document", async () => {
-    const r = await fetch(`${base}/repos/notes/docs/hello.md`, {
+  it("Accept: text/markdown returns byte-exact document (?raw suppresses $version)", async () => {
+    const r = await fetch(`${base}/repos/notes/docs/hello.md?raw`, {
       headers: { ...authHeaders(), Accept: "text/markdown" },
     });
     expect(r.status).toBe(200);
     expect(r.headers.get("content-type")).toContain("text/markdown");
     expect(await r.text()).toBe("---\nstatus: draft\n---\nhello m3\n");
+  });
+
+  it("Accept: text/markdown (default) appends $version", async () => {
+    const r = await fetch(`${base}/repos/notes/docs/hello.md`, {
+      headers: { ...authHeaders(), Accept: "text/markdown" },
+    });
+    expect(r.status).toBe(200);
+    expect(await r.text()).toBe("---\nstatus: draft\n$version: v1\n---\nhello m3\n");
   });
 
   it("Accept: application/json returns Version envelope", async () => {
@@ -237,10 +245,10 @@ describe("REST docs — content negotiation", () => {
     expect(r.status).toBe(304);
   });
 
-  it("Content-Type: text/markdown round-trips byte-exact", async () => {
+  it("Content-Type: text/markdown round-trips byte-exact (?raw both ends)", async () => {
     const original = "---\nstatus: draft\n---\nhello m3\n";
-    // Read as markdown → re-PUT → read again — bytes must be identical.
-    const r1 = await fetch(`${base}/repos/notes/docs/hello.md`, {
+    // Read as markdown with ?raw → re-PUT → read again — bytes must be identical.
+    const r1 = await fetch(`${base}/repos/notes/docs/hello.md?raw`, {
       headers: { ...authHeaders(), Accept: "text/markdown" },
     });
     const md = await r1.text();
@@ -254,10 +262,56 @@ describe("REST docs — content negotiation", () => {
       },
       body: md,
     });
-    const r2 = await fetch(`${base}/repos/notes/docs/hello.md`, {
+    const r2 = await fetch(`${base}/repos/notes/docs/hello.md?raw`, {
       headers: { ...authHeaders(), Accept: "text/markdown" },
     });
     expect(await r2.text()).toBe(original);
+  });
+
+  it("PUT with $version in frontmatter (no If-Match) uses embedded version as prev", async () => {
+    // GET default markdown → contains $version → PUT without If-Match → succeeds,
+    // and the stored doc has $version stripped (byte-exact via ?raw).
+    const r1 = await fetch(`${base}/repos/notes/docs/hello.md`, {
+      headers: { ...authHeaders(), Accept: "text/markdown" },
+    });
+    const md = await r1.text();
+    expect(md).toContain("$version: v1");
+    // Edit only the body; keep $version in frontmatter.
+    const edited = md.replace("hello m3\n", "hello v2\n");
+    const rp = await fetch(`${base}/repos/notes/docs/hello.md`, {
+      method: "PUT",
+      headers: { ...authHeaders(), "Content-Type": "text/markdown" },
+      body: edited,
+    });
+    expect(rp.status).toBe(200);
+    // Storage doesn't carry $version — read raw and verify.
+    const r2 = await fetch(`${base}/repos/notes/docs/hello.md?raw`, {
+      headers: { ...authHeaders(), Accept: "text/markdown" },
+    });
+    expect(await r2.text()).toBe("---\nstatus: draft\n---\nhello v2\n");
+  });
+
+  it("PUT with $version after a concurrent write → stale_prev", async () => {
+    // Someone else advances the doc to v2.
+    await fetch(`${base}/repos/notes/docs/hello.md`, {
+      method: "PUT",
+      headers: {
+        ...authHeaders(),
+        "Content-Type": "text/markdown",
+        "If-Match": '"v1"',
+      },
+      body: "---\nstatus: draft\n---\nintervening\n",
+    });
+    // Our client still has v1 in its embedded $version.
+    const stale = "---\nstatus: draft\n$version: v1\n---\nour edit\n";
+    const rp = await fetch(`${base}/repos/notes/docs/hello.md`, {
+      method: "PUT",
+      headers: { ...authHeaders(), "Content-Type": "text/markdown" },
+      body: stale,
+    });
+    expect(rp.status).toBe(412);
+    const body = (await rp.json()) as { code: string };
+    expect(body.code).toBe("stale_prev");
   });
 });
 
