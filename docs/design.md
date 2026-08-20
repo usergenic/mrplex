@@ -1067,6 +1067,24 @@ Remaining `[OPEN]` markers throughout the doc are narrower questions (query cach
 - **Structured body queries (block tree).** A cached parse of each version's body into a block tree — headings, sections, paragraphs, list/task items, code fences — stored as a derived artifact like chunks. Already motivated twice elsewhere: merge helpers (above) want it for three-way block merge, and link anchors (§11.2) want heading identity. With it, filters can address structure: "docs with an unchecked task item," "docs with an `## Decisions` section," via `$`-namespace intrinsics (e.g. `$headings`, `$tasks` — same collision-free convention as §5.1). One cached artifact feeds three features (merge, structure queries, body patches); build it when the first of the three lands.
 - **Links, backlinks, and graph queries.** Fully sketched in §11.2 — a derived link index that binds to document *identity*, glob-argument CEL intrinsics for single-hop queries, recursive-CTE traversal for multi-hop.
 - **EDTF interval queries in CEL.** Frontmatter routinely carries date-range values in [Extended Date/Time Format](https://www.loc.gov/standards/datetime/) — `active_duty: 2025-05-01/2025-07-13`, `active_duty: 2025-05-01/..` for open-ended intervals, year- or month-granularity endpoints, etc. Making these queryable follows the §5.2 `list()` playbook: a set of CEL functions the compiler recognizes as hints — `edtf_contains(active_duty, "2026-06-01")`, `edtf_overlaps(active_duty, "2025-06/2025-08")`, `edtf_start(active_duty) < "2025-06-01"` — compiled to a UDF call registered on the connection (same mechanism as the existing `regexp` UDF for scope filtering, §5.1). The UDF pulls in a JS EDTF parser (Level 0–2, including `..`), so semantics are identical across SQLite and Postgres adapters. Missing or malformed values follow the same "predicate is false" rule as `list()` misses. Per-row parse cost is the honest limit — fine when other filters narrow the set, less fine when EDTF is the primary predicate at scale. Two follow-on options if that becomes real: (a) per-repo config listing EDTF fields to normalize into `(start, end)` at write time (same shape as the `link_config: { fields: [...] }` idea in §11.2), or (b) a general derived-artifact table (`versions_edtf(version_id, field, start, end)`) maintained by the same worker that does chunks. Both are additive — nothing in v1's schema blocks either.
+- **Documents as list membership: the `--in` operator** `[OPEN]`. Any document already denotes a set — the documents it references — so no "list" doctype is needed. Introduce a `--in <path>` operator on `query` (also on the MCP `docs_query` tool and the REST list surface): membership = the outbound *static* edges from the current version of `<path>` (via the §11.2 links index) unioned with the results of any *embedded queries* the document contains. Both sources compose with the usual `--filter`, `--path`, `--text`, `--rank` — `--in` narrows the candidate set; the others predicate over it. Dissolves the earlier "saved views" open questions: storage is the document itself (versioned, diffable, restorable, authored — the whole §3 machinery for free); addressing is the document's own path (no new URI scheme, no views table); scope follows the rules already in force — author scope governs who can see the list document; caller scope filters the resolved membership the same way §11.2 traversal does. **Dynamic queries resolve at query time** — no result materialization, per the §11.2 "static edges only" note; a per-doc cap on embedded queries prevents pathological list docs from becoming fork bombs. Membership ordering: static-first in `ord` order, then dynamic, deduped by `document_id`; ordering is unspecified once `--filter` composes. Dangling static edges contribute nothing (consistent with "membership = what a reader could click through to"). Recursion is one hop only — a member that is itself a list doc is *not* expanded; multi-hop reachability lives in `$reachable_from` (§11.2). The CEL twin of `--in X` is `$in(X)` (§11.2 CEL surface) — same union semantics, same scope rules — so membership also composes *inside* filters as set algebra: `--filter '$in("moc/employees.md") && !$in("moc/contractors.md")'`.
+
+  Roadmap coupling: the static half depends on the §11.2 link index shipping first; the dynamic half (embedded queries) is independent and could ship first as an honest slice — `--in X` returns query-derived membership only until static links land.
+
+  Open: (1) embedded-query surface — fenced code blocks with an `mrplex-query` info string (Dataview-style, visible where a reader sees the list) vs. a frontmatter field (`queries: [...]`, structured and easier to validate at write time) vs. both; (2) whether query specs are cached in a small `document_queries(src_document_id, ord, spec)` sidecar maintained by the same worker (still no *result* materialization — just cached parse, doc-keyed and rebuilt on write of the source like `links`) or re-parsed from the source on every `--in` call; (3) the cap value on embedded queries per doc and the response when it's exceeded (reject the query with an explicit error, or truncate with a warning?); (4) whether frontmatter-declared link fields (`link_config.fields`) count toward static membership for `--in` by default, or only body-syntax edges do.
+- **Aggregations and grouping** `[OPEN]`. Extend `query` with `--count`, `--group-by <field>`, `--facet <field>`; polymorphic `list()` semantics (§5.2) carry over so a document with `tags: [a, b]` counts once per bucket. Both adapters support this natively (SQL `COUNT`/`GROUP BY`, plus `jsonb_array_elements` on Postgres / `json_each` on SQLite for list explosion). Open: response shape (grow the existing envelope with a `groups`/`counts` sibling to `items`, or split off a distinct `docs.count`/`docs.aggregate` op?); text and rank interaction (does count reflect FTS relevance, and do groups return per-group top-k?); ETag semantics for aggregated responses vs. the row-level ETags §6.3 currently emits.
+- **`docs.blame`.** Per-line last-touched-in version, computed by folding the existing unified-diff chain from oldest to newest. Kernel op, `/repos/{repo}/blame/{path}` REST route (JSON envelope), `docs_blame` MCP tool, `mrplex docs blame` CLI. Cost is O(chain length) per call — fine for interactive reads on typical documents; pathological chains are the same class that already stresses `docs.history`. No new storage; the diffs are the source.
+- **Stable pagination cursors.** Snapshot the query's read-point (`max(version_id)` bound at query time) into the cursor alongside the ordering key. Second-page reads apply the same `version_id ≤ snapshot` predicate, so writes concurrent with a paging session never shuffle rows across page boundaries and the caller sees the coherent state they started paging from. The `versions(next_id is null)` current-version filter becomes a range check bounded by the snapshot; the versioned schema already contains everything needed.
+- **Per-repo frontmatter schema** `[OPEN]`. Declared shape stored per repo (types, required fields, enums, string patterns), validated at write time. Turns the "YAML soup" reality into typed records without giving up prose, and is load-bearing for three downstream features: MCP tools shaped like the domain (`notes.create_task(title, due, tags)` derived from the schema, not just generic `docs.put`), LSP completion (below), and aggregations (above) that can trust field types. Open: schema language (JSON Schema for reach, or a small mrplex-native dialect that maps directly to CEL types?); enforcement mode (strict / warn / advisory, per repo *and* per field?); evolution when a required field is added to a repo with existing docs (reject writes, allow with defaults, or trigger a bulk-update pass via the future bulk-update op?); scope (schema lives in repo config, or as a system-namespace doc so it versions like anything else?).
+- **Computed frontmatter as `$`-intrinsics.** `$word_count`, `$reading_time`, `$outgoing_links` (once §11.2 lands), `$last_body_edit` (most recent version whose body hash actually differed — distinguishes real edits from frontmatter-only touches). All derivable from data mrplex already stores; queryable via the same CEL surface as `$path`/`$updated_at`. Read-only — writes rejected with `computed_field`. Kills the "stash derived value in frontmatter and forget to update it" antipattern that otherwise grows in every corpus.
+- **Change feed — webhooks and SSE.** Every write (create/update/move/delete) emits `{ repo, path, document_id, version_id, prev_version_id, actor, kind }`. Two subscribers: outbound webhooks (per-repo config, HMAC-signed, at-least-once with a small retry queue) and a `GET /repos/{repo}/events` SSE stream filtered by the caller's read scope (§8.2) — same scope filter as `query`, so no subscriber ever sees an event it couldn't have read. MCP notifications already exist; this is the plain-HTTP twin so a static-site builder, Meilisearch indexer, or an agent doesn't have to poll. Ordering guarantee is per-document, not global (matches the write model). Resume via `?from_version_id=…`.
+- **`mrplex verify`.** Integrity scrub over the version chain: walk each document oldest-to-newest, recompute body/frontmatter hashes, confirm `frontmatter_raw` ↔ `frontmatter` round-trips byte-exact (§3.2), check `prev_id`/`next_id` symmetry, verify FTS/chunk/link derived tables against their source versions, report orphans. No writes. CLI + kernel op + optional CI mode that exits non-zero on any inconsistency. Cheap insurance for an append-only store where the chain *is* the guarantee.
+- **Retention: rollup of autosave storms.** Per-repo policy that collapses contiguous same-author versions within N seconds into a single displayed step in `docs.history` — underlying versions retained, a `rollup_of` link identifies the group. Complements the embedding damper (§5.3): history stays readable when a WebDAV/Obsidian client sprays 40 saves per minute during an edit session. This is a view-time policy over an untouched underlying chain, not a delete — `docs.get --version` still resolves every intermediate step and `docs.diff` still spans them.
+- **`mrplex-lsp`.** LSP over stdio for Markdown+YAML: frontmatter completion and diagnostics from the per-repo schema (above), go-to-definition and hover on links once §11.2 lands, code-actions surfacing `mrplex links repair`. Editors get the mrplex surface (VS Code, Neovim, Helix, Zed) through their existing LSP clients, without a per-editor plugin. Runs against `--database` or `--server` the same way the CLI does.
+- **`mrplex export`.** Materialize a repo's live current versions as a filesystem tree — `path/` structure, `frontmatter_raw` + body written verbatim. Flags for `:deleted/` inclusion, historical version fanout (`--as-of` once PIT reads land), and index files. Hands the corpus to Hugo/Zola/11ty/rsync in one command; the byte-exact round-trip is what makes it trustworthy where a naive dump wouldn't be.
+- **Attachments — content-addressed sidecars** `[OPEN]`. Bounded relaxation of the "text-only" non-goal (§2): binary blobs stored in a separate `attachments(sha256, bytes, media_type, size)` table, referenced from frontmatter via a `!attachment sha256:…` tag or from body via a canonical `attachment:` URL scheme. Uploaded via `POST /repos/{repo}/attachments` (returns the sha), garbage-collected once no live version references them. Solves "where do the images live" without a second system while preserving the invariant that documents themselves are Markdown-only. Open: scope (per-repo bucket, or a global content-addressed pool shared across repos?); auth (attachment access follows the doc scope of any referring version, or independent read-globs?); size limits and streaming (small blobs inline in the DB, large ones deferred until it matters?); GC policy (immediate refcount, or a periodic sweep?).
+- **`mrplex import`.** Bulk-seed a repo from a filesystem tree. Default mode creates one version per file. `--replay-git` walks a git history and creates one mrplex version per commit that touched the file, preserving the commit author and timestamp — the schema already carries author + created_at, so this is straight population, not a new concept. Best onramp for existing Obsidian/Zettelkasten vaults; sits below git bridging (above) as its one-shot precursor.
+- **Read-only follower servers.** `mrplex serve --read-only` refuses all writes at the surface (returns `read_only` on mutating kernel ops, rejects the corresponding MCP tools, 405s the REST verbs). Points at a Postgres follower via its own DATABASE URL; the DB layer handles replication. Horizontal read scale for the "one shared notes DB, N agent readers" pattern — writes stay on the primary, queries fan out. SQLite variant is trivially available via a read-only file open, useful for local backups.
 
 ### 11.1 WebDAV gateway — implementation spec
 
@@ -1120,26 +1138,45 @@ The client half ships with every OS — that is the point of choosing WebDAV ove
 
 ### 11.2 Links, backlinks, and graph queries — design sketch
 
-A markdown corpus is a graph, and mrplex should know it. The architecture follows chunks and FTS exactly: **links are a derived index over versions** — extracted by the same post-write worker, rebuildable from scratch, never source of truth. That is also why deferring is safe: nothing in the v1 schema blocks this; a backfill pass builds the index for an existing corpus the same way `embed backfill` does.
+A markdown corpus is a graph, and mrplex should know it. The architecture follows chunks and FTS exactly: **links are a derived index over documents' current versions** — extracted by the same post-write worker, rebuildable from scratch, never source of truth. **Doc-keyed, not version-keyed:** one row per outbound edge from the live corpus, not per historical write. Every interesting query (backlinks, `--in` membership, orphans, traversal) asks about the current graph; the version-keyed alternative would inflate storage linearly with edit history for no query the design cares about. Historical link questions ("what did this doc link to in v42?") are answered by reparsing that version — consistent with the rest of the design's "current is fast, history is a scan" posture (see the PIT reads bullet above). That is also why deferring is safe: nothing in the v1 schema blocks this; a backfill pass builds the index for an existing corpus the same way `embed backfill` does.
 
 #### Extraction
 
-On write, the worker parses the new version for two kinds of edge. Extraction is deterministic and server-side, like chunking (§5.3) — no hook; the syntaxes below are the contract:
+On write, the worker parses the new **current version** of the source document for outbound edges. Extraction is deterministic and server-side, like chunking (§5.3) — no hook — and driven by the effective **link config**, layered `hardcoded defaults → server config → per-repo override` on the §3.5 pattern. Each configured syntax contributes edges to the same table; disabling a syntax removes it from extraction entirely.
 
-- **Body links** — CommonMark links/images and wiki-style `[[page]]` links. Relative targets normalize against the doc's own path; anchors (`#heading`) are preserved on the raw target.
-- **Frontmatter references** — values of per-repo declared fields (`link_config: { fields: ["parent", "related"] }`), each a document path, scalar-or-list per the §5.2 convention.
+Recognized syntaxes and defaults:
+
+- **CommonMark inline** `[text](path)` — default on.
+- **CommonMark reference** `[text][id]` + `[id]: path` — default on.
+- **Image links** `![alt](path)` — default on. Turn off in repos where images live as content-addressed attachments (see the attachments bullet in §11).
+- **Autolinks** `<foo.md>` — default on.
+- **Wikilinks** `[[page]]` and `[[page|display]]` — default on. Extension elision on: `[[foo]]` resolves to `foo.md` first, then `foo/index.md`.
+- **Frontmatter references** — values of per-repo declared fields (`link_config.fields`), each a document path, scalar-or-list per the §5.2 convention. Default: empty list (opt-in per repo). Field names use CEL's field-access syntax (see **Field paths** below), so `link_config.fields` and `--filter` share one grammar.
+
+Path resolution rules: relative targets normalize against the source doc's own path unless written repo-absolute (leading `/`); anchors (`#heading`) are preserved on the raw target; case follows the repo's path policy (§3.5.1). All of these are also link-config knobs on the same three-level cascade.
+
+**Field paths.** The `field` column below and `link_config.fields` both use CEL's field-access syntax — filter authors already write it, so link config and filters share one path grammar:
+
+- Dot notation for identifier-safe segments: `parent`, `project.lead`, `metadata.author.name`.
+- Bracket-quoted strings for segments that aren't valid identifiers: `owners["team-lead"]`, `data["2024-Q3"]`.
+- No explicit array indices in the path. The polymorphic `list()` convention (§5.2) treats scalar-and-list forms of a field uniformly, and extraction follows suit: `stakeholders.name` matches both `stakeholders: {name: alice}` and `stakeholders: [{name: alice}, {name: bob}]`; the two hits come out at different `ord` values under the same `field`.
+- `$body` is the reserved sentinel for body-derived edges. Since `$` is not a valid identifier-start in CEL, `$body` is unambiguously a sentinel, not a field name — no collision possible with any frontmatter path.
+- **Terminal-fields rule.** A declared `link_config.fields` entry extracts only when its resolved value is a string or list of strings. A non-terminal name on a list-of-objects extracts nothing — declare the terminal path (`stakeholders.name`) to reach in. Foot-gun prevented by construction: `link_config.fields: ["stakeholders"]` cannot silently harvest prose values from `stakeholders[*].bio`.
 
 ```sql
 links (
-  src_version_id     integer not null references versions(id),
-  ord                integer not null,                 -- position within the doc
-  kind               text not null,                    -- 'body' | 'frontmatter'
-  field              text,                             -- frontmatter field name when kind = 'frontmatter'
+  src_document_id    integer not null references documents(id),
+  ord                integer not null,                 -- position within the current version
+  field              text not null,                    -- '$body' for body-derived edges; CEL-style frontmatter path otherwise (e.g. 'parent', 'project.lead')
   target_raw         text not null,                    -- exactly what was written, normalized to repo-absolute; anchor preserved
   target_document_id integer references documents(id), -- resolved at extraction; null = dangling
-  primary key (src_version_id, ord)
+  primary key (src_document_id, ord)
 )
 ```
+
+**Maintenance is local to the source.** On every `docs.put`/`docs.create` that advances doc D's current version, the worker deletes `where src_document_id = D` and re-extracts from the new body and frontmatter — one bounded transaction, no accumulation across history. `docs.delete` moves D into the system namespace; the worker clears D's outbound rows, and inbound rows (target = D) stay put — visibility filtering excludes them from live-namespace queries the same way `query` already excludes deleted docs (§8.2 / §4.1). `docs.move` produces **no edge churn at all** — target resolution is identity-bound (below), so inbound edges keep pointing at D. A change to the effective link config triggers a repo-wide re-extraction pass, driven by the same worker on the same path as `embed backfill`.
+
+**Static edges only.** This index holds outbound *static* links — CommonMark, wikilink, and declared frontmatter references. **Dynamic membership** — a list document containing embedded queries whose results contribute to `--in X` (see the saved-views bullet in §11) — is *resolved at query time* against the current state of the repo, not materialized here. A materialized dynamic-membership index is a genuinely deep separate concern (repo-global invalidation, predicate-inversion, staleness budget); it would earn its own sketch if and when it becomes worth building.
 
 Links are repo-local in this sketch; cross-repo references are `[OPEN]`.
 
@@ -1158,26 +1195,62 @@ Because the graph is identity-bound, moving a page breaks nothing structurally; 
 - `mrplex links repair` walks that list and rewrites each doc as an ordinary optimistic `docs.put` under the caller's token — `prev` checks apply, conflicts are reported and skipped, and every repair is a normal authored version in the chain.
 - `[OPEN]` an opt-in per-repo `auto_repair` policy driving the same loop from the server-side worker after each move. Either way the mechanism is identical; the question is only who pulls the trigger.
 
-#### Backlinks and associative queries in CEL
+#### CEL surface: `$in`, `$has`, `$backlinks()`, `$links()`
 
-Graph predicates join the intrinsic `$` namespace (§5.1) as functions, compiled to SQL joins against the link index. Two tiers:
+Graph predicates join the intrinsic `$` namespace (§5.1) as functions, compiled to SQL joins against the link index (static) or to embedded-query evaluation at query time (dynamic). The vocabulary deliberately avoids directional prepositions ("links to," "linked from") — those force the reader to work out which end of the arrow the current document sits on. **Possession language** is direction-unambiguous by construction:
 
-**Tier 1 — single-hop, glob arguments.** Each compiles to one `EXISTS` join against `links`; ships first:
+| Concept | Boolean test | Collection |
+|---|---|---|
+| others → me | `$in(glob)` — "I'm in X's set" | `$backlinks()` |
+| me → others | `$has(glob)` — "X is in my set" | `$links()` |
+
+Four names, each the most natural word for its concept:
+
+- **`$in(path-or-glob)`** — membership. The CEL twin of the `--in` operator (§11 list-membership bullet): `--in employees.md` on the CLI is exactly `$in("employees.md")` in a filter. A glob argument means "in any matching doc's set."
+- **`$has(path-or-glob)`** — reference. Reads as the question people actually ask: "docs that have a link to horses.md" → `$has("horses.md")`.
+- **`$backlinks()`** — the community's own word (Obsidian, Roam, LogSeq): the collection of docs referencing me, for `.exists()` / `.all()` / `.size()`.
+- **`$links()`** — the collection of docs I reference.
+
+No separate count functions: CEL's `size()` covers it — `$backlinks().size()` compiles to a scalar `COUNT` subquery.
+
+**MOC set algebra** is the payoff — membership expressions compose like set operations:
 
 ```cel
-$links_to("projects/**")              -- outbound link to a doc currently under projects/
-$linked_from("moc/**")                -- backlinks: some doc under moc/ links here
-!$linked_from("**")                   -- orphan pages
-$ref("parent", "projects/**")         -- frontmatter-field-specific edge
+$in("moc/employees.md") && !$in("moc/contractors.md")   -- set difference
+$in("moc/employees.md") && $in("moc/on-call.md")        -- intersection
+$in("moc/**")                                            -- union over a family of MOCs
+!$in("**")                                               -- orphan: in nobody's set
+$has("projects/**") && status == "active"                -- active docs referencing any project
+$backlinks().exists(d, d.status == "draft")              -- something unfinished cites me
+$links().size() == 0                                     -- leaf node
 ```
 
-**Tier 2 — bounded traversal and sub-predicates** (`[OPEN]` syntax; feasibility is settled):
+**Three-way static / dynamic / union partition.** Each of the four exists in three named forms:
+
+- `_static` suffix — evaluates against the `links` index only. Cheap `EXISTS` join.
+- `_dyn` suffix — evaluates *only* embedded queries at query time. Never touches the `links` index.
+- No suffix — union of the two. Semantically `_static(x) || _dyn(x)`; cost is the sum.
+
+So: `$in_static` / `$in_dyn` / `$in`, and likewise `$has_*`, `$backlinks_*()`, `$links_*()`. Bare `$in` agrees with `--in` without a special-case rule — both mean the union, by the same convention everything else follows. Debugging is mechanical: "why isn't this doc in `$in(X)`?" → check `$in_static(X)` and `$in_dyn(X)` independently to isolate a missing written link vs. a query miss.
+
+**Field restriction is an optional second argument**, not a separate function family: `$has("projects/**", "parent")` — "names a project as its parent"; `$in("moc/**", "related")` — "listed in some MOC's `related` field." Field arguments use the CEL field-access syntax defined under **Field paths** above, including `"$body"` to restrict to body-derived edges. A field argument restricts evaluation to static edges — dynamic edges are fieldless by nature — so `$has(X, f)` ≡ `$has_static(X, f)`, and the `_dyn` forms reject a field argument at compile time.
+
+**Multi-hop traversal** — feasibility settled, syntax `[OPEN]`:
 
 ```cel
-$reachable_from("moc/index.md", 3)               -- within 3 hops of the index
-$backlinks().exists(d, d.status == "draft")      -- predicate over the linking docs
+$reachable_from("moc/index.md", 3)               -- inbound reachability within 3 hops of the index
 ```
 
-Multi-hop compiles to a recursive CTE — supported by both Postgres and SQLite, so the §7.2 parity guarantees hold; depth is capped and cycles terminate via the CTE's visited set. Sub-predicates compile to nested `EXISTS`. The committed part is the schema shape, not the syntax: identity-resolved links make every one of these a join, not a parse.
+Graph-distance vocabulary is correct *here*, where the question is genuinely about the graph. Multi-hop compiles to a recursive CTE — supported by both Postgres and SQLite, so the §7.2 parity guarantees hold; depth is capped and cycles terminate via the CTE's visited set. Traversal is offered against the *static* index only; there is no bounded-cost story for multi-hop over embedded queries, and there won't be until materialized dynamic membership arrives.
 
-**Scope interaction:** traversal respects the caller's read scope the same way `query` does (§8.2) — a hop whose target falls outside the read globs is silently dropped, so the visible graph is exactly the readable graph.
+**Cost model — asymmetric between directions:**
+
+- me → others `_dyn` (`$has_dyn`, `$links_dyn()`) — cheap, **row-bounded** by the current doc's embedded-query cap.
+- others → me `_dyn` (`$in_dyn`, `$backlinks_dyn()`) — **corpus-bounded**: `$in_dyn("**")` fans out over every list doc in the repo. Same underlying problem that made materialized dynamic membership its own deferred concern.
+
+**Scope interaction.** Every predicate — static, dyn, or union — respects the caller's read scope the same way `query` does (§8.2). Sources and targets outside the read globs are silently dropped, so the visible graph equals the readable graph. Embedded-query evaluation for `_dyn` variants also runs under the caller's scope, not the list document's author's scope — an author cannot leak paths a caller couldn't otherwise read.
+
+**Phasing:**
+
+- **Phase 1** — ships with the `links` index. Only the `_static` variants (including field-argument forms). Filter authors write `$in_static(X)` explicitly; queries stay stable when Phase 2 lands.
+- **Phase 2** — ships with embedded queries and the `--in` operator. The `_dyn` variants and the bare-name unions ship together, so bare names' semantics are stable from birth. Inbound-direction `_dyn` (and therefore bare `$in` and bare `$backlinks()`) requires a runtime cap on the number of list docs the evaluator will fan out to — the error surfaces as `dynamic_scope_exceeded` with the list of docs it would have visited, and callers who know what they're doing can widen it explicitly (`--dyn-scope`).
