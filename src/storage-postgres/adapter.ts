@@ -253,25 +253,17 @@ class PostgresStorage implements Storage {
 
   async repos_list(): Promise<RepoRow[]> {
     return this.withClient(async (c) => {
-      const res = await c.query<{
-        id: number;
-        slug: string;
-        path_config: unknown;
-        created_at: string;
-      }>("select id, slug, path_config, created_at from repos order by slug");
+      const res = await c.query<RepoRawRow>(
+        "select id, slug, path_config, link_config, created_at from repos order by slug",
+      );
       return res.rows.map(hydrateRepo);
     });
   }
 
   async repos_create(input: { slug: string; created_at: string }): Promise<RepoRow> {
     return this.withClient(async (c) => {
-      const res = await c.query<{
-        id: number;
-        slug: string;
-        path_config: unknown;
-        created_at: string;
-      }>(
-        "insert into repos(slug, slug_norm, created_at) values ($1, $2, $3) returning id, slug, path_config, created_at",
+      const res = await c.query<RepoRawRow>(
+        "insert into repos(slug, slug_norm, created_at) values ($1, $2, $3) returning id, slug, path_config, link_config, created_at",
         [input.slug, normalizeKey(input.slug), input.created_at],
       );
       return hydrateRepo(res.rows[0] as never);
@@ -280,13 +272,8 @@ class PostgresStorage implements Storage {
 
   async repos_rename(id: number, new_slug: string): Promise<RepoRow> {
     return this.withClient(async (c) => {
-      const res = await c.query<{
-        id: number;
-        slug: string;
-        path_config: unknown;
-        created_at: string;
-      }>(
-        "update repos set slug = $1, slug_norm = $2 where id = $3 returning id, slug, path_config, created_at",
+      const res = await c.query<RepoRawRow>(
+        "update repos set slug = $1, slug_norm = $2 where id = $3 returning id, slug, path_config, link_config, created_at",
         [new_slug, normalizeKey(new_slug), id],
       );
       if (res.rows.length === 0) throw new Error(`repos_rename: repo ${id} not found`);
@@ -297,13 +284,8 @@ class PostgresStorage implements Storage {
   async repos_set_path_config(id: number, path_config: string | null): Promise<RepoRow> {
     return this.withClient(async (c) => {
       // path_config on the wire is JSON text; store as jsonb.
-      const res = await c.query<{
-        id: number;
-        slug: string;
-        path_config: unknown;
-        created_at: string;
-      }>(
-        "update repos set path_config = $1::jsonb where id = $2 returning id, slug, path_config, created_at",
+      const res = await c.query<RepoRawRow>(
+        "update repos set path_config = $1::jsonb where id = $2 returning id, slug, path_config, link_config, created_at",
         [path_config, id],
       );
       if (res.rows.length === 0) throw new Error(`repos_set_path_config: repo ${id} not found`);
@@ -311,28 +293,34 @@ class PostgresStorage implements Storage {
     });
   }
 
+  async repos_set_link_config(id: number, link_config: string | null): Promise<RepoRow> {
+    return this.withClient(async (c) => {
+      // link_config on the wire is JSON text; store as jsonb.
+      const res = await c.query<RepoRawRow>(
+        "update repos set link_config = $1::jsonb where id = $2 returning id, slug, path_config, link_config, created_at",
+        [link_config, id],
+      );
+      if (res.rows.length === 0) throw new Error(`repos_set_link_config: repo ${id} not found`);
+      return hydrateRepo(res.rows[0] as never);
+    });
+  }
+
   async repos_by_slug(slug: string): Promise<RepoRow | null> {
     return this.withClient(async (c) => {
-      const res = await c.query<{
-        id: number;
-        slug: string;
-        path_config: unknown;
-        created_at: string;
-      }>("select id, slug, path_config, created_at from repos where slug_norm = $1", [
-        normalizeKey(slug),
-      ]);
+      const res = await c.query<RepoRawRow>(
+        "select id, slug, path_config, link_config, created_at from repos where slug_norm = $1",
+        [normalizeKey(slug)],
+      );
       return res.rows[0] ? hydrateRepo(res.rows[0] as never) : null;
     });
   }
 
   async repos_by_id(id: number): Promise<RepoRow | null> {
     return this.withClient(async (c) => {
-      const res = await c.query<{
-        id: number;
-        slug: string;
-        path_config: unknown;
-        created_at: string;
-      }>("select id, slug, path_config, created_at from repos where id = $1", [id]);
+      const res = await c.query<RepoRawRow>(
+        "select id, slug, path_config, link_config, created_at from repos where id = $1",
+        [id],
+      );
       return res.rows[0] ? hydrateRepo(res.rows[0] as never) : null;
     });
   }
@@ -846,23 +834,26 @@ class PostgresStorage implements Storage {
   }
 }
 
-function hydrateRepo(row: {
+type RepoRawRow = {
   id: number;
   slug: string;
   path_config: unknown;
+  link_config: unknown;
   created_at: string;
-}): RepoRow {
-  // path_config arrives as an already-parsed object from jsonb. RepoRow
-  // types it as string | null (the SQLite raw shape); serialize it back
-  // to a string so the kernel's JSON.parse path is uniform across
+};
+
+function hydrateRepo(row: RepoRawRow): RepoRow {
+  // path_config / link_config arrive as already-parsed objects from jsonb.
+  // RepoRow types them as string | null (the SQLite raw shape); serialize
+  // back to a string so the kernel's JSON.parse path is uniform across
   // adapters.
+  const asText = (v: unknown): string | null =>
+    v === null || v === undefined ? null : JSON.stringify(v);
   return {
     id: row.id,
     slug: row.slug,
-    path_config:
-      row.path_config === null || row.path_config === undefined
-        ? null
-        : JSON.stringify(row.path_config),
+    path_config: asText(row.path_config),
+    link_config: asText(row.link_config),
     created_at: row.created_at,
   };
 }

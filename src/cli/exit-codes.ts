@@ -32,6 +32,7 @@ export function exitCodeForKernelError(code: KernelErrorCode): number {
     case "path_invalid":
     case "frontmatter_invalid":
     case "filter_invalid":
+    case "link_config_invalid":
     case "version_not_in_document":
     case "precondition_required":
     case "payload_too_large":

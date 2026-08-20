@@ -23,6 +23,8 @@ export type RepoRow = {
   id: number;
   slug: string;
   path_config: string | null;
+  /** Per-repo link-extraction override JSON (§11.2). Null = inherit. */
+  link_config: string | null;
   created_at: string;
 };
 
@@ -175,6 +177,7 @@ export type Storage = {
   repos_create(input: { slug: string; created_at: string }): Promise<RepoRow>;
   repos_rename(id: number, new_slug: string): Promise<RepoRow>;
   repos_set_path_config(id: number, path_config: string | null): Promise<RepoRow>;
+  repos_set_link_config(id: number, link_config: string | null): Promise<RepoRow>;
   repos_by_slug(slug: string): Promise<RepoRow | null>;
   repos_by_id(id: number): Promise<RepoRow | null>;
 

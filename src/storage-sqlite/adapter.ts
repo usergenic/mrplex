@@ -194,14 +194,14 @@ class SqliteStorage implements Storage {
 
   async repos_list(): Promise<RepoRow[]> {
     return this.db
-      .prepare("select id, slug, path_config, created_at from repos order by slug")
+      .prepare("select id, slug, path_config, link_config, created_at from repos order by slug")
       .all() as RepoRow[];
   }
 
   async repos_create(input: { slug: string; created_at: string }): Promise<RepoRow> {
     return this.db
       .prepare(
-        "insert into repos(slug, slug_norm, created_at) values (?, ?, ?) returning id, slug, path_config, created_at",
+        "insert into repos(slug, slug_norm, created_at) values (?, ?, ?) returning id, slug, path_config, link_config, created_at",
       )
       .get(input.slug, normalizeKey(input.slug), input.created_at) as RepoRow;
   }
@@ -209,7 +209,7 @@ class SqliteStorage implements Storage {
   async repos_rename(id: number, new_slug: string): Promise<RepoRow> {
     const row = this.db
       .prepare(
-        "update repos set slug = ?, slug_norm = ? where id = ? returning id, slug, path_config, created_at",
+        "update repos set slug = ?, slug_norm = ? where id = ? returning id, slug, path_config, link_config, created_at",
       )
       .get(new_slug, normalizeKey(new_slug), id) as RepoRow | undefined;
     if (!row) throw new Error(`repos_rename: repo ${id} not found`);
@@ -219,10 +219,20 @@ class SqliteStorage implements Storage {
   async repos_set_path_config(id: number, path_config: string | null): Promise<RepoRow> {
     const row = this.db
       .prepare(
-        "update repos set path_config = ? where id = ? returning id, slug, path_config, created_at",
+        "update repos set path_config = ? where id = ? returning id, slug, path_config, link_config, created_at",
       )
       .get(path_config, id) as RepoRow | undefined;
     if (!row) throw new Error(`repos_set_path_config: repo ${id} not found`);
+    return row;
+  }
+
+  async repos_set_link_config(id: number, link_config: string | null): Promise<RepoRow> {
+    const row = this.db
+      .prepare(
+        "update repos set link_config = ? where id = ? returning id, slug, path_config, link_config, created_at",
+      )
+      .get(link_config, id) as RepoRow | undefined;
+    if (!row) throw new Error(`repos_set_link_config: repo ${id} not found`);
     return row;
   }
 
@@ -230,7 +240,9 @@ class SqliteStorage implements Storage {
     // Case-insensitive identity: fold the query key to slug_norm (§3.5.1).
     return (
       (this.db
-        .prepare("select id, slug, path_config, created_at from repos where slug_norm = ?")
+        .prepare(
+          "select id, slug, path_config, link_config, created_at from repos where slug_norm = ?",
+        )
         .get(normalizeKey(slug)) as RepoRow | undefined) ?? null
     );
   }
@@ -238,7 +250,7 @@ class SqliteStorage implements Storage {
   async repos_by_id(id: number): Promise<RepoRow | null> {
     return (
       (this.db
-        .prepare("select id, slug, path_config, created_at from repos where id = ?")
+        .prepare("select id, slug, path_config, link_config, created_at from repos where id = ?")
         .get(id) as RepoRow | undefined) ?? null
     );
   }
