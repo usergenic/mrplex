@@ -10,6 +10,8 @@ import type {
   DocumentRow,
   FrontmatterJson,
   HistoryOptions,
+  LinkEdgeInput,
+  LinkRow,
   OpenConfig,
   RepoRow,
   Storage,
@@ -348,6 +350,62 @@ class SqliteStorage implements Storage {
     // SQLite FTS5 external-content mode with AFTER INSERT triggers on
     // `versions` keeps the index in sync automatically (see migration
     // 0003_fts_docs.sql).
+  }
+
+  // Links derived index (design §11.2, migration 0005_links.sql).
+
+  async links_replace(
+    repo_id: number,
+    source_id: number,
+    edges: readonly LinkEdgeInput[],
+  ): Promise<void> {
+    return this.tx(async () => {
+      this.db.prepare("delete from links where source_id = ?").run(source_id);
+      if (edges.length === 0) return;
+      const insert = this.db.prepare(
+        `insert into links (repo_id, source_id, ord, field, target_raw, target_norm, target_id)
+         values (?, ?, ?, ?, ?, ?, ?)`,
+      );
+      for (const e of edges) {
+        insert.run(repo_id, source_id, e.ord, e.field, e.target_raw, e.target_norm, e.target_id);
+      }
+    });
+  }
+
+  async links_clear(source_id: number): Promise<void> {
+    this.db.prepare("delete from links where source_id = ?").run(source_id);
+  }
+
+  async links_resolve_dangling(
+    repo_id: number,
+    target_norm: string,
+    document_id: number,
+  ): Promise<number> {
+    const res = this.db
+      .prepare(
+        `update links set target_id = ?
+         where repo_id = ? and target_norm = ? and target_id is null`,
+      )
+      .run(document_id, repo_id, target_norm);
+    return res.changes;
+  }
+
+  async links_by_source(source_id: number): Promise<LinkRow[]> {
+    return this.db
+      .prepare(
+        `select repo_id, source_id, ord, field, target_raw, target_norm, target_id
+         from links where source_id = ? order by ord`,
+      )
+      .all(source_id) as LinkRow[];
+  }
+
+  async links_by_repo(repo_id: number): Promise<LinkRow[]> {
+    return this.db
+      .prepare(
+        `select repo_id, source_id, ord, field, target_raw, target_norm, target_id
+         from links where repo_id = ? order by source_id, ord`,
+      )
+      .all(repo_id) as LinkRow[];
   }
 
   async versions_search(plan: SearchPlan): Promise<VersionRow[]> {

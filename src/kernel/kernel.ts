@@ -10,6 +10,13 @@
  */
 
 import { randomBytes } from "node:crypto";
+import {
+  HARDCODED_DEFAULTS as LINK_DEFAULTS,
+  type LinkConfig,
+  effectiveLinkConfig,
+  parseRepoOverride as parseLinkOverride,
+} from "../links/link-config.js";
+import { bindDanglingToPath, reindexOutboundLinks } from "../links/maintain.js";
 import type { RepoRow, Storage, TokenRow, VersionRow } from "../storage/types.js";
 import type { Action, Actor, StoredScope, Target } from "./auth/actor.js";
 import { authorize } from "./auth/authorize.js";
@@ -123,6 +130,8 @@ export type Kernel = {
 export type KernelConfig = {
   storage: Storage;
   serverPathConfig?: PathConfig;
+  /** Server-level link-extraction config (§11.2). Defaults to hardcoded. */
+  serverLinkConfig?: LinkConfig;
   /**
    * M4 write-time hook: called with the new version's storage id after
    * every committed create / put / delete. Awaited in-line so a throw
@@ -140,6 +149,7 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
       : { storage: config as Storage };
   const storage = cfg.storage;
   const serverPathConfig = cfg.serverPathConfig ?? HARDCODED_DEFAULTS;
+  const serverLinkConfig = cfg.serverLinkConfig ?? LINK_DEFAULTS;
   const onVersionCommitted = cfg.onVersionCommitted;
   const queryEmbed = cfg.queryEmbed;
 
@@ -193,6 +203,10 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
 
   function repoEffectiveConfig(repo: RepoRow): PathConfig {
     return effectivePathConfig(serverPathConfig, parseRepoOverride(repo.path_config));
+  }
+
+  function repoEffectiveLinkConfig(repo: RepoRow): LinkConfig {
+    return effectiveLinkConfig(serverLinkConfig, parseLinkOverride(repo.link_config));
   }
 
   async function resolveRepo(actor: Actor, slug: string, action: Action): Promise<RepoRow> {
@@ -450,6 +464,19 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
             author_id: actor.user_id,
             created_at: new Date().toISOString(),
           });
+          // Links (§11.2): index this doc's outbound edges, and bind any
+          // danglers that were waiting for a document at this path.
+          const linkConfig = repoEffectiveLinkConfig(repo);
+          await reindexOutboundLinks(
+            storage,
+            linkConfig,
+            repo.id,
+            doc.id,
+            path,
+            input.body,
+            canon.frontmatter,
+          );
+          await bindDanglingToPath(storage, repo.id, path, doc.id);
           const author = await userById(actor.user_id);
           return {
             version: toVersionWireSync(inserted, repoSlug, author),
@@ -516,6 +543,23 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
             author_id: actor.user_id,
             created_at: new Date().toISOString(),
           });
+          // Links (§11.2): re-extract this doc's outbound edges from the new
+          // version (body/frontmatter or the source path may have changed).
+          // Inbound edges are identity-bound, so a move needs no inbound
+          // churn; but a move INTO a path that has danglers binds them.
+          const linkConfig = repoEffectiveLinkConfig(repo);
+          await reindexOutboundLinks(
+            storage,
+            linkConfig,
+            repo.id,
+            prev.document_id,
+            destPath,
+            body,
+            canon.frontmatter,
+          );
+          if (destPath !== prev.path) {
+            await bindDanglingToPath(storage, repo.id, destPath, prev.document_id);
+          }
           const author = await userById(actor.user_id);
           return {
             version: toVersionWireSync(inserted, repoSlug, author),
@@ -593,6 +637,12 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
             author_id: actor.user_id,
             created_at: new Date().toISOString(),
           });
+          // Links (§11.2): clear the deleted doc's OUTBOUND edges — a doc in
+          // the system namespace links to nothing readable. INBOUND edges
+          // (target = this doc) stay bound; visibility filtering excludes
+          // them from live-namespace queries, and they rebind naturally if
+          // the doc is restored.
+          await storage.links_clear(prev.document_id);
           const author = await userById(actor.user_id);
           return {
             version: toVersionWireSync(inserted, repoSlug, author),

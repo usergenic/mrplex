@@ -57,12 +57,23 @@ describe("migrate", () => {
       .get() as { name: string } | undefined;
     expect(linksTable?.name).toBe("links");
 
+    const linkCols = db.prepare("pragma table_info(links)").all() as { name: string }[];
+    expect(linkCols.map((c) => c.name)).toEqual([
+      "repo_id",
+      "source_id",
+      "ord",
+      "field",
+      "target_raw",
+      "target_norm",
+      "target_id",
+    ]);
+
     const linkIndexes = db
       .prepare(
         "select name from sqlite_master where type='index' and tbl_name='links' and name like 'links_%' order by name",
       )
       .all() as { name: string }[];
-    expect(linkIndexes.map((i) => i.name)).toEqual(["links_target_id_idx", "links_target_raw_idx"]);
+    expect(linkIndexes.map((i) => i.name)).toEqual(["links_dangling_idx", "links_target_id_idx"]);
 
     const repoCols = db.prepare("pragma table_info(repos)").all() as { name: string }[];
     expect(repoCols.map((c) => c.name)).toContain("link_config");
