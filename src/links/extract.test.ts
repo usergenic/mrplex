@@ -209,6 +209,121 @@ describe("frontmatter reference fields", () => {
   });
 });
 
+describe("frontmatter field-path resolution (dot / bracket / nesting)", () => {
+  const withFields = (fields: string[]) => mergeConfig(HARDCODED_DEFAULTS, { fields });
+  const fm = (frontmatter: FrontmatterJson, ...fields: string[]) =>
+    extract("", { frontmatter, config: withFields(fields) });
+
+  it("resolves a nested-object scalar path (project.lead)", () => {
+    const edges = fm({ project: { lead: "alice.md" } }, "project.lead");
+    expect(edges).toEqual([{ ord: 0, field: "project.lead", target: "alice.md", wikilink: false }]);
+  });
+
+  it("resolves a deep nested-object path (a.b.c)", () => {
+    expect(targets(fm({ a: { b: { c: "deep.md" } } }, "a.b.c"))).toEqual(["deep.md"]);
+  });
+
+  it('resolves a bracket-quoted segment (owners["team-lead"])', () => {
+    const edges = fm({ owners: { "team-lead": "lead.md" } }, 'owners["team-lead"]');
+    expect(edges).toEqual([
+      { ord: 0, field: 'owners["team-lead"]', target: "lead.md", wikilink: false },
+    ]);
+  });
+
+  it('resolves a bracket segment with non-identifier chars (data["2024-Q3"])', () => {
+    expect(targets(fm({ data: { "2024-Q3": "q3.md" } }, 'data["2024-Q3"]'))).toEqual(["q3.md"]);
+  });
+
+  it("resolves a nested list of strings (meta.related)", () => {
+    const edges = fm({ meta: { related: ["a.md", "b.md"] } }, "meta.related");
+    expect(edges).toEqual([
+      { ord: 0, field: "meta.related", target: "a.md", wikilink: false },
+      { ord: 1, field: "meta.related", target: "b.md", wikilink: false },
+    ]);
+  });
+
+  it("resolves a terminal beneath a list-of-objects two levels deep", () => {
+    // links: [{to: {path: x}}, ...] via links.to.path
+    const edges = fm(
+      { links: [{ to: { path: "x.md" } }, { to: { path: "y.md" } }] },
+      "links.to.path",
+    );
+    expect(targets(edges)).toEqual(["x.md", "y.md"]);
+  });
+
+  it("mixes a scalar and a list under the polymorphic (§5.2) convention", () => {
+    // `owner` scalar-or-list: one entry here as a scalar.
+    expect(targets(fm({ owner: "solo.md" }, "owner"))).toEqual(["solo.md"]);
+    expect(targets(fm({ owner: ["a.md", "b.md"] }, "owner"))).toEqual(["a.md", "b.md"]);
+  });
+});
+
+describe("frontmatter field-path — misses and non-string values yield nothing", () => {
+  const withFields = (fields: string[]) => mergeConfig(HARDCODED_DEFAULTS, { fields });
+  const fm = (frontmatter: FrontmatterJson, ...fields: string[]) =>
+    extract("", { frontmatter, config: withFields(fields) });
+
+  it("a declared field absent from the frontmatter extracts nothing", () => {
+    expect(fm({ title: "hi" }, "parent")).toEqual([]);
+  });
+
+  it("a nested path whose parent object is missing extracts nothing", () => {
+    expect(fm({ project: {} }, "project.lead")).toEqual([]);
+    expect(fm({}, "project.lead")).toEqual([]);
+  });
+
+  it("a path that runs THROUGH a scalar (not an object) extracts nothing", () => {
+    // project is a string, so project.lead can't descend.
+    expect(fm({ project: "notanobject.md" }, "project.lead")).toEqual([]);
+  });
+
+  it("non-string terminal values are skipped (number, bool, null, object)", () => {
+    expect(fm({ n: 42 }, "n")).toEqual([]);
+    expect(fm({ b: true }, "b")).toEqual([]);
+    expect(fm({ z: null }, "z")).toEqual([]);
+    expect(fm({ o: { k: "v" } }, "o")).toEqual([]); // object terminal → not a link
+  });
+
+  it("a list with mixed types keeps only the string members", () => {
+    expect(targets(fm({ related: ["a.md", 7, null, "b.md", { x: 1 }] }, "related"))).toEqual([
+      "a.md",
+      "b.md",
+    ]);
+  });
+
+  it("an empty list extracts nothing", () => {
+    expect(fm({ related: [] }, "related")).toEqual([]);
+  });
+});
+
+describe("frontmatter field-path — multiple declared fields", () => {
+  const withFields = (fields: string[]) => mergeConfig(HARDCODED_DEFAULTS, { fields });
+
+  it("extracts each declared field in declaration order, tagging its own field", () => {
+    const edges = extract("", {
+      frontmatter: { parent: "p.md", related: ["a.md", "b.md"], project: { lead: "lead.md" } },
+      config: withFields(["parent", "related", "project.lead"]),
+    });
+    expect(stripSpans(edges)).toEqual([
+      { ord: 0, field: "parent", target: "p.md", wikilink: false },
+      { ord: 1, field: "related", target: "a.md", wikilink: false },
+      { ord: 2, field: "related", target: "b.md", wikilink: false },
+      { ord: 3, field: "project.lead", target: "lead.md", wikilink: false },
+    ]);
+  });
+
+  it("the same target reached via two declared fields yields two distinct edges", () => {
+    const edges = extract("", {
+      frontmatter: { parent: "x.md", canonical: "x.md" },
+      config: withFields(["parent", "canonical"]),
+    });
+    expect(edges.map((e) => ({ field: e.field, target: e.target }))).toEqual([
+      { field: "parent", target: "x.md" },
+      { field: "canonical", target: "x.md" },
+    ]);
+  });
+});
+
 describe("determinism", () => {
   it("same input → identical edges", () => {
     const body = "[a](one.md) [[two]] ![img](p.png)\n\n[a]: unused.md";

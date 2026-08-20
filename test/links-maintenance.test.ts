@@ -38,6 +38,10 @@ async function withFrontmatterFields(): Promise<void> {
   await storage.repos_set_link_config(repoId, JSON.stringify({ fields: ["parent", "related"] }));
 }
 
+async function withFields(...fields: string[]): Promise<void> {
+  await storage.repos_set_link_config(repoId, JSON.stringify({ fields }));
+}
+
 beforeEach(async () => {
   storage = await fresh();
   kernel = createKernel(storage);
@@ -135,6 +139,53 @@ describe("outbound extraction on create", () => {
     // parent resolves (target exists); related is dangling (bob.md absent).
     expect(edges[0]?.target_id).toBe(await docIdAt("moc/employees.md"));
     expect(edges[1]?.target_id).toBeNull();
+  });
+
+  it("resolves a nested-object frontmatter field (project.lead) to identity", async () => {
+    await withFields("project.lead");
+    await create("people/lead.md", { body: "the lead" });
+    await create("proj.md", {
+      frontmatter: { project: { lead: "people/lead.md" } },
+      body: "a project",
+    });
+    const edges = await edgesFrom("proj.md");
+    expect(edges).toHaveLength(1);
+    expect(edges[0]?.field).toBe("project.lead");
+    expect(edges[0]?.target_id).toBe(await docIdAt("people/lead.md"));
+  });
+
+  it("resolves a frontmatter reference RELATIVE to the source doc's directory", async () => {
+    // A bare (non-absolute) frontmatter path resolves like a CommonMark
+    // relative link — against the source's own directory, not the repo root.
+    await withFields("parent");
+    await create("team/lead.md", { body: "lead" });
+    await create("team/alice.md", {
+      frontmatter: { parent: "lead.md" }, // relative → team/lead.md
+      body: "alice",
+    });
+    const edges = await edgesFrom("team/alice.md");
+    expect(edges[0]?.target_raw).toBe("team/lead.md");
+    expect(edges[0]?.target_id).toBe(await docIdAt("team/lead.md"));
+  });
+
+  it("resolves a repo-absolute frontmatter reference (leading slash) from the root", async () => {
+    await withFields("parent");
+    await create("moc.md", { body: "root moc" });
+    await create("deep/nested/note.md", {
+      frontmatter: { parent: "/moc.md" }, // absolute → moc.md at root
+      body: "note",
+    });
+    const edges = await edgesFrom("deep/nested/note.md");
+    expect(edges[0]?.target_raw).toBe("moc.md");
+    expect(edges[0]?.target_id).toBe(await docIdAt("moc.md"));
+  });
+
+  it("a dangling frontmatter field re-binds when its target is created", async () => {
+    await withFields("parent");
+    await create("child.md", { frontmatter: { parent: "/hub.md" }, body: "c" });
+    expect((await edgesFrom("child.md"))[0]?.target_id).toBeNull();
+    await create("hub.md", { body: "hub" });
+    expect((await edgesFrom("child.md"))[0]?.target_id).toBe(await docIdAt("hub.md"));
   });
 
   it("writes no edges for a document with no links", async () => {
