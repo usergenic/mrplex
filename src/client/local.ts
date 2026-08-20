@@ -94,6 +94,11 @@ function buildClient(
       put: (repo, prev, path, input) => kernel.docs.put(actor, repo, prev, path, input),
       delete: (repo, prev) => kernel.docs.delete(actor, repo, prev),
     },
+    links: {
+      backfill: (repo) => kernel.links.backfill(actor, repo),
+      stale: (repo) => kernel.links.stale(actor, repo),
+      repair: (repo, opts) => kernel.links.repair(actor, repo, opts),
+    },
     tokens: {
       list: () => kernel.tokens.list(actor),
       create: (label, scopes, opts) => kernel.tokens.create(actor, label, scopes, opts),

@@ -792,6 +792,58 @@ function buildProgram(): Command {
       }).catch(reportError);
     });
 
+  // -------- links (§11.2) --------
+  const links = program.command("links").description("link index — backfill / stale / repair");
+
+  // Repo comes from the global -r/--repo (or MRPLEX_REPO / config), the same
+  // source `docs *` commands use — so `mrplex -r notes links stale`.
+  links
+    .command("backfill")
+    .description("rebuild the link index for a repo (backfill / after a link-config change)")
+    .action(function (this: Command) {
+      const globals = this.optsWithGlobals<GlobalOpts>();
+      const repo = resolveRepoSlug(globals);
+      withClient(this, async (client, opts) => {
+        const result = await client.links.backfill(repo);
+        emit(result, opts, `backfill ${repo}: documents=${result.documents} edges=${result.edges}`);
+      }).catch(reportError);
+    });
+
+  links
+    .command("stale")
+    .description("list live docs whose written link text no longer matches the target's path")
+    .action(function (this: Command) {
+      const globals = this.optsWithGlobals<GlobalOpts>();
+      const repo = resolveRepoSlug(globals);
+      withClient(this, async (client, opts) => {
+        const result = await client.links.stale(repo);
+        const text = result.length
+          ? result.map((r) => `${r.source_path}: "${r.written}" → "${r.current}"`).join("\n")
+          : "no stale links";
+        emit(result, opts, text);
+      }).catch(reportError);
+    });
+
+  links
+    .command("repair")
+    .description("rewrite stale link text as optimistic docs.put (conflicts skipped)")
+    .option("--dry-run", "report what would change without writing", false)
+    .action(function (this: Command) {
+      const localOpts = this.opts<{ dryRun: boolean }>();
+      const globals = this.optsWithGlobals<GlobalOpts>();
+      const repo = resolveRepoSlug(globals);
+      withClient(this, async (client, opts) => {
+        const result = await client.links.repair(repo, { dry_run: localOpts.dryRun });
+        const prefix = result.dry_run ? "[dry-run] " : "";
+        const lines = [
+          `${prefix}repaired ${result.repaired.length} doc(s), skipped ${result.skipped.length}`,
+          ...result.repaired.map((r) => `  ~ ${r.path} (${r.edges} link(s))`),
+          ...result.skipped.map((s) => `  ! ${s.path}: ${s.reason}`),
+        ];
+        emit(result, opts, lines.join("\n"));
+      }).catch(reportError);
+    });
+
   // -------- embed --------
   // Embed commands are LOCAL-mode only (bypass the client seam like
   // `bootstrap` and `serve`): backfill drives the worker directly

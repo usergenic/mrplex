@@ -43,9 +43,9 @@ afterEach(async () => {
 });
 
 describe("MCP lifecycle + tools/list", () => {
-  it("lists 21 tools (including docs_diff — M4)", async () => {
+  it("lists 24 tools (docs_diff — M4; links_* — §11.2)", async () => {
     const r = await client.listTools();
-    expect(r.tools.length).toBe(21);
+    expect(r.tools.length).toBe(24);
     // Sample the important names.
     const names = new Set(r.tools.map((t) => t.name));
     for (const name of [
@@ -58,6 +58,9 @@ describe("MCP lifecycle + tools/list", () => {
       "docs_diff",
       "query",
       "tokens_create",
+      "links_backfill",
+      "links_stale",
+      "links_repair",
     ]) {
       expect(names.has(name)).toBe(true);
     }

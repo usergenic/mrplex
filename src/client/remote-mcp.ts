@@ -17,6 +17,7 @@ import type { ScopeInput } from "../kernel/auth/scope.js";
 import type { UnifiedDiff } from "../kernel/diff.js";
 import { KernelError, isKernelErrorCode } from "../kernel/errors.js";
 import type { FrontmatterInput } from "../kernel/frontmatter-input.js";
+import type { LinksBackfillResult, RepairResult, StaleLinkWire } from "../kernel/kernel.js";
 import type { PathConfigOverride } from "../kernel/path-config.js";
 import type { QuerySpec } from "../kernel/query/query.js";
 import type { PathWarning, Repo, Token, User, Version } from "../kernel/wire.js";
@@ -162,6 +163,15 @@ function buildRemoteClient(client: Client): KernelClient {
           ...(input.body !== undefined && { body: input.body }),
         }),
       delete: (repo, prev) => call<Version>("docs_delete", { repo, prev_version_id: prev }),
+    },
+    links: {
+      backfill: (repo) => call<LinksBackfillResult>("links_backfill", { repo }),
+      stale: (repo) => callList<StaleLinkWire>("links_stale", { repo }),
+      repair: (repo, opts) =>
+        call<RepairResult>("links_repair", {
+          repo,
+          ...(opts?.dry_run !== undefined && { dry_run: opts.dry_run }),
+        }),
     },
     tokens: {
       list: () => callList<Token>("tokens_list", {}),

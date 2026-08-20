@@ -13,6 +13,7 @@
 import type { ScopeInput } from "../kernel/auth/scope.js";
 import type { UnifiedDiff } from "../kernel/diff.js";
 import type { FrontmatterInput } from "../kernel/frontmatter-input.js";
+import type { LinksBackfillResult, RepairResult, StaleLinkWire } from "../kernel/kernel.js";
 import type { PathConfigOverride } from "../kernel/path-config.js";
 import type { QuerySpec } from "../kernel/query/query.js";
 import type { PathWarning, Repo, Token, User, Version } from "../kernel/wire.js";
@@ -67,6 +68,11 @@ export type KernelClient = {
       input: Partial<FrontmatterInput> & { body?: string },
     ): Promise<Version>;
     delete(repo: string, prev_version_id: string): Promise<Version>;
+  };
+  links: {
+    backfill(repo: string): Promise<LinksBackfillResult>;
+    stale(repo: string): Promise<StaleLinkWire[]>;
+    repair(repo: string, opts?: { dry_run?: boolean }): Promise<RepairResult>;
   };
   tokens: {
     list(): Promise<Token[]>;
