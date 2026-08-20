@@ -16,10 +16,14 @@ function extract(
 
 const targets = (edges: RawEdge[]) => edges.map((e) => e.target);
 
+/** Drop dest_span so exact-object assertions can ignore byte offsets. */
+const stripSpans = (edges: RawEdge[]): Omit<RawEdge, "dest_span">[] =>
+  edges.map(({ dest_span, ...rest }) => rest);
+
 describe("inline links", () => {
   it("extracts the destination, ignores link text and title", () => {
     const edges = extract('See [Alice](people/alice.md "the title") here.');
-    expect(edges).toEqual([
+    expect(stripSpans(edges)).toEqual([
       { ord: 0, field: BODY_FIELD, target: "people/alice.md", wikilink: false },
     ]);
   });
@@ -102,14 +106,14 @@ describe("code exclusion", () => {
 describe("wikilinks", () => {
   it("extracts the page half, dropping the display half", () => {
     const edges = extract("[[alice]] and [[bob|Bob Smith]]");
-    expect(edges).toEqual([
+    expect(stripSpans(edges)).toEqual([
       { ord: 0, field: BODY_FIELD, target: "alice", wikilink: true },
       { ord: 1, field: BODY_FIELD, target: "bob", wikilink: true },
     ]);
   });
 
   it("treats ![[embed]] the same as [[embed]] (cosmetic prefix)", () => {
-    expect(extract("![[page]]")).toEqual([
+    expect(stripSpans(extract("![[page]]"))).toEqual([
       { ord: 0, field: BODY_FIELD, target: "page", wikilink: true },
     ]);
   });
@@ -198,7 +202,7 @@ describe("frontmatter reference fields", () => {
       frontmatter: { parent: "p.md" },
       config: withFields(["parent"]),
     });
-    expect(edges).toEqual([
+    expect(stripSpans(edges)).toEqual([
       { ord: 0, field: BODY_FIELD, target: "one.md", wikilink: false },
       { ord: 1, field: "parent", target: "p.md", wikilink: false },
     ]);
@@ -209,5 +213,55 @@ describe("determinism", () => {
   it("same input → identical edges", () => {
     const body = "[a](one.md) [[two]] ![img](p.png)\n\n[a]: unused.md";
     expect(extract(body)).toEqual(extract(body));
+  });
+});
+
+describe("dest_span — the rewritable destination range (for links repair)", () => {
+  const spanText = (body: string, e: RawEdge) =>
+    e.dest_span ? body.slice(e.dest_span.start, e.dest_span.end) : undefined;
+
+  it("captures the inline destination text span", () => {
+    const body = "see [Alice](people/alice.md) here";
+    const [edge] = extract(body);
+    expect(edge?.dest_span).toBeDefined();
+    expect(spanText(body, edge as RawEdge)).toBe("people/alice.md");
+  });
+
+  it("captures the wikilink page-half span (not the display half)", () => {
+    const body = "- [[alice|Alice Ng]]";
+    const [edge] = extract(body);
+    expect(spanText(body, edge as RawEdge)).toBe("alice");
+  });
+
+  it("captures the span of a pointy-bracket destination's inner text", () => {
+    const body = "[x](<path with spaces.md>)";
+    const [edge] = extract(body);
+    expect(spanText(body, edge as RawEdge)).toBe("path with spaces.md");
+  });
+
+  it("includes the anchor in the inline destination span", () => {
+    const body = "[x](foo.md#sec)";
+    const [edge] = extract(body);
+    expect(spanText(body, edge as RawEdge)).toBe("foo.md#sec");
+  });
+
+  it("omits the span for reference-style links (definition lives elsewhere)", () => {
+    const [edge] = extract("[Bob][b]\n\n[b]: people/bob.md");
+    expect(edge?.dest_span).toBeUndefined();
+  });
+
+  it("omits the span for frontmatter edges", () => {
+    const edges = extract("", {
+      frontmatter: { parent: "p.md" },
+      config: mergeConfig(HARDCODED_DEFAULTS, { fields: ["parent"] }),
+    });
+    expect(edges[0]?.dest_span).toBeUndefined();
+  });
+
+  it("spans stay correct with multiple links on one line", () => {
+    const body = "[a](a.md) and [b](b.md)";
+    const edges = extract(body);
+    expect(spanText(body, edges[0] as RawEdge)).toBe("a.md");
+    expect(spanText(body, edges[1] as RawEdge)).toBe("b.md");
   });
 });

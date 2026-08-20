@@ -34,12 +34,20 @@ export const BODY_FIELD = "$body";
  * One extracted edge, pre-resolution. `target` is verbatim as written
  * (anchor included); `wikilink` selects the resolution rules in resolve.ts
  * (root-relative + extension elision vs. CommonMark relative-to-source).
+ *
+ * `dest_span` is the [start, end) byte range of the *destination text* in
+ * the body — the exact slice `mrplex links repair` rewrites. Present for
+ * body edges whose destination sits at the link site (inline `[t](dest)`
+ * and wikilink `[[dest]]`); absent for reference-style links (the
+ * destination lives in a separate `[id]: dest` definition, repaired via its
+ * own edge is out of scope) and for frontmatter edges.
  */
 export type RawEdge = {
   ord: number;
   field: string; // BODY_FIELD or a CEL frontmatter field path
   target: string; // as written, e.g. "../horses.md", "foo#sec", "moc/employees.md"
   wikilink: boolean;
+  dest_span?: { start: number; end: number };
 };
 
 export type ExtractInput = {
@@ -66,7 +74,12 @@ export function extractEdges(input: ExtractInput): RawEdge[] {
 // Body extraction — CommonMark via micromark, plus wikilink scan.
 // -----------------------------------------------------------------------------
 
-type BodyHit = { offset: number; target: string; wikilink: boolean };
+type BodyHit = {
+  offset: number;
+  target: string;
+  wikilink: boolean;
+  dest_span?: { start: number; end: number };
+};
 
 function extractBodyEdges(body: string, config: LinkConfig): Omit<RawEdge, "ord">[] {
   const hits: BodyHit[] = [];
@@ -75,7 +88,12 @@ function extractBodyEdges(body: string, config: LinkConfig): Omit<RawEdge, "ord"
     collectWikilinks(body, codeRanges, hits);
   }
   hits.sort((a, b) => a.offset - b.offset);
-  return hits.map((h) => ({ field: BODY_FIELD, target: h.target, wikilink: h.wikilink }));
+  return hits.map((h) => ({
+    field: BODY_FIELD,
+    target: h.target,
+    wikilink: h.wikilink,
+    ...(h.dest_span ? { dest_span: h.dest_span } : {}),
+  }));
 }
 
 /**
@@ -116,7 +134,10 @@ function collectCommonMark(body: string, config: LinkConfig, hits: BodyHit[]): [
         if (top && top.dest === undefined && top.refKey === undefined) top.label += slice(token);
       } else if (T === "resourceDestinationString") {
         const top = stack[stack.length - 1];
-        if (top) top.dest = slice(token);
+        if (top) {
+          top.dest = slice(token);
+          top.destSpan = { start: token.start.offset, end: token.end.offset };
+        }
       } else if (T === "referenceString") {
         const top = stack[stack.length - 1];
         if (top) top.refKey = normalizeLabel(slice(token));
@@ -132,7 +153,14 @@ function collectCommonMark(body: string, config: LinkConfig, hits: BodyHit[]): [
       if (!enabled) continue;
       const target = resolveDestination(frame, definitions);
       if (target !== undefined && target.length > 0 && syntaxEnabled(frame, config)) {
-        hits.push({ offset: frame.start, target, wikilink: false });
+        // Only inline links carry a rewritable destination span; reference
+        // links resolve via a separate [id]: definition.
+        hits.push({
+          offset: frame.start,
+          target,
+          wikilink: false,
+          ...(frame.destSpan ? { dest_span: frame.destSpan } : {}),
+        });
       }
     }
   }
@@ -144,6 +172,7 @@ type Frame = {
   start: number;
   label: string;
   dest?: string; // inline resource destination
+  destSpan?: { start: number; end: number }; // [start,end) of the inline dest text
   refKey?: string; // full/collapsed reference key (normalized)
 };
 
@@ -181,11 +210,24 @@ function collectWikilinks(body: string, codeRanges: [number, number][], hits: Bo
   for (let m = WIKILINK.exec(body); m !== null; m = WIKILINK.exec(body)) {
     const offset = m.index;
     if (inAnyRange(offset, codeRanges)) continue;
+    const full = m[0] as string;
     const inner = m[1] as string;
     // Display half after '|' is cosmetic; the target is the page half.
-    const target = (inner.split("|")[0] as string).trim();
+    const pageRaw = inner.split("|")[0] as string;
+    const target = pageRaw.trim();
     if (target.length === 0) continue;
-    hits.push({ offset, target, wikilink: true });
+    // Span of the trimmed page-half within the body: the inner content
+    // starts after the `!?[[` prefix; the trimmed target sits at
+    // pageRaw's leading-whitespace offset within that.
+    const innerStart = offset + full.indexOf(inner);
+    const lead = pageRaw.length - pageRaw.trimStart().length;
+    const start = innerStart + lead;
+    hits.push({
+      offset,
+      target,
+      wikilink: true,
+      dest_span: { start, end: start + target.length },
+    });
   }
 }
 

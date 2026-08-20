@@ -10,6 +10,7 @@
  */
 
 import { randomBytes } from "node:crypto";
+import { backfillRepoLinks } from "../links/backfill.js";
 import {
   HARDCODED_DEFAULTS as LINK_DEFAULTS,
   type LinkConfig,
@@ -17,6 +18,8 @@ import {
   parseRepoOverride as parseLinkOverride,
 } from "../links/link-config.js";
 import { bindDanglingToPath, reindexOutboundLinks } from "../links/maintain.js";
+import { planRepairs } from "../links/repair.js";
+import { findStaleLinks } from "../links/stale.js";
 import type { RepoRow, Storage, TokenRow, VersionRow } from "../storage/types.js";
 import type { Action, Actor, StoredScope, Target } from "./auth/actor.js";
 import { authorize } from "./auth/authorize.js";
@@ -69,6 +72,23 @@ export type SetPathConfigResult = { repo: Repo; warnings: PathWarning[] };
 
 export type TokenCreateResult = { token: string; meta: Token };
 
+export type LinksBackfillResult = { documents: number; edges: number };
+
+/** A stale link on the wire — paths, never internal document ids. */
+export type StaleLinkWire = {
+  repo: string;
+  source_path: string;
+  ord: number;
+  written: string;
+  current: string;
+};
+
+export type RepairResult = {
+  dry_run: boolean;
+  repaired: { path: string; edges: number }[];
+  skipped: { path: string; reason: string }[];
+};
+
 export type Kernel = {
   repos: {
     list(actor: Actor, opts?: { include_system?: boolean }): Promise<Repo[]>;
@@ -113,6 +133,14 @@ export type Kernel = {
       input: Partial<FrontmatterInput> & { body?: string },
     ): Promise<Version>;
     delete(actor: Actor, repo: string, prev_version_id: string): Promise<Version>;
+  };
+  links: {
+    /** Rebuild the link index for a repo (backfill / config-change). */
+    backfill(actor: Actor, repo: string): Promise<LinksBackfillResult>;
+    /** List live docs whose written link text is stale vs. the target's path. */
+    stale(actor: Actor, repo: string): Promise<StaleLinkWire[]>;
+    /** Rewrite stale link text as optimistic docs.put; dry_run plans only. */
+    repair(actor: Actor, repo: string, opts?: { dry_run?: boolean }): Promise<RepairResult>;
   };
   tokens: {
     list(actor: Actor): Promise<Token[]>;
@@ -282,7 +310,7 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
     return n;
   }
 
-  return {
+  const kernel: Kernel = {
     repos: {
       async list(actor, opts) {
         authorize(actor, "read", { kind: "server" });
@@ -654,6 +682,68 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
       },
     },
 
+    links: {
+      async backfill(actor, repoSlug) {
+        // Rebuilding the whole index is an admin-scoped maintenance op.
+        const repo = await resolveRepo(actor, repoSlug, "write");
+        authorize(actor, "admin", { kind: "server_admin" });
+        return backfillRepoLinks(storage, repo.id, repoEffectiveLinkConfig(repo));
+      },
+
+      async stale(actor, repoSlug) {
+        const repo = await resolveRepo(actor, repoSlug, "read");
+        const rows = await findStaleLinks(storage, repo.id, repoEffectiveLinkConfig(repo));
+        // Scope: only surface stale links whose SOURCE the caller can read
+        // (the source path is what we return + would rewrite).
+        return rows
+          .filter((r) => actor.admin || scopesGrant(actor.scopes, "read", repo.id, r.source_path))
+          .map((r) => ({
+            repo: repoSlug,
+            source_path: r.source_path,
+            ord: r.ord,
+            written: r.written,
+            current: r.current,
+          }));
+      },
+
+      async repair(actor, repoSlug, opts) {
+        const dryRun = opts?.dry_run ?? false;
+        const repo = await resolveRepo(actor, repoSlug, "write");
+        const plans = await planRepairs(storage, repo.id, repoEffectiveLinkConfig(repo));
+        const repaired: { path: string; edges: number }[] = [];
+        const skipped: { path: string; reason: string }[] = [];
+
+        for (const plan of plans) {
+          // Only repair docs the caller may write.
+          if (!actor.admin && !scopesGrant(actor.scopes, "write", repo.id, plan.version.path)) {
+            skipped.push({ path: plan.version.path, reason: "forbidden" });
+            continue;
+          }
+          if (dryRun) {
+            repaired.push({ path: plan.version.path, edges: plan.edges });
+            continue;
+          }
+          try {
+            await kernel.docs.put(
+              actor,
+              repoSlug,
+              encodeVersionId(plan.version.id),
+              plan.version.path,
+              { body: plan.newBody },
+            );
+            repaired.push({ path: plan.version.path, edges: plan.edges });
+          } catch (err) {
+            if (err instanceof KernelError && err.code === "stale_prev") {
+              skipped.push({ path: plan.version.path, reason: "conflict" });
+            } else {
+              throw err;
+            }
+          }
+        }
+        return { dry_run: dryRun, repaired, skipped };
+      },
+    },
+
     tokens: {
       async list(actor) {
         const rows = await storage.tokens_list(actor.user_id);
@@ -714,4 +804,5 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
       });
     },
   };
+  return kernel;
 }
