@@ -20,6 +20,14 @@ import { KernelError } from "../kernel/errors.js";
 import type { CelExpr } from "../kernel/query/ast.js";
 import { unwrapConstant, unwrapListHint } from "../kernel/query/ast.js";
 import { INTRINSIC_PREFIX } from "../kernel/query/cel-parse.js";
+import {
+  type GraphCollection,
+  type GraphMembership,
+  asGraphCollection,
+  asGraphMembership,
+  assertNotReservedGraphName,
+} from "../kernel/query/graph-ast.js";
+import { BODY_FIELD } from "../links/extract.js";
 import type { ScopeGroup, SearchPlan, SigilExclusion } from "../storage/search-plan.js";
 
 export type CompiledSql = {
@@ -28,12 +36,19 @@ export type CompiledSql = {
 };
 
 // A running builder that keeps params + `$n` counter aligned as we
-// weave nested fragments together.
+// weave nested fragments together. Also carries the plan's scope so graph
+// subqueries can scope the OTHER endpoint (§11.2), plus an alias sequence
+// so nested graph subqueries don't collide.
 class Builder {
   readonly params: unknown[] = [];
+  scope: SearchPlan["scope"] = { kind: "allow_all" };
+  private aliasSeq = 0;
   push(v: unknown): string {
     this.params.push(v);
     return `$${this.params.length}`;
+  }
+  nextAlias(): string {
+    return `lv${this.aliasSeq++}`;
   }
 }
 
@@ -43,6 +58,7 @@ class Builder {
 
 export function compileSearchPlan(plan: SearchPlan): CompiledSql {
   const b = new Builder();
+  b.scope = plan.scope; // graph subqueries scope the other endpoint (§11.2)
   const clauses: string[] = ["versions.next_id IS NULL"];
 
   // repo_id filter.
@@ -56,7 +72,7 @@ export function compileSearchPlan(plan: SearchPlan): CompiledSql {
   if (sigilSql.length > 0) clauses.push(sigilSql);
 
   if (plan.scope.kind === "groups") {
-    const scopeSql = compileScopeGroups(plan.scope.groups, b);
+    const scopeSql = compileScopeGroups(plan.scope.groups, b, "versions");
     if (scopeSql.length > 0) clauses.push(`(${scopeSql})`);
     else clauses.push("false");
   }
@@ -115,19 +131,31 @@ function compileSigilExclusion(groups: readonly SigilExclusion[], b: Builder): s
   return parts.join(" AND ");
 }
 
-function compileScopeGroups(groups: readonly ScopeGroup[], b: Builder): string {
+function compileScopeGroups(groups: readonly ScopeGroup[], b: Builder, alias: string): string {
   const parts: string[] = [];
   for (const g of groups) {
     if (g.globs.length === 0) continue;
-    const globExpr = compileScopeGlobs(g.globs, b);
+    const globExpr = compileScopeGlobs(g.globs, b, alias);
     if (g.repos === "*") {
       parts.push(`(${globExpr})`);
     } else if (g.repos.length > 0) {
       const ph = b.push(g.repos);
-      parts.push(`(versions.repo_id = ANY(${ph}::bigint[]) AND (${globExpr}))`);
+      parts.push(`(${alias}.repo_id = ANY(${ph}::bigint[]) AND (${globExpr}))`);
     }
   }
   return parts.join(" OR ");
+}
+
+/**
+ * Scope predicate for an aliased `versions` row inside a graph subquery
+ * (§11.2 — the visible graph equals the readable graph). Mirrors the
+ * SQLite compiler's scopeFragmentForAlias.
+ */
+function scopeFragmentForAlias(b: Builder, alias: string): string {
+  if (b.scope.kind === "allow_all") return "TRUE";
+  if (b.scope.kind === "deny_all") return "FALSE";
+  const sql = compileScopeGroups(b.scope.groups, b, alias);
+  return sql.length > 0 ? `(${sql})` : "FALSE";
 }
 
 /**
@@ -135,7 +163,7 @@ function compileScopeGroups(groups: readonly ScopeGroup[], b: Builder): string {
  * later globs wrap earlier ones (so the outermost WHEN — the last glob
  * — wins if it matches).
  */
-function compileScopeGlobs(globs: readonly string[], b: Builder): string {
+function compileScopeGlobs(globs: readonly string[], b: Builder, alias: string): string {
   // We need `$n`s to appear in outermost-first order in the emitted SQL.
   // The compileWithReverseOrder pattern: build the fragment text first
   // with named placeholders, then emit params in the correct order.
@@ -157,7 +185,7 @@ function compileScopeGlobs(globs: readonly string[], b: Builder): string {
   // gets pushed first.
   for (const e of entries) {
     const ph = b.push(e.regex);
-    expr = `(CASE WHEN versions.path ~ ${ph} THEN ${e.verdict} ELSE ${expr} END)`;
+    expr = `(CASE WHEN ${alias}.path ~ ${ph} THEN ${e.verdict} ELSE ${expr} END)`;
   }
   return expr;
 }
@@ -343,6 +371,11 @@ function compileCall(expr: CelExpr, b: Builder): string {
   }
 
   if (target) {
+    // `$backlinks_static().size()` — method-form size on a collection.
+    if (fn === "size" && args.length === 0) {
+      const collection = asGraphCollection(target);
+      if (collection) return compileGraphCollectionSize(collection, b);
+    }
     if (fn === "startsWith" && args.length === 1)
       return compileStartsWith(target, args[0] as CelExpr, b);
     if (fn === "endsWith" && args.length === 1)
@@ -352,9 +385,76 @@ function compileCall(expr: CelExpr, b: Builder): string {
     if (fn === "matches" && args.length === 1) return compileMatches(target, args[0] as CelExpr, b);
   }
 
+  // Graph membership predicates: $in_static / $has_static (§11.2).
+  const membership = asGraphMembership(expr);
+  if (membership) return compileGraphMembership(membership, b);
+
+  if (asGraphCollection(expr)) {
+    throw new KernelError("filter_invalid", {
+      reason: `$${(asGraphCollection(expr) as GraphCollection).direction}_static() is a collection; use .size(), .exists(), or .all()`,
+    });
+  }
+
+  assertNotReservedGraphName(fn);
+
   throw new KernelError("filter_invalid", {
     reason: `unsupported function: ${target ? "<target>." : ""}${fn}(...) with ${args.length} arg(s)`,
   });
+}
+
+// -----------------------------------------------------------------------------
+// Graph predicates (design §11.2, WS4) — Postgres mirror of the SQLite
+// emitters in compile-filter.ts. See there for the directional model.
+// -----------------------------------------------------------------------------
+
+function globRegex(glob: string): string {
+  return `^${globToRegexSource(glob)}$`;
+}
+
+function graphSubqueryCore(
+  direction: "in" | "has" | "backlinks" | "links",
+  b: Builder,
+  opts: { glob?: string; field?: string; alias?: string },
+): { from: string; alias: string } {
+  const alias = opts.alias ?? b.nextAlias();
+
+  if (direction === "in" || direction === "backlinks") {
+    const parts = [
+      "FROM links l",
+      `JOIN versions ${alias} ON l.source_id = ${alias}.document_id AND ${alias}.next_id IS NULL`,
+      "WHERE l.target_id = versions.document_id",
+    ];
+    if (opts.glob !== undefined) parts.push(`AND ${alias}.path ~ ${b.push(globRegex(opts.glob))}`);
+    if (opts.field !== undefined) {
+      parts.push(`AND l.field = ${b.push(opts.field === "$body" ? BODY_FIELD : opts.field)}`);
+    }
+    parts.push(`AND ${scopeFragmentForAlias(b, alias)}`);
+    return { from: parts.join(" "), alias };
+  }
+
+  // has / links: outer = source; other end is the (maybe-dangling) target.
+  const parts = [
+    `FROM links l LEFT JOIN versions ${alias} ON l.target_id = ${alias}.document_id AND ${alias}.next_id IS NULL`,
+    "WHERE l.source_id = versions.document_id",
+  ];
+  if (opts.glob !== undefined) {
+    parts.push(`AND COALESCE(${alias}.path, l.target_norm) ~ ${b.push(globRegex(opts.glob))}`);
+  }
+  if (opts.field !== undefined) {
+    parts.push(`AND l.field = ${b.push(opts.field === "$body" ? BODY_FIELD : opts.field)}`);
+  }
+  parts.push(`AND (l.target_id IS NULL OR ${scopeFragmentForAlias(b, alias)})`);
+  return { from: parts.join(" "), alias };
+}
+
+function compileGraphMembership(m: GraphMembership, b: Builder): string {
+  const core = graphSubqueryCore(m.direction, b, { glob: m.glob, field: m.field });
+  return `EXISTS (SELECT 1 ${core.from})`;
+}
+
+function compileGraphCollectionSize(c: GraphCollection, b: Builder): string {
+  const core = graphSubqueryCore(c.direction, b, {});
+  return `(SELECT COUNT(*) ${core.from})`;
 }
 
 function compileBinary(op: string, a: CelExpr, b_: CelExpr, b: Builder): string {
@@ -505,6 +605,9 @@ function jsonbLiteral(v: unknown): { scalar: string; array: string } | null {
 }
 
 function compileSize(inner: CelExpr, b: Builder): string {
+  const collection = asGraphCollection(inner);
+  if (collection) return compileGraphCollectionSize(collection, b);
+
   const listHint = unwrapListHint(inner);
   if (listHint) {
     const fmPath = fmPathIfPure(listHint);
@@ -531,6 +634,11 @@ function compileComprehension(expr: CelExpr, b: Builder): string {
     throw new Error("compileComprehension: wrong kind");
   }
   const comp = expr.exprKind.value;
+
+  // Graph collection comprehension: $backlinks_static().exists(d, pred) etc.
+  const collection = asGraphCollection(comp.iterRange as CelExpr);
+  if (collection) return compileGraphComprehension(comp, collection, b);
+
   const listHint = unwrapListHint(comp.iterRange as CelExpr);
   if (!listHint) {
     throw new KernelError("filter_invalid", {
@@ -688,4 +796,90 @@ function combineCallWithSubstitutedArgs(
   throw new KernelError("filter_invalid", {
     reason: `unsupported call inside comprehension predicate: ${fn}`,
   });
+}
+
+// -----------------------------------------------------------------------------
+// Graph collection comprehensions (design §11.2, WS4).
+// -----------------------------------------------------------------------------
+
+function compileGraphComprehension(
+  comp: NonNullable<Extract<CelExpr["exprKind"], { case: "comprehensionExpr" }>["value"]>,
+  collection: GraphCollection,
+  b: Builder,
+): string {
+  const shape = classifyComprehension(comp);
+  if (shape === "unsupported") {
+    throw new KernelError("filter_invalid", {
+      reason: "unsupported comprehension over a link collection (use .exists or .all)",
+    });
+  }
+  const alias = b.nextAlias();
+  const core = graphSubqueryCore(collection.direction, b, { alias });
+  const userPred = extractUserPredicate(comp.loopStep as CelExpr);
+  const pred = compileAgainstAlias(userPred, comp.iterVar, alias, b);
+
+  if (shape === "exists") {
+    return `EXISTS (SELECT 1 ${core.from} AND (${pred}))`;
+  }
+  return `NOT EXISTS (SELECT 1 ${core.from} AND NOT (${pred}))`;
+}
+
+/**
+ * Compile a predicate where the iter var denotes the OTHER document's row
+ * (aliased). `d.field` → that doc's frontmatter; `d.$path` etc. → its
+ * intrinsics; everything else compiles against the outer `versions` row.
+ */
+function compileAgainstAlias(expr: CelExpr, iterVar: string, alias: string, b: Builder): string {
+  const kind = expr.exprKind.case;
+
+  if (kind === "identExpr") {
+    if (expr.exprKind.value.name === iterVar) {
+      throw new KernelError("filter_invalid", {
+        reason: `bare '${iterVar}' is not usable; access a field like ${iterVar}.status or ${iterVar}.$path`,
+      });
+    }
+    return compileExpr(expr, b);
+  }
+
+  if (kind === "selectExpr") {
+    const path = collectSelectPath(expr);
+    if (path && path[0] === iterVar) {
+      return aliasFieldAccess(alias, path.slice(1));
+    }
+    return compileExpr(expr, b);
+  }
+
+  if (kind === "callExpr") {
+    const call = expr.exprKind.value;
+    const target = call.target
+      ? compileAgainstAlias(call.target as CelExpr, iterVar, alias, b)
+      : undefined;
+    const args = call.args.map((a) => compileAgainstAlias(a as CelExpr, iterVar, alias, b));
+    return combineCallWithSubstitutedArgs(call.function, target, args, b);
+  }
+
+  return compileExpr(expr, b);
+}
+
+/** Field/intrinsic access on the aliased other-document row (text form). */
+function aliasFieldAccess(alias: string, tail: string[]): string {
+  const head = tail[0];
+  if (head === undefined) {
+    throw new KernelError("filter_invalid", { reason: "empty field access on link iter var" });
+  }
+  if (head.startsWith(INTRINSIC_PREFIX)) {
+    if (tail.length > 1) {
+      throw new KernelError("filter_invalid", { reason: "intrinsics have no subfields" });
+    }
+    const name = head.slice(INTRINSIC_PREFIX.length);
+    const col = INTRINSIC_COLUMNS[name];
+    if (!col) throw new KernelError("filter_invalid", { reason: `unknown intrinsic $${name}` });
+    return col.replace(/^versions\./, `${alias}.`);
+  }
+  // jsonb text access on the aliased frontmatter.
+  const escaped = tail.map((p) => p.replace(/'/g, "''"));
+  if (escaped.length === 1) return `${alias}.frontmatter ->> '${escaped[0]}'`;
+  let e = `${alias}.frontmatter -> '${escaped[0]}'`;
+  for (let i = 1; i < escaped.length - 1; i++) e = `${e} -> '${escaped[i]}'`;
+  return `${e} ->> '${escaped[escaped.length - 1]}'`;
 }

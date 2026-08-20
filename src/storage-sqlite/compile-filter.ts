@@ -21,9 +21,18 @@
  * the kernel wraps them in the main query.
  */
 
+import { globToRegexSource } from "../kernel/auth/glob.js";
 import { KernelError } from "../kernel/errors.js";
 import { type CelExpr, unwrapConstant, unwrapListHint } from "../kernel/query/ast.js";
 import { INTRINSIC_PREFIX } from "../kernel/query/cel-parse.js";
+import {
+  type GraphCollection,
+  type GraphMembership,
+  asGraphCollection,
+  asGraphMembership,
+  assertNotReservedGraphName,
+} from "../kernel/query/graph-ast.js";
+import { BODY_FIELD } from "../links/extract.js";
 
 // -----------------------------------------------------------------------------
 // Public compiler surface
@@ -34,8 +43,36 @@ export type SqlFragment = {
   params: (string | number | bigint | null)[];
 };
 
-export function compileFilter(expr: CelExpr): SqlFragment {
-  return compileExpr(expr);
+/**
+ * Compile context. `graphScope(alias)` yields the read-scope predicate for
+ * an aliased `versions` row inside a graph subquery (so the visible graph
+ * equals the readable graph, §11.2). Absent when the caller doesn't support
+ * graph predicates (compile-filter's own tests) — a graph predicate then
+ * errors rather than leaking unscoped edges.
+ */
+export type FilterCtx = {
+  graphScope?: (alias: string) => SqlFragment;
+};
+
+// Module-level context for the current compile pass. Compilation is fully
+// synchronous (no await between set and clear), so this is safe and avoids
+// threading ctx through every compileExpr signature.
+let CTX: FilterCtx = {};
+
+export function compileFilter(expr: CelExpr, ctx: FilterCtx = {}): SqlFragment {
+  CTX = ctx;
+  try {
+    return compileExpr(expr);
+  } finally {
+    CTX = {};
+  }
+}
+
+// A monotonic alias counter so nested graph subqueries don't collide on
+// their `versions` alias name within one compiled statement.
+let GRAPH_ALIAS_SEQ = 0;
+function nextGraphAlias(): string {
+  return `lv${GRAPH_ALIAS_SEQ++}`;
 }
 
 // -----------------------------------------------------------------------------
@@ -236,6 +273,12 @@ function compileCall(expr: CelExpr): SqlFragment {
 
   // Method-style calls: `x.startsWith(y)`, etc.
   if (target) {
+    // `$backlinks_static().size()` parses as method-form size (target =
+    // the collection call, zero args) — dispatch to the collection COUNT.
+    if (fn === "size" && args.length === 0) {
+      const collection = asGraphCollection(target);
+      if (collection) return compileGraphCollectionSize(collection);
+    }
     if (fn === "startsWith" && args.length === 1) {
       return compileStartsWith(target, args[0] as CelExpr);
     }
@@ -249,6 +292,21 @@ function compileCall(expr: CelExpr): SqlFragment {
       return compileMatches(target, args[0] as CelExpr);
     }
   }
+
+  // Graph membership predicates: $in_static / $has_static (§11.2).
+  const membership = asGraphMembership(expr);
+  if (membership) return compileGraphMembership(membership);
+
+  // A bare collection call ($backlinks_static()) reaching a boolean context
+  // is meaningless — collections only compose via .size()/.exists()/.all().
+  if (asGraphCollection(expr)) {
+    throw new KernelError("filter_invalid", {
+      reason: `$${(asGraphCollection(expr) as GraphCollection).direction}_static() is a collection; use .size(), .exists(), or .all()`,
+    });
+  }
+
+  // Reserved Phase-2 graph names ($in, $backlinks(), _dyn variants).
+  assertNotReservedGraphName(fn);
 
   throw new KernelError("filter_invalid", {
     reason: `unsupported function: ${target ? "<target>." : ""}${fn}(...) with ${args.length} arg(s)`,
@@ -265,6 +323,223 @@ const BIN_OPS: Record<string, string> = {
   "_&&_": "AND",
   "_||_": "OR",
 };
+
+// -----------------------------------------------------------------------------
+// Graph predicates — $in_static / $has_static / $backlinks_static() /
+// $links_static() over the `links` index (design §11.2, WS4).
+//
+// Direction fixes which end of the edge the OUTER `versions` row sits on:
+//   in / backlinks  → outer doc is the TARGET; the OTHER end is the source.
+//   has / links     → outer doc is the SOURCE; the OTHER end is the target.
+//
+// Scope (§5 decision 5): the other endpoint's version row carries the
+// caller's read scope, so an edge to/from an unreadable doc is invisible.
+// For `has`/`links` a resolved edge joins the target's version; a *dangling*
+// `has` edge has no target version to scope, but the source (the outer,
+// already-scoped row) is what the caller reads, and the target is just a
+// written path — so dangling edges count for `has_static` (matches
+// "$has_static(\"horses.md\") — dangling target ok").
+// -----------------------------------------------------------------------------
+
+function requireGraphScope(): (alias: string) => SqlFragment {
+  if (!CTX.graphScope) {
+    throw new KernelError("filter_invalid", {
+      reason: "graph predicates are not available in this query context",
+    });
+  }
+  return CTX.graphScope;
+}
+
+/** Anchored regexp over a path glob (gitignore-style, §8.2 machinery). */
+function globRegex(glob: string): string {
+  return `^${globToRegexSource(glob)}$`;
+}
+
+/** `AND l.field = ?` fragment (or '$body' sentinel) when a field is given. */
+function fieldClause(field: string | undefined): SqlFragment {
+  if (field === undefined) return { sql: "", params: [] };
+  const f = field === "$body" ? BODY_FIELD : field;
+  return { sql: " AND l.field = ?", params: [f] };
+}
+
+/**
+ * The correlated EXISTS body shared by membership ($in/$has) and the
+ * collection `.size()`/comprehension forms. Returns the FROM+WHERE of a
+ * subquery correlated to the outer `versions` row, minus the leading
+ * SELECT (callers wrap it).
+ */
+function graphSubqueryCore(
+  direction: "in" | "has" | "backlinks" | "links",
+  opts: { glob?: string; field?: string; predicateAlias?: string },
+): SqlFragment {
+  const scope = requireGraphScope();
+  const params: SqlFragment["params"] = [];
+
+  if (direction === "in" || direction === "backlinks") {
+    // Outer = target; join the source version. Resolved edges only
+    // (target_id must equal the outer doc), source must be live + readable.
+    const alias = opts.predicateAlias ?? nextGraphAlias();
+    const parts = [
+      "FROM links l",
+      `JOIN versions ${alias} ON l.source_id = ${alias}.document_id AND ${alias}.next_id IS NULL`,
+      "WHERE l.target_id = versions.document_id",
+    ];
+    if (opts.glob !== undefined) {
+      parts.push(`AND regexp(?, ${alias}.path)`);
+      params.push(globRegex(opts.glob));
+    }
+    const fc = fieldClause(opts.field);
+    if (fc.sql) {
+      parts.push(fc.sql.replace(/^ AND /, "AND "));
+      params.push(...fc.params);
+    }
+    const sc = scope(alias);
+    parts.push(`AND ${sc.sql}`);
+    params.push(...sc.params);
+    return { sql: parts.join(" "), params };
+  }
+
+  // direction === "has" || "links": outer = source; the other end is target.
+  // Match the written folded target (target_norm) so dangling edges count.
+  // When the target resolves, also require it to be readable; a dangling
+  // target has no version row to scope (the target path isn't a live doc).
+  const alias = opts.predicateAlias ?? nextGraphAlias();
+  const parts = [
+    `FROM links l LEFT JOIN versions ${alias} ON l.target_id = ${alias}.document_id AND ${alias}.next_id IS NULL`,
+    "WHERE l.source_id = versions.document_id",
+  ];
+  if (opts.glob !== undefined) {
+    // has/links match against the resolved/​written target path. Prefer the
+    // resolved live path when bound; fall back to target_norm for danglers.
+    parts.push(`AND regexp(?, COALESCE(${alias}.path, l.target_norm))`);
+    params.push(globRegex(opts.glob));
+  }
+  const fc = fieldClause(opts.field);
+  if (fc.sql) {
+    parts.push(fc.sql.replace(/^ AND /, "AND "));
+    params.push(...fc.params);
+  }
+  // Scope: a bound target must be readable; a dangling edge (no target row)
+  // is visible because the source is the caller's own readable row.
+  const sc = scope(alias);
+  parts.push(`AND (l.target_id IS NULL OR ${sc.sql})`);
+  params.push(...sc.params);
+  return { sql: parts.join(" "), params };
+}
+
+function compileGraphMembership(m: GraphMembership): SqlFragment {
+  const core = graphSubqueryCore(m.direction, { glob: m.glob, field: m.field });
+  return { sql: `EXISTS (SELECT 1 ${core.sql})`, params: core.params };
+}
+
+/** COUNT(*) scalar for size($backlinks_static()) / size($links_static()). */
+function compileGraphCollectionSize(c: GraphCollection): SqlFragment {
+  const core = graphSubqueryCore(c.direction, {});
+  return { sql: `(SELECT COUNT(*) ${core.sql})`, params: core.params };
+}
+
+/**
+ * $backlinks_static().exists(d, pred) / .all(d, pred). The iter var ranges
+ * over the OTHER document's live version (aliased); the predicate compiles
+ * against that alias. `.exists` → EXISTS(core AND pred); `.all` →
+ * NOT EXISTS(core AND NOT pred) — vacuously true on an empty collection,
+ * matching CEL's `.all` semantics.
+ */
+function compileGraphComprehension(
+  comp: NonNullable<Extract<CelExpr["exprKind"], { case: "comprehensionExpr" }>["value"]>,
+  collection: GraphCollection,
+): SqlFragment {
+  const shape = classifyComprehension(comp);
+  if (shape === "unsupported") {
+    throw new KernelError("filter_invalid", {
+      reason: "unsupported comprehension over a link collection (use .exists or .all)",
+    });
+  }
+  const alias = nextGraphAlias();
+  const core = graphSubqueryCore(collection.direction, { predicateAlias: alias });
+  const userPred = extractUserPredicate(comp.loopStep as CelExpr);
+  const pred = compileAgainstAlias(userPred, comp.iterVar, alias);
+
+  if (shape === "exists") {
+    return {
+      sql: `EXISTS (SELECT 1 ${core.sql} AND (${pred.sql}))`,
+      params: [...core.params, ...pred.params],
+    };
+  }
+  // "all": no member violates the predicate (vacuously true when empty).
+  return {
+    sql: `NOT EXISTS (SELECT 1 ${core.sql} AND NOT (${pred.sql}))`,
+    params: [...core.params, ...pred.params],
+  };
+}
+
+/**
+ * Compile a comprehension predicate where the iter var denotes the OTHER
+ * document's version row (aliased). `d` bare is meaningless; `d.field`
+ * reads that doc's frontmatter, and `d.$path`/`d.$updated_at`/`d.$body`
+ * read its intrinsics. Everything else compiles normally (referring to the
+ * OUTER `versions` row) — so a predicate can mix both documents.
+ */
+function compileAgainstAlias(expr: CelExpr, iterVar: string, alias: string): SqlFragment {
+  const kind = expr.exprKind.case;
+
+  if (kind === "identExpr") {
+    if (expr.exprKind.value.name === iterVar) {
+      // Bare iter var in a boolean/scalar position isn't supported — you
+      // must access a field (d.status) or intrinsic (d.$path).
+      throw new KernelError("filter_invalid", {
+        reason: `bare '${iterVar}' is not usable; access a field like ${iterVar}.status or ${iterVar}.$path`,
+      });
+    }
+    return compileExpr(expr);
+  }
+
+  if (kind === "selectExpr") {
+    const path = collectSelectPath(expr);
+    if (path && path[0] === iterVar) {
+      return aliasFieldAccess(alias, path.slice(1));
+    }
+    return compileExpr(expr);
+  }
+
+  if (kind === "callExpr") {
+    const call = expr.exprKind.value;
+    const target = call.target
+      ? compileAgainstAlias(call.target as CelExpr, iterVar, alias)
+      : undefined;
+    const args = call.args.map((a) => compileAgainstAlias(a as CelExpr, iterVar, alias));
+    return recompileCallWithSubstitutedArgs(call.function, target, args);
+  }
+
+  // Constants and anything else: compile normally.
+  return compileExpr(expr);
+}
+
+/**
+ * Field access on the aliased other-document row. An empty tail is the bare
+ * iter var (rejected above). A `$`-prefixed head is an intrinsic
+ * ($path/$updated_at/$body); otherwise it's a frontmatter path.
+ */
+function aliasFieldAccess(alias: string, tail: string[]): SqlFragment {
+  const head = tail[0];
+  if (head === undefined) {
+    throw new KernelError("filter_invalid", { reason: "empty field access on link iter var" });
+  }
+  if (head.startsWith(INTRINSIC_PREFIX)) {
+    if (tail.length > 1) {
+      throw new KernelError("filter_invalid", { reason: "intrinsics have no subfields" });
+    }
+    const name = head.slice(INTRINSIC_PREFIX.length);
+    const col = INTRINSIC_COLUMNS[name];
+    if (!col) {
+      throw new KernelError("filter_invalid", { reason: `unknown intrinsic $${name}` });
+    }
+    // INTRINSIC_COLUMNS maps to `versions.<col>`; retarget to the alias.
+    return { sql: col.replace(/^versions\./, `${alias}.`), params: [] };
+  }
+  const parts = tail.map((p) => `"${p.replace(/"/g, '""')}"`);
+  return { sql: `json_extract(${alias}.frontmatter, '$.${parts.join(".")}')`, params: [] };
+}
 
 function compileBinary(op: string, a: CelExpr, b: CelExpr): SqlFragment {
   const lhs = compileExpr(a);
@@ -374,6 +649,10 @@ function compileIn(needle: CelExpr, container: CelExpr): SqlFragment {
 }
 
 function compileSize(inner: CelExpr): SqlFragment {
+  // size($backlinks_static()) / size($links_static()) → COUNT subquery.
+  const collection = asGraphCollection(inner);
+  if (collection) return compileGraphCollectionSize(collection);
+
   // size(list(field)) — polymorphic: 1 if scalar, N if list, 0 if null.
   // We use the two-arg form of json_type — json_type(root, path) — so it
   // looks at the JSON representation BEFORE unwrapping (a bare scalar
@@ -445,7 +724,14 @@ function compileComprehension(expr: CelExpr): SqlFragment {
   //   .exists(v, pred)  → accuInit=false, loopStep = accu || pred
   //   .filter(v, pred)  → accumulator is a list (not supported here)
   //   .map(...)         → likewise not supported
-  //
+
+  // Graph collection comprehension: $backlinks_static().exists(d, pred) /
+  // $links_static().all(d, pred). The iter var ranges over the OTHER
+  // document's version row (§11.2), so the predicate compiles against a
+  // joined `versions` alias rather than json_each rows.
+  const collection = asGraphCollection(comp.iterRange as CelExpr);
+  if (collection) return compileGraphComprehension(comp, collection);
+
   // We detect the two supported shapes structurally. iterRange must be a
   // list() hint (§5.2).
   const listHint = unwrapListHint(comp.iterRange as CelExpr);

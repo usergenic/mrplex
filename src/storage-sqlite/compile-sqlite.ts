@@ -30,9 +30,13 @@ export function compileSearchPlan(plan: SearchPlan): CompiledSql {
   clauses.push(`versions.repo_id IN (${repoPh})`);
   for (const id of plan.repo_ids) params.push(id);
 
-  // Optional CEL filter.
+  // Optional CEL filter. Graph predicates ($in_static etc.) need to apply
+  // the caller's read scope to the OTHER endpoint of an edge, so hand the
+  // filter compiler a scope-fragment builder bound to this plan's scope.
   if (plan.filter_ast) {
-    const compiled = compileFilter(plan.filter_ast);
+    const compiled = compileFilter(plan.filter_ast, {
+      graphScope: (alias: string) => scopeFragmentForAlias(plan.scope, alias),
+    });
     clauses.push(`(${compiled.sql})`);
     for (const p of compiled.params) params.push(p);
   }
@@ -46,7 +50,7 @@ export function compileSearchPlan(plan: SearchPlan): CompiledSql {
 
   // Scope filter.
   if (plan.scope.kind === "groups") {
-    const scopeFrag = compileScopeGroups(plan.scope.groups);
+    const scopeFrag = compileScopeGroups(plan.scope.groups, "versions");
     if (scopeFrag.sql.length > 0) {
       clauses.push(`(${scopeFrag.sql})`);
       for (const p of scopeFrag.params) params.push(p);
@@ -113,19 +117,19 @@ function compileSigilExclusion(groups: readonly SigilExclusion[]): CompiledSql {
   return { sql: clauses.join(" AND "), params };
 }
 
-function compileScopeGroups(groups: readonly ScopeGroup[]): CompiledSql {
+function compileScopeGroups(groups: readonly ScopeGroup[], alias: string): CompiledSql {
   const scopeSqls: string[] = [];
   const scopeParams: (string | number | bigint | null)[] = [];
   for (const group of groups) {
     if (group.globs.length === 0) continue;
     if (group.repos === "*") {
-      const globExpr = globsToLastMatchCaseSql(group.globs, scopeParams);
+      const globExpr = globsToLastMatchCaseSql(group.globs, scopeParams, alias);
       scopeSqls.push(`(${globExpr})`);
     } else if (group.repos.length > 0) {
       const ph = group.repos.map(() => "?").join(",");
       for (const id of group.repos) scopeParams.push(id);
-      const globExpr = globsToLastMatchCaseSql(group.globs, scopeParams);
-      scopeSqls.push(`(versions.repo_id IN (${ph}) AND (${globExpr}))`);
+      const globExpr = globsToLastMatchCaseSql(group.globs, scopeParams, alias);
+      scopeSqls.push(`(${alias}.repo_id IN (${ph}) AND (${globExpr}))`);
     }
   }
   return { sql: scopeSqls.join(" OR "), params: scopeParams };
@@ -134,6 +138,7 @@ function compileScopeGroups(groups: readonly ScopeGroup[]): CompiledSql {
 function globsToLastMatchCaseSql(
   globs: readonly string[],
   params: (string | number | bigint | null)[],
+  alias: string,
 ): string {
   let expr = "0";
   const localParams: string[] = [];
@@ -143,8 +148,23 @@ function globsToLastMatchCaseSql(
     const raw = negated ? g.slice(1) : g;
     const regex = `^${globToRegexSource(raw)}$`;
     localParams.unshift(regex);
-    expr = `(CASE WHEN regexp(?, versions.path) THEN ${negated ? "0" : "1"} ELSE ${expr} END)`;
+    expr = `(CASE WHEN regexp(?, ${alias}.path) THEN ${negated ? "0" : "1"} ELSE ${expr} END)`;
   }
   for (const p of localParams) params.push(p);
   return expr;
+}
+
+/**
+ * Scope predicate for an aliased `versions` row inside a graph subquery
+ * (links-plan.md §5 decision 5 — the visible graph equals the readable
+ * graph). `allow_all` → always true; `deny_all` → always false; `groups`
+ * → the same OR-of-globs the outer query applies, retargeted to `alias`.
+ */
+function scopeFragmentForAlias(scope: SearchPlan["scope"], alias: string): CompiledSql {
+  if (scope.kind === "allow_all") return { sql: "1", params: [] };
+  if (scope.kind === "deny_all") return { sql: "0", params: [] };
+  const frag = compileScopeGroups(scope.groups, alias);
+  return frag.sql.length > 0
+    ? { sql: `(${frag.sql})`, params: frag.params }
+    : { sql: "0", params: [] };
 }
