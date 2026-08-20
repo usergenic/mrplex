@@ -10,6 +10,18 @@
  */
 
 import { randomBytes } from "node:crypto";
+import { backfillRepoLinks } from "../links/backfill.js";
+import {
+  HARDCODED_DEFAULTS as LINK_DEFAULTS,
+  type LinkConfig,
+  type LinkConfigOverride,
+  effectiveLinkConfig,
+  parseRepoOverride as parseLinkOverride,
+  validateRepoOverride as validateLinkOverride,
+} from "../links/link-config.js";
+import { bindDanglingToPath, reindexOutboundLinks } from "../links/maintain.js";
+import { planRepairs } from "../links/repair.js";
+import { findStaleLinks } from "../links/stale.js";
 import type { RepoRow, Storage, TokenRow, VersionRow } from "../storage/types.js";
 import type { Action, Actor, StoredScope, Target } from "./auth/actor.js";
 import { authorize } from "./auth/authorize.js";
@@ -62,6 +74,31 @@ export type SetPathConfigResult = { repo: Repo; warnings: PathWarning[] };
 
 export type TokenCreateResult = { token: string; meta: Token };
 
+export type LinksBackfillResult = { documents: number; edges: number };
+
+/**
+ * Result of `repos.set_link_config`: the updated repo plus the re-extraction
+ * report. A config change makes the link index stale, so the op re-extracts
+ * the whole repo under the new config in the same call (§11.2 "Config change
+ * ⇒ re-extraction") — the returned `reindexed` counts document it.
+ */
+export type SetLinkConfigResult = { repo: Repo; reindexed: LinksBackfillResult };
+
+/** A stale link on the wire — paths, never internal document ids. */
+export type StaleLinkWire = {
+  repo: string;
+  source_path: string;
+  ord: number;
+  written: string;
+  current: string;
+};
+
+export type RepairResult = {
+  dry_run: boolean;
+  repaired: { path: string; edges: number }[];
+  skipped: { path: string; reason: string }[];
+};
+
 export type Kernel = {
   repos: {
     list(actor: Actor, opts?: { include_system?: boolean }): Promise<Repo[]>;
@@ -74,6 +111,11 @@ export type Kernel = {
       slug: string,
       config: PathConfigOverride | null,
     ): Promise<SetPathConfigResult>;
+    set_link_config(
+      actor: Actor,
+      slug: string,
+      config: LinkConfigOverride | null,
+    ): Promise<SetLinkConfigResult>;
   };
   users: {
     list(actor: Actor): Promise<User[]>;
@@ -107,6 +149,14 @@ export type Kernel = {
     ): Promise<Version>;
     delete(actor: Actor, repo: string, prev_version_id: string): Promise<Version>;
   };
+  links: {
+    /** Rebuild the link index for a repo (backfill / config-change). */
+    backfill(actor: Actor, repo: string): Promise<LinksBackfillResult>;
+    /** List live docs whose written link text is stale vs. the target's path. */
+    stale(actor: Actor, repo: string): Promise<StaleLinkWire[]>;
+    /** Rewrite stale link text as optimistic docs.put; dry_run plans only. */
+    repair(actor: Actor, repo: string, opts?: { dry_run?: boolean }): Promise<RepairResult>;
+  };
   tokens: {
     list(actor: Actor): Promise<Token[]>;
     create(
@@ -123,6 +173,8 @@ export type Kernel = {
 export type KernelConfig = {
   storage: Storage;
   serverPathConfig?: PathConfig;
+  /** Server-level link-extraction config (§11.2). Defaults to hardcoded. */
+  serverLinkConfig?: LinkConfig;
   /**
    * M4 write-time hook: called with the new version's storage id after
    * every committed create / put / delete. Awaited in-line so a throw
@@ -140,6 +192,7 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
       : { storage: config as Storage };
   const storage = cfg.storage;
   const serverPathConfig = cfg.serverPathConfig ?? HARDCODED_DEFAULTS;
+  const serverLinkConfig = cfg.serverLinkConfig ?? LINK_DEFAULTS;
   const onVersionCommitted = cfg.onVersionCommitted;
   const queryEmbed = cfg.queryEmbed;
 
@@ -193,6 +246,10 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
 
   function repoEffectiveConfig(repo: RepoRow): PathConfig {
     return effectivePathConfig(serverPathConfig, parseRepoOverride(repo.path_config));
+  }
+
+  function repoEffectiveLinkConfig(repo: RepoRow): LinkConfig {
+    return effectiveLinkConfig(serverLinkConfig, parseLinkOverride(repo.link_config));
   }
 
   async function resolveRepo(actor: Actor, slug: string, action: Action): Promise<RepoRow> {
@@ -268,7 +325,7 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
     return n;
   }
 
-  return {
+  const kernel: Kernel = {
     repos: {
       async list(actor, opts) {
         authorize(actor, "read", { kind: "server" });
@@ -333,6 +390,26 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
           }
         }
         return { repo: toRepoWire(updated), warnings };
+      },
+      async set_link_config(actor, slug, config) {
+        authorize(actor, "admin", { kind: "server_admin" });
+        const repo = await storage.repos_by_slug(slug);
+        if (!repo) throw repoNotFound(slug);
+        if (config !== null) {
+          // Validates the merge; throws link_config_invalid on a bad override.
+          validateLinkOverride(config, serverLinkConfig);
+        }
+        const configJson = config === null ? null : JSON.stringify(config);
+        const updated = await storage.repos_set_link_config(repo.id, configJson);
+        // A config change makes the link index stale for this repo — re-extract
+        // the whole corpus under the new effective config now, so the index is
+        // immediately consistent (§11.2 "Config change ⇒ re-extraction").
+        const reindexed = await backfillRepoLinks(
+          storage,
+          repo.id,
+          effectiveLinkConfig(serverLinkConfig, config),
+        );
+        return { repo: toRepoWire(updated), reindexed };
       },
     },
 
@@ -450,6 +527,19 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
             author_id: actor.user_id,
             created_at: new Date().toISOString(),
           });
+          // Links (§11.2): index this doc's outbound edges, and bind any
+          // danglers that were waiting for a document at this path.
+          const linkConfig = repoEffectiveLinkConfig(repo);
+          await reindexOutboundLinks(
+            storage,
+            linkConfig,
+            repo.id,
+            doc.id,
+            path,
+            input.body,
+            canon.frontmatter,
+          );
+          await bindDanglingToPath(storage, repo.id, path, doc.id);
           const author = await userById(actor.user_id);
           return {
             version: toVersionWireSync(inserted, repoSlug, author),
@@ -516,6 +606,23 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
             author_id: actor.user_id,
             created_at: new Date().toISOString(),
           });
+          // Links (§11.2): re-extract this doc's outbound edges from the new
+          // version (body/frontmatter or the source path may have changed).
+          // Inbound edges are identity-bound, so a move needs no inbound
+          // churn; but a move INTO a path that has danglers binds them.
+          const linkConfig = repoEffectiveLinkConfig(repo);
+          await reindexOutboundLinks(
+            storage,
+            linkConfig,
+            repo.id,
+            prev.document_id,
+            destPath,
+            body,
+            canon.frontmatter,
+          );
+          if (destPath !== prev.path) {
+            await bindDanglingToPath(storage, repo.id, destPath, prev.document_id);
+          }
           const author = await userById(actor.user_id);
           return {
             version: toVersionWireSync(inserted, repoSlug, author),
@@ -593,6 +700,12 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
             author_id: actor.user_id,
             created_at: new Date().toISOString(),
           });
+          // Links (§11.2): clear the deleted doc's OUTBOUND edges — a doc in
+          // the system namespace links to nothing readable. INBOUND edges
+          // (target = this doc) stay bound; visibility filtering excludes
+          // them from live-namespace queries, and they rebind naturally if
+          // the doc is restored.
+          await storage.links_clear(prev.document_id);
           const author = await userById(actor.user_id);
           return {
             version: toVersionWireSync(inserted, repoSlug, author),
@@ -601,6 +714,72 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
         });
         await onVersionCommitted?.(insertedId);
         return version;
+      },
+    },
+
+    links: {
+      async backfill(actor, repoSlug) {
+        // Rebuilding the whole index is an admin-scoped maintenance op.
+        const repo = await resolveRepo(actor, repoSlug, "write");
+        authorize(actor, "admin", { kind: "server_admin" });
+        return backfillRepoLinks(storage, repo.id, repoEffectiveLinkConfig(repo));
+      },
+
+      async stale(actor, repoSlug) {
+        const repo = await resolveRepo(actor, repoSlug, "read");
+        const rows = await findStaleLinks(storage, repo.id, repoEffectiveLinkConfig(repo));
+        // Scope (§11.2 "Scope interaction" — visible graph = readable graph):
+        // surface a stale link only when the caller can read BOTH endpoints.
+        // The SOURCE path is what we return + would rewrite; the `current`
+        // (TARGET) path we'd expose is private if the caller can't read it —
+        // dropping the row prevents leaking the moved target's new location.
+        const canRead = (p: string) => actor.admin || scopesGrant(actor.scopes, "read", repo.id, p);
+        return rows
+          .filter((r) => canRead(r.source_path) && canRead(r.current))
+          .map((r) => ({
+            repo: repoSlug,
+            source_path: r.source_path,
+            ord: r.ord,
+            written: r.written,
+            current: r.current,
+          }));
+      },
+
+      async repair(actor, repoSlug, opts) {
+        const dryRun = opts?.dry_run ?? false;
+        const repo = await resolveRepo(actor, repoSlug, "write");
+        const plans = await planRepairs(storage, repo.id, repoEffectiveLinkConfig(repo));
+        const repaired: { path: string; edges: number }[] = [];
+        const skipped: { path: string; reason: string }[] = [];
+
+        for (const plan of plans) {
+          // Only repair docs the caller may write.
+          if (!actor.admin && !scopesGrant(actor.scopes, "write", repo.id, plan.version.path)) {
+            skipped.push({ path: plan.version.path, reason: "forbidden" });
+            continue;
+          }
+          if (dryRun) {
+            repaired.push({ path: plan.version.path, edges: plan.edges });
+            continue;
+          }
+          try {
+            await kernel.docs.put(
+              actor,
+              repoSlug,
+              encodeVersionId(plan.version.id),
+              plan.version.path,
+              { body: plan.newBody },
+            );
+            repaired.push({ path: plan.version.path, edges: plan.edges });
+          } catch (err) {
+            if (err instanceof KernelError && err.code === "stale_prev") {
+              skipped.push({ path: plan.version.path, reason: "conflict" });
+            } else {
+              throw err;
+            }
+          }
+        }
+        return { dry_run: dryRun, repaired, skipped };
       },
     },
 
@@ -664,4 +843,5 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
       });
     },
   };
+  return kernel;
 }

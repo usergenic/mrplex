@@ -23,6 +23,8 @@ export type RepoRow = {
   id: number;
   slug: string;
   path_config: string | null;
+  /** Per-repo link-extraction override JSON (§11.2). Null = inherit. */
+  link_config: string | null;
   created_at: string;
 };
 
@@ -102,6 +104,39 @@ export type VectorSearchHit = {
 };
 
 /**
+ * Links derived index (design §11.2). One row per outbound STATIC edge
+ * from a source document's CURRENT version, doc-keyed. The kernel extracts
+ * + resolves edges and hands the adapter the resolved shape below;
+ * extraction/resolution logic (markdown parsing, path normalization) lives
+ * in src/links, never in the storage layer.
+ */
+
+/**
+ * A resolved outbound edge, ready to persist. `target_id` is the bound
+ * document identity or null when dangling (the named path has no live
+ * document yet). `target_norm` is the folded, anchor-stripped resolution
+ * key used to rebind danglers case-insensitively (§3.5.1).
+ */
+export type LinkEdgeInput = {
+  ord: number;
+  field: string; // '$body' or a CEL frontmatter field path
+  target_raw: string; // canonical written form (primary candidate + anchor)
+  target_norm: string; // normalizeKey of the primary candidate (no anchor)
+  target_id: number | null; // resolved document id, or null = dangling
+};
+
+/** A stored link edge row (read shape — backfill, links.stale, tests). */
+export type LinkRow = {
+  repo_id: number;
+  source_id: number;
+  ord: number;
+  field: string;
+  target_raw: string;
+  target_norm: string;
+  target_id: number | null;
+};
+
+/**
  * Embedding backlog (design §3.2, §5.3). One row per version awaiting
  * (or having failed) embedding. `attempts` counts failed tries; a fresh
  * enqueue resets `attempts` and `next_retry_at` so a superseding write
@@ -175,6 +210,7 @@ export type Storage = {
   repos_create(input: { slug: string; created_at: string }): Promise<RepoRow>;
   repos_rename(id: number, new_slug: string): Promise<RepoRow>;
   repos_set_path_config(id: number, path_config: string | null): Promise<RepoRow>;
+  repos_set_link_config(id: number, link_config: string | null): Promise<RepoRow>;
   repos_by_slug(slug: string): Promise<RepoRow | null>;
   repos_by_id(id: number): Promise<RepoRow | null>;
 
@@ -213,6 +249,45 @@ export type Storage = {
   // fts_docs directly, so kernel.query has one path through the
   // adapter, not two.
   fts_index(version_id: number, body: string): Promise<void>;
+
+  // Links derived index (design §11.2). Doc-keyed, maintained in the write
+  // tx alongside version_insert — extraction is pure CPU (no external I/O),
+  // so it rides the kernel tx rather than the async backlog worker.
+
+  /**
+   * Replace document `source_id`'s outbound edges wholesale (delete +
+   * insert) in one shot. `repo_id` scopes the rows (links are repo-local).
+   * Called on every create/put that advances the doc's current version.
+   * Passing an empty `edges` clears the doc's outbound rows.
+   */
+  links_replace(repo_id: number, source_id: number, edges: readonly LinkEdgeInput[]): Promise<void>;
+
+  /** Clear a document's outbound edges (on delete). Inbound rows stay put. */
+  links_clear(source_id: number): Promise<void>;
+
+  /**
+   * Bind dangling edges in `repo_id` whose folded target matches
+   * `target_norm` to `document_id`. Called when a document appears at a
+   * path (create / move-in / restore) so waiting danglers resolve — the
+   * identity-bound counterpart to "backlinks survive renames" (§11.2).
+   * Bind-only: already-bound edges are never touched, and edges are never
+   * unbound (a move produces zero inbound churn; a delete leaves inbound
+   * rows bound and lets visibility filtering hide them — §11.2). A source's
+   * edge is never bound to the source itself (self-links are noise and are
+   * excluded, `source_id <> document_id`). Returns the number of edges
+   * newly bound.
+   */
+  links_resolve_dangling(
+    repo_id: number,
+    target_norm: string,
+    document_id: number,
+  ): Promise<number>;
+
+  /** A document's outbound edges (backfill, links.stale, tests). */
+  links_by_source(source_id: number): Promise<LinkRow[]>;
+
+  /** Every link row in a repo, ordered by (source_id, ord) (tests, verify). */
+  links_by_repo(repo_id: number): Promise<LinkRow[]>;
 
   /**
    * Composed query — the kernel orchestrator (§5) hands over a structured

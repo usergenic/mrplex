@@ -76,6 +76,7 @@ function buildClient(
       rename: (slug, ns) => kernel.repos.rename(actor, slug, ns),
       delete: (slug) => kernel.repos.delete(actor, slug),
       set_path_config: (slug, cfg) => kernel.repos.set_path_config(actor, slug, cfg),
+      set_link_config: (slug, cfg) => kernel.repos.set_link_config(actor, slug, cfg),
     },
     users: {
       list: () => kernel.users.list(actor),
@@ -93,6 +94,11 @@ function buildClient(
       create: (repo, path, input) => kernel.docs.create(actor, repo, path, input),
       put: (repo, prev, path, input) => kernel.docs.put(actor, repo, prev, path, input),
       delete: (repo, prev) => kernel.docs.delete(actor, repo, prev),
+    },
+    links: {
+      backfill: (repo) => kernel.links.backfill(actor, repo),
+      stale: (repo) => kernel.links.stale(actor, repo),
+      repair: (repo, opts) => kernel.links.repair(actor, repo, opts),
     },
     tokens: {
       list: () => kernel.tokens.list(actor),

@@ -1,10 +1,11 @@
 /**
  * MCP tool registry — design §6.2.
  *
- * 21 tools mirroring the kernel one-to-one. Each entry names the tool,
+ * 25 tools mirroring the kernel one-to-one. Each entry names the tool,
  * describes it, carries a JSON Schema for the input, and delegates to a
  * kernel call with the resolved actor. M4 added `docs_diff` (the tool
- * m3 deferred).
+ * m3 deferred); §11.2 added `links_backfill` / `links_stale` /
+ * `links_repair` and `repos_set_link_config`.
  *
  * Results shape:
  *   • On success: { structured, text } — structured is the wire type,
@@ -19,6 +20,7 @@ import type { Kernel } from "../kernel/kernel.js";
 import type { PathConfigOverride } from "../kernel/path-config.js";
 import type { QuerySpec } from "../kernel/query/query.js";
 import type { Version } from "../kernel/wire.js";
+import type { LinkConfigOverride } from "../links/link-config.js";
 import { appendSystemProperty, extractSystemProperties } from "../markdown/frontmatter.js";
 import {
   renderJson,
@@ -241,6 +243,36 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       const cfg = args.config as PathConfigOverride | null;
       const result = await kernel.repos.set_path_config(actor, argStr(args, "repo"), cfg);
       return { structured: result, text: `warnings: ${result.warnings.length}` };
+    },
+  },
+  {
+    name: "repos_set_link_config",
+    description:
+      "Set (or clear) a repo's link-extraction config override (§11.2); re-extracts the repo under the new config. Pass config = null to clear.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string" },
+        config: {
+          oneOf: [
+            {
+              type: "object",
+              additionalProperties: true,
+              description: "LinkConfig override — syntaxes / fields / resolution (§11.2).",
+            },
+            { type: "null" },
+          ],
+        },
+      },
+      required: ["repo", "config"],
+    },
+    handler: async (kernel, actor, args) => {
+      const cfg = args.config as LinkConfigOverride | null;
+      const result = await kernel.repos.set_link_config(actor, argStr(args, "repo"), cfg);
+      return {
+        structured: result,
+        text: `link_config updated; reindexed ${result.reindexed.documents} doc(s), ${result.reindexed.edges} edge(s)`,
+      };
     },
   },
 
@@ -491,6 +523,58 @@ export const TOOL_REGISTRY: ToolEntry[] = [
         argStr(args, "prev_version_id"),
       );
       return { structured: v, text: renderVersion(v) };
+    },
+  },
+
+  // ---- links (§11.2) ----
+  {
+    name: "links_backfill",
+    description: "Rebuild the link index for a repo (backfill / config change). Admin.",
+    inputSchema: {
+      type: "object",
+      properties: { repo: { type: "string" } },
+      required: ["repo"],
+    },
+    handler: async (kernel, actor, args) => {
+      const r = await kernel.links.backfill(actor, argStr(args, "repo"));
+      return {
+        structured: r,
+        text: `backfill ${argStr(args, "repo")}: documents=${r.documents} edges=${r.edges}`,
+      };
+    },
+  },
+  {
+    name: "links_stale",
+    description:
+      "List live docs whose written link text is stale vs. the target's current path (§11.2).",
+    inputSchema: {
+      type: "object",
+      properties: { repo: { type: "string" } },
+      required: ["repo"],
+    },
+    handler: async (kernel, actor, args) => {
+      const rows = await kernel.links.stale(actor, argStr(args, "repo"));
+      const text = rows.length
+        ? rows.map((r) => `${r.source_path}: "${r.written}" → "${r.current}"`).join("\n")
+        : "no stale links";
+      return { structured: wrapList(rows), text };
+    },
+  },
+  {
+    name: "links_repair",
+    description:
+      "Rewrite stale link text as optimistic docs.put; dry_run plans only. Conflicts skipped.",
+    inputSchema: {
+      type: "object",
+      properties: { repo: { type: "string" }, dry_run: { type: "boolean" } },
+      required: ["repo"],
+    },
+    handler: async (kernel, actor, args) => {
+      const r = await kernel.links.repair(actor, argStr(args, "repo"), {
+        dry_run: argBoolOpt(args, "dry_run") ?? false,
+      });
+      const text = `${r.dry_run ? "[dry-run] " : ""}repaired=${r.repaired.length} skipped=${r.skipped.length}`;
+      return { structured: r, text };
     },
   },
 

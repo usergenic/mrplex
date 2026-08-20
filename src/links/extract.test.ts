@@ -1,0 +1,394 @@
+import { describe, expect, it } from "vitest";
+import type { FrontmatterJson } from "../markdown/frontmatter.js";
+import { BODY_FIELD, type RawEdge, extractEdges } from "./extract.js";
+import { HARDCODED_DEFAULTS, type LinkConfig, mergeConfig } from "./link-config.js";
+
+function extract(
+  body: string,
+  opts: { frontmatter?: FrontmatterJson; config?: LinkConfig } = {},
+): RawEdge[] {
+  return extractEdges({
+    body,
+    frontmatter: opts.frontmatter ?? {},
+    config: opts.config ?? HARDCODED_DEFAULTS,
+  });
+}
+
+const targets = (edges: RawEdge[]) => edges.map((e) => e.target);
+
+/** Drop dest_span so exact-object assertions can ignore byte offsets. */
+const stripSpans = (edges: RawEdge[]): Omit<RawEdge, "dest_span">[] =>
+  edges.map(({ dest_span, ...rest }) => rest);
+
+describe("inline links", () => {
+  it("extracts the destination, ignores link text and title", () => {
+    const edges = extract('See [Alice](people/alice.md "the title") here.');
+    expect(stripSpans(edges)).toEqual([
+      { ord: 0, field: BODY_FIELD, target: "people/alice.md", wikilink: false },
+    ]);
+  });
+
+  it("extracts multiple links in document order", () => {
+    expect(targets(extract("[a](one.md) then [b](two.md)"))).toEqual(["one.md", "two.md"]);
+  });
+
+  it("preserves anchors on the raw target", () => {
+    expect(targets(extract("[x](foo.md#section)"))).toEqual(["foo.md#section"]);
+  });
+
+  it("strips pointy-bracket destinations, keeping the inner path", () => {
+    expect(targets(extract("[a](<path/to/thing.md>)"))).toEqual(["path/to/thing.md"]);
+  });
+
+  it("preserves spaces inside a pointy-bracket destination", () => {
+    expect(targets(extract("[b](<path with spaces.md>)"))).toEqual(["path with spaces.md"]);
+  });
+
+  it("keeps an anchor inside a pointy-bracket destination", () => {
+    expect(targets(extract("[c](<foo.md#sec>)"))).toEqual(["foo.md#sec"]);
+  });
+});
+
+describe("reference links", () => {
+  it("resolves full references against their definition", () => {
+    expect(targets(extract("Ref [Bob][b].\n\n[b]: people/bob.md"))).toEqual(["people/bob.md"]);
+  });
+
+  it("resolves collapsed and shortcut references", () => {
+    expect(targets(extract("[Carol][] and [Dave]\n\n[carol]: c.md\n[dave]: d.md"))).toEqual([
+      "c.md",
+      "d.md",
+    ]);
+  });
+
+  it("does not emit an edge for a reference with no matching definition", () => {
+    expect(extract("[ghost] and [miss][nope] here.")).toEqual([]);
+  });
+
+  it("strips pointy-bracket destinations in a definition (spaces preserved)", () => {
+    expect(targets(extract("Ref [a][x].\n\n[x]: <path with spaces.md>"))).toEqual([
+      "path with spaces.md",
+    ]);
+  });
+});
+
+describe("images (! is a cosmetic embed prefix, not a type)", () => {
+  it("extracts an image destination as an ordinary edge", () => {
+    expect(targets(extract("![diagram](img/arch.png)"))).toEqual(["img/arch.png"]);
+  });
+
+  it("rides the inline toggle, not a separate image knob", () => {
+    const noInline = mergeConfig(HARDCODED_DEFAULTS, {
+      syntaxes: { inline: false, reference: true, autolink: true, wikilink: true },
+    });
+    expect(extract("![diagram](img/arch.png)", { config: noInline })).toEqual([]);
+  });
+});
+
+describe("code exclusion", () => {
+  it("ignores links inside inline code spans", () => {
+    expect(extract("Inline `[nope](x.md)` code.")).toEqual([]);
+  });
+
+  it("ignores links inside fenced code blocks", () => {
+    expect(extract("```\n[nope](y.md)\n```")).toEqual([]);
+  });
+
+  it("ignores links inside indented code blocks", () => {
+    expect(extract("    [nope](z.md)")).toEqual([]);
+  });
+
+  it("still extracts real links around code", () => {
+    expect(targets(extract("`[no](x.md)` but [yes](real.md)"))).toEqual(["real.md"]);
+  });
+});
+
+describe("wikilinks", () => {
+  it("extracts the page half, dropping the display half", () => {
+    const edges = extract("[[alice]] and [[bob|Bob Smith]]");
+    expect(stripSpans(edges)).toEqual([
+      { ord: 0, field: BODY_FIELD, target: "alice", wikilink: true },
+      { ord: 1, field: BODY_FIELD, target: "bob", wikilink: true },
+    ]);
+  });
+
+  it("treats ![[embed]] the same as [[embed]] (cosmetic prefix)", () => {
+    expect(stripSpans(extract("![[page]]"))).toEqual([
+      { ord: 0, field: BODY_FIELD, target: "page", wikilink: true },
+    ]);
+  });
+
+  it("keeps an anchor on the wikilink target", () => {
+    expect(targets(extract("[[foo#section]]"))).toEqual(["foo#section"]);
+  });
+
+  it("is excluded inside code", () => {
+    expect(extract("`[[nope]]`")).toEqual([]);
+    expect(extract("```\n[[nope]]\n```")).toEqual([]);
+  });
+
+  it("is disabled when the wikilink syntax is off", () => {
+    const off = mergeConfig(HARDCODED_DEFAULTS, {
+      syntaxes: { inline: true, reference: true, autolink: true, wikilink: false },
+    });
+    expect(extract("[[alice]]", { config: off })).toEqual([]);
+  });
+});
+
+describe("mixed body ordering", () => {
+  it("interleaves inline and wikilink hits by source offset", () => {
+    const edges = extract("[a](one.md) [[two]] [b](three.md)");
+    expect(targets(edges)).toEqual(["one.md", "two", "three.md"]);
+    expect(edges.map((e) => e.ord)).toEqual([0, 1, 2]);
+  });
+});
+
+describe("frontmatter reference fields", () => {
+  const withFields = (fields: string[]) => mergeConfig(HARDCODED_DEFAULTS, { fields });
+
+  it("extracts a scalar field value under the declaring field path", () => {
+    const edges = extract("", {
+      frontmatter: { parent: "moc/employees.md" },
+      config: withFields(["parent"]),
+    });
+    expect(edges).toEqual([
+      { ord: 0, field: "parent", target: "moc/employees.md", wikilink: false },
+    ]);
+  });
+
+  it("extracts list values as distinct ords under the same field", () => {
+    const edges = extract("", {
+      frontmatter: { related: ["alice.md", "bob.md"] },
+      config: withFields(["related"]),
+    });
+    expect(edges).toEqual([
+      { ord: 0, field: "related", target: "alice.md", wikilink: false },
+      { ord: 1, field: "related", target: "bob.md", wikilink: false },
+    ]);
+  });
+
+  it("reaches terminal string paths through list-of-objects (stakeholders.name)", () => {
+    const edges = extract("", {
+      frontmatter: {
+        stakeholders: [
+          { name: "alice.md", role: "lead" },
+          { name: "bob.md", role: "eng" },
+        ],
+      },
+      config: withFields(["stakeholders.name"]),
+    });
+    expect(targets(edges)).toEqual(["alice.md", "bob.md"]);
+  });
+
+  it("terminal-fields rule: a non-terminal path extracts nothing", () => {
+    const edges = extract("", {
+      frontmatter: {
+        stakeholders: [
+          { name: "alice.md", role: "lead" },
+          { name: "bob.md", role: "eng" },
+        ],
+      },
+      config: withFields(["stakeholders"]),
+    });
+    expect(edges).toEqual([]);
+  });
+
+  it("extracts nothing when fields are not opted in", () => {
+    expect(extract("", { frontmatter: { parent: "moc/employees.md" } })).toEqual([]);
+  });
+
+  it("body edges come before frontmatter edges in ord order", () => {
+    const edges = extract("[a](one.md)", {
+      frontmatter: { parent: "p.md" },
+      config: withFields(["parent"]),
+    });
+    expect(stripSpans(edges)).toEqual([
+      { ord: 0, field: BODY_FIELD, target: "one.md", wikilink: false },
+      { ord: 1, field: "parent", target: "p.md", wikilink: false },
+    ]);
+  });
+});
+
+describe("frontmatter field-path resolution (dot / bracket / nesting)", () => {
+  const withFields = (fields: string[]) => mergeConfig(HARDCODED_DEFAULTS, { fields });
+  const fm = (frontmatter: FrontmatterJson, ...fields: string[]) =>
+    extract("", { frontmatter, config: withFields(fields) });
+
+  it("resolves a nested-object scalar path (project.lead)", () => {
+    const edges = fm({ project: { lead: "alice.md" } }, "project.lead");
+    expect(edges).toEqual([{ ord: 0, field: "project.lead", target: "alice.md", wikilink: false }]);
+  });
+
+  it("resolves a deep nested-object path (a.b.c)", () => {
+    expect(targets(fm({ a: { b: { c: "deep.md" } } }, "a.b.c"))).toEqual(["deep.md"]);
+  });
+
+  it('resolves a bracket-quoted segment (owners["team-lead"])', () => {
+    const edges = fm({ owners: { "team-lead": "lead.md" } }, 'owners["team-lead"]');
+    expect(edges).toEqual([
+      { ord: 0, field: 'owners["team-lead"]', target: "lead.md", wikilink: false },
+    ]);
+  });
+
+  it('resolves a bracket segment with non-identifier chars (data["2024-Q3"])', () => {
+    expect(targets(fm({ data: { "2024-Q3": "q3.md" } }, 'data["2024-Q3"]'))).toEqual(["q3.md"]);
+  });
+
+  it("resolves a nested list of strings (meta.related)", () => {
+    const edges = fm({ meta: { related: ["a.md", "b.md"] } }, "meta.related");
+    expect(edges).toEqual([
+      { ord: 0, field: "meta.related", target: "a.md", wikilink: false },
+      { ord: 1, field: "meta.related", target: "b.md", wikilink: false },
+    ]);
+  });
+
+  it("resolves a terminal beneath a list-of-objects two levels deep", () => {
+    // links: [{to: {path: x}}, ...] via links.to.path
+    const edges = fm(
+      { links: [{ to: { path: "x.md" } }, { to: { path: "y.md" } }] },
+      "links.to.path",
+    );
+    expect(targets(edges)).toEqual(["x.md", "y.md"]);
+  });
+
+  it("mixes a scalar and a list under the polymorphic (§5.2) convention", () => {
+    // `owner` scalar-or-list: one entry here as a scalar.
+    expect(targets(fm({ owner: "solo.md" }, "owner"))).toEqual(["solo.md"]);
+    expect(targets(fm({ owner: ["a.md", "b.md"] }, "owner"))).toEqual(["a.md", "b.md"]);
+  });
+});
+
+describe("frontmatter field-path — misses and non-string values yield nothing", () => {
+  const withFields = (fields: string[]) => mergeConfig(HARDCODED_DEFAULTS, { fields });
+  const fm = (frontmatter: FrontmatterJson, ...fields: string[]) =>
+    extract("", { frontmatter, config: withFields(fields) });
+
+  it("a declared field absent from the frontmatter extracts nothing", () => {
+    expect(fm({ title: "hi" }, "parent")).toEqual([]);
+  });
+
+  it("a nested path whose parent object is missing extracts nothing", () => {
+    expect(fm({ project: {} }, "project.lead")).toEqual([]);
+    expect(fm({}, "project.lead")).toEqual([]);
+  });
+
+  it("a path that runs THROUGH a scalar (not an object) extracts nothing", () => {
+    // project is a string, so project.lead can't descend.
+    expect(fm({ project: "notanobject.md" }, "project.lead")).toEqual([]);
+  });
+
+  it("non-string terminal values are skipped (number, bool, null, object)", () => {
+    expect(fm({ n: 42 }, "n")).toEqual([]);
+    expect(fm({ b: true }, "b")).toEqual([]);
+    expect(fm({ z: null }, "z")).toEqual([]);
+    expect(fm({ o: { k: "v" } }, "o")).toEqual([]); // object terminal → not a link
+  });
+
+  it("a list with mixed types keeps only the string members", () => {
+    expect(targets(fm({ related: ["a.md", 7, null, "b.md", { x: 1 }] }, "related"))).toEqual([
+      "a.md",
+      "b.md",
+    ]);
+  });
+
+  it("an empty list extracts nothing", () => {
+    expect(fm({ related: [] }, "related")).toEqual([]);
+  });
+});
+
+describe("frontmatter field-path — multiple declared fields", () => {
+  const withFields = (fields: string[]) => mergeConfig(HARDCODED_DEFAULTS, { fields });
+
+  it("extracts each declared field in declaration order, tagging its own field", () => {
+    const edges = extract("", {
+      frontmatter: { parent: "p.md", related: ["a.md", "b.md"], project: { lead: "lead.md" } },
+      config: withFields(["parent", "related", "project.lead"]),
+    });
+    expect(stripSpans(edges)).toEqual([
+      { ord: 0, field: "parent", target: "p.md", wikilink: false },
+      { ord: 1, field: "related", target: "a.md", wikilink: false },
+      { ord: 2, field: "related", target: "b.md", wikilink: false },
+      { ord: 3, field: "project.lead", target: "lead.md", wikilink: false },
+    ]);
+  });
+
+  it("the same target reached via two declared fields yields two distinct edges", () => {
+    const edges = extract("", {
+      frontmatter: { parent: "x.md", canonical: "x.md" },
+      config: withFields(["parent", "canonical"]),
+    });
+    expect(edges.map((e) => ({ field: e.field, target: e.target }))).toEqual([
+      { field: "parent", target: "x.md" },
+      { field: "canonical", target: "x.md" },
+    ]);
+  });
+});
+
+describe("determinism", () => {
+  it("same input → identical edges", () => {
+    const body = "[a](one.md) [[two]] ![img](p.png)\n\n[a]: unused.md";
+    expect(extract(body)).toEqual(extract(body));
+  });
+});
+
+describe("dest_span — the rewritable destination range (for links repair)", () => {
+  const spanText = (body: string, e: RawEdge) =>
+    e.dest_span ? body.slice(e.dest_span.start, e.dest_span.end) : undefined;
+
+  it("captures the inline destination text span", () => {
+    const body = "see [Alice](people/alice.md) here";
+    const [edge] = extract(body);
+    expect(edge?.dest_span).toBeDefined();
+    expect(spanText(body, edge as RawEdge)).toBe("people/alice.md");
+  });
+
+  it("captures the wikilink page-half span (not the display half)", () => {
+    const body = "- [[alice|Alice Ng]]";
+    const [edge] = extract(body);
+    expect(spanText(body, edge as RawEdge)).toBe("alice");
+  });
+
+  it("captures the span of a pointy-bracket destination's inner text", () => {
+    const body = "[x](<path with spaces.md>)";
+    const [edge] = extract(body);
+    expect(spanText(body, edge as RawEdge)).toBe("path with spaces.md");
+  });
+
+  it("includes the anchor in the inline destination span", () => {
+    const body = "[x](foo.md#sec)";
+    const [edge] = extract(body);
+    expect(spanText(body, edge as RawEdge)).toBe("foo.md#sec");
+  });
+
+  it("points a reference-style link's span at its [id]: definition destination", () => {
+    const body = "[Bob][b]\n\n[b]: people/bob.md";
+    const [edge] = extract(body);
+    // The rewritable span is the definition's destination, not the inline
+    // label — so repair edits the shared definition once.
+    expect(spanText(body, edge as RawEdge)).toBe("people/bob.md");
+  });
+
+  it("shortcut + collapsed references resolve their span to the definition", () => {
+    const body = "[carol] and [carol][]\n\n[carol]: people/carol.md";
+    const edges = extract(body);
+    expect(edges).toHaveLength(2);
+    // Both references share the single definition's destination span.
+    for (const e of edges) expect(spanText(body, e)).toBe("people/carol.md");
+    expect(edges[0]?.dest_span).toEqual(edges[1]?.dest_span);
+  });
+
+  it("omits the span for frontmatter edges", () => {
+    const edges = extract("", {
+      frontmatter: { parent: "p.md" },
+      config: mergeConfig(HARDCODED_DEFAULTS, { fields: ["parent"] }),
+    });
+    expect(edges[0]?.dest_span).toBeUndefined();
+  });
+
+  it("spans stay correct with multiple links on one line", () => {
+    const body = "[a](a.md) and [b](b.md)";
+    const edges = extract(body);
+    expect(spanText(body, edges[0] as RawEdge)).toBe("a.md");
+    expect(spanText(body, edges[1] as RawEdge)).toBe("b.md");
+  });
+});

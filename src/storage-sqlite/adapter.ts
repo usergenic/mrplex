@@ -10,6 +10,8 @@ import type {
   DocumentRow,
   FrontmatterJson,
   HistoryOptions,
+  LinkEdgeInput,
+  LinkRow,
   OpenConfig,
   RepoRow,
   Storage,
@@ -194,14 +196,14 @@ class SqliteStorage implements Storage {
 
   async repos_list(): Promise<RepoRow[]> {
     return this.db
-      .prepare("select id, slug, path_config, created_at from repos order by slug")
+      .prepare("select id, slug, path_config, link_config, created_at from repos order by slug")
       .all() as RepoRow[];
   }
 
   async repos_create(input: { slug: string; created_at: string }): Promise<RepoRow> {
     return this.db
       .prepare(
-        "insert into repos(slug, slug_norm, created_at) values (?, ?, ?) returning id, slug, path_config, created_at",
+        "insert into repos(slug, slug_norm, created_at) values (?, ?, ?) returning id, slug, path_config, link_config, created_at",
       )
       .get(input.slug, normalizeKey(input.slug), input.created_at) as RepoRow;
   }
@@ -209,7 +211,7 @@ class SqliteStorage implements Storage {
   async repos_rename(id: number, new_slug: string): Promise<RepoRow> {
     const row = this.db
       .prepare(
-        "update repos set slug = ?, slug_norm = ? where id = ? returning id, slug, path_config, created_at",
+        "update repos set slug = ?, slug_norm = ? where id = ? returning id, slug, path_config, link_config, created_at",
       )
       .get(new_slug, normalizeKey(new_slug), id) as RepoRow | undefined;
     if (!row) throw new Error(`repos_rename: repo ${id} not found`);
@@ -219,10 +221,20 @@ class SqliteStorage implements Storage {
   async repos_set_path_config(id: number, path_config: string | null): Promise<RepoRow> {
     const row = this.db
       .prepare(
-        "update repos set path_config = ? where id = ? returning id, slug, path_config, created_at",
+        "update repos set path_config = ? where id = ? returning id, slug, path_config, link_config, created_at",
       )
       .get(path_config, id) as RepoRow | undefined;
     if (!row) throw new Error(`repos_set_path_config: repo ${id} not found`);
+    return row;
+  }
+
+  async repos_set_link_config(id: number, link_config: string | null): Promise<RepoRow> {
+    const row = this.db
+      .prepare(
+        "update repos set link_config = ? where id = ? returning id, slug, path_config, link_config, created_at",
+      )
+      .get(link_config, id) as RepoRow | undefined;
+    if (!row) throw new Error(`repos_set_link_config: repo ${id} not found`);
     return row;
   }
 
@@ -230,7 +242,9 @@ class SqliteStorage implements Storage {
     // Case-insensitive identity: fold the query key to slug_norm (§3.5.1).
     return (
       (this.db
-        .prepare("select id, slug, path_config, created_at from repos where slug_norm = ?")
+        .prepare(
+          "select id, slug, path_config, link_config, created_at from repos where slug_norm = ?",
+        )
         .get(normalizeKey(slug)) as RepoRow | undefined) ?? null
     );
   }
@@ -238,7 +252,7 @@ class SqliteStorage implements Storage {
   async repos_by_id(id: number): Promise<RepoRow | null> {
     return (
       (this.db
-        .prepare("select id, slug, path_config, created_at from repos where id = ?")
+        .prepare("select id, slug, path_config, link_config, created_at from repos where id = ?")
         .get(id) as RepoRow | undefined) ?? null
     );
   }
@@ -336,6 +350,63 @@ class SqliteStorage implements Storage {
     // SQLite FTS5 external-content mode with AFTER INSERT triggers on
     // `versions` keeps the index in sync automatically (see migration
     // 0003_fts_docs.sql).
+  }
+
+  // Links derived index (design §11.2, migration 0005_links.sql).
+
+  async links_replace(
+    repo_id: number,
+    source_id: number,
+    edges: readonly LinkEdgeInput[],
+  ): Promise<void> {
+    return this.tx(async () => {
+      this.db.prepare("delete from links where source_id = ?").run(source_id);
+      if (edges.length === 0) return;
+      const insert = this.db.prepare(
+        `insert into links (repo_id, source_id, ord, field, target_raw, target_norm, target_id)
+         values (?, ?, ?, ?, ?, ?, ?)`,
+      );
+      for (const e of edges) {
+        insert.run(repo_id, source_id, e.ord, e.field, e.target_raw, e.target_norm, e.target_id);
+      }
+    });
+  }
+
+  async links_clear(source_id: number): Promise<void> {
+    this.db.prepare("delete from links where source_id = ?").run(source_id);
+  }
+
+  async links_resolve_dangling(
+    repo_id: number,
+    target_norm: string,
+    document_id: number,
+  ): Promise<number> {
+    const res = this.db
+      .prepare(
+        `update links set target_id = ?
+         where repo_id = ? and target_norm = ? and target_id is null
+           and source_id <> ?`,
+      )
+      .run(document_id, repo_id, target_norm, document_id);
+    return res.changes;
+  }
+
+  async links_by_source(source_id: number): Promise<LinkRow[]> {
+    return this.db
+      .prepare(
+        `select repo_id, source_id, ord, field, target_raw, target_norm, target_id
+         from links where source_id = ? order by ord`,
+      )
+      .all(source_id) as LinkRow[];
+  }
+
+  async links_by_repo(repo_id: number): Promise<LinkRow[]> {
+    return this.db
+      .prepare(
+        `select repo_id, source_id, ord, field, target_raw, target_norm, target_id
+         from links where repo_id = ? order by source_id, ord`,
+      )
+      .all(repo_id) as LinkRow[];
   }
 
   async versions_search(plan: SearchPlan): Promise<VersionRow[]> {

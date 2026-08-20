@@ -32,6 +32,7 @@
     "better-sqlite3": "^11.5.0",
     "commander": "^12.1.0",
     "diff": "^9.0.0",
+    "micromark": "^4.0.2",
     "pg": "^8.23.0",
     "sqlite-vec": "^0.1.9",
     "yaml": "^2.6.0"

@@ -16,6 +16,7 @@ export type KernelErrorCode =
   | "path_invalid"
   | "frontmatter_invalid"
   | "filter_invalid"
+  | "link_config_invalid" // repos.set_link_config: override fails validation post-merge (§11.2)
   | "stale_prev"
   | "create_conflict"
   | "path_taken"
@@ -62,6 +63,7 @@ export const KERNEL_ERROR_CODES: ReadonlySet<KernelErrorCode> = new Set<KernelEr
   "path_invalid",
   "frontmatter_invalid",
   "filter_invalid",
+  "link_config_invalid",
   "stale_prev",
   "create_conflict",
   "path_taken",

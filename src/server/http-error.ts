@@ -55,6 +55,7 @@ export function httpStatusFor(code: KernelErrorCode): number {
     case "path_invalid":
     case "frontmatter_invalid":
     case "filter_invalid":
+    case "link_config_invalid":
       return 400;
     case "rank_unavailable":
       return 503;

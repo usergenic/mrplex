@@ -668,5 +668,219 @@ export function runKernelSuite(factory: AdapterFactory): void {
         }
       });
     });
+
+    // -----------------------------------------------------------------
+    // Links — the derived graph index (design §11.2). These run on BOTH
+    // adapters, so they're the Postgres-parity referee for extraction,
+    // resolution, dangling rebind, moves, deletes, graph queries, and
+    // repair. Deliberately broad (redundant with the SQLite-only link
+    // test files) — parity is what this file exists to guarantee.
+    // -----------------------------------------------------------------
+    describe("links (graph index) — adapter parity", () => {
+      const mk = async (
+        actor: Actor,
+        path: string,
+        body: string,
+        frontmatter?: Record<string, unknown>,
+      ) => {
+        const fm = frontmatter ? { frontmatter } : { frontmatter_raw: "" };
+        return kernel.docs.create(actor, "notes", path, { ...fm, body });
+      };
+      const paths = async (actor: Actor, filter: string) =>
+        (await kernel.query(actor, { repo: "notes", filter })).map((v) => v.path).sort();
+
+      it("extracts + resolves an inline link on write", async () => {
+        const actor = await aliceActor();
+        await mk(actor, "horses.md", "neigh");
+        await mk(actor, "note.md", "see [h](horses.md)");
+        expect(await paths(actor, '$has_static("horses.md")')).toEqual(["note.md"]);
+        expect(await paths(actor, '$in_static("note.md")')).toEqual(["horses.md"]);
+      });
+
+      it("binds a dangling link when the target is created later", async () => {
+        const actor = await aliceActor();
+        await mk(actor, "note.md", "[f](future.md)");
+        // Dangling: nobody is "in note's set" as a resolved target yet.
+        expect(await paths(actor, '$in_static("note.md")')).toEqual([]);
+        await mk(actor, "future.md", "arrived");
+        expect(await paths(actor, '$in_static("note.md")')).toEqual(["future.md"]);
+      });
+
+      it("self-links are not indexed (no doc is in its own set / backlinks)", async () => {
+        const actor = await aliceActor();
+        await mk(actor, "self.md", "I link to [me](self.md) and [[self]]");
+        // self.md is neither in its own set nor a backlink of itself.
+        expect(await paths(actor, '$in_static("self.md")')).toEqual([]);
+        expect(await paths(actor, "$backlinks_static().size() > 0")).not.toContain("self.md");
+        expect(await paths(actor, "$links_static().size() == 0")).toContain("self.md");
+      });
+
+      it("a move keeps inbound edges resolved (identity-bound)", async () => {
+        const actor = await aliceActor();
+        const target = await mk(actor, "horses.md", "neigh");
+        await mk(actor, "note.md", "[h](horses.md)");
+        await kernel.docs.put(actor, "notes", target.version_id, "animals/horses.md", {});
+        // note.md still references the (moved) target.
+        expect(await paths(actor, '$has_static("horses.md")')).toEqual(["note.md"]);
+      });
+
+      it("delete clears the deleted doc's outbound edges", async () => {
+        const actor = await aliceActor();
+        await mk(actor, "a.md", "a");
+        const note = await mk(actor, "note.md", "[a](a.md)");
+        expect(await paths(actor, '$has_static("a.md")')).toEqual(["note.md"]);
+        await kernel.docs.delete(actor, "notes", note.version_id);
+        expect(await paths(actor, '$has_static("a.md")')).toEqual([]);
+      });
+
+      it("a source's inbound edge to a DELETED target is sigil-hidden from $has", async () => {
+        // note.md links to a.md; deleting a.md moves it into the :deleted
+        // namespace but leaves the inbound edge bound (identity). The edge
+        // must not surface via $has_static("**") — the target is now
+        // sigil-hidden, so the visible graph stays the readable graph.
+        const actor = await aliceActor();
+        const target = await mk(actor, "a.md", "a");
+        await mk(actor, "note.md", "[a](a.md)");
+        expect(await paths(actor, '$has_static("**")')).toContain("note.md");
+        await kernel.docs.delete(actor, "notes", target.version_id);
+        // The bound edge now points at a :deleted doc → excluded.
+        expect(await paths(actor, '$has_static("**")')).not.toContain("note.md");
+      });
+
+      it("membership set algebra composes", async () => {
+        const actor = await aliceActor();
+        await mk(actor, "alice.md", "a");
+        await mk(actor, "bob.md", "b");
+        await mk(actor, "moc/all.md", "[[alice]] [[bob]]");
+        await mk(actor, "moc/contractors.md", "[[bob]]");
+        expect(
+          await paths(actor, '$in_static("moc/all.md") && !$in_static("moc/contractors.md")'),
+        ).toEqual(["alice.md"]);
+      });
+
+      it("$links_static().size() and orphan detection", async () => {
+        const actor = await aliceActor();
+        await mk(actor, "leaf.md", "no links");
+        await mk(actor, "hub.md", "[l](leaf.md)");
+        expect(await paths(actor, "$links_static().size() == 0")).toContain("leaf.md");
+        // leaf.md is referenced; hub.md is an orphan (in nobody's set).
+        expect(await paths(actor, '!$in_static("**")')).toContain("hub.md");
+        expect(await paths(actor, '!$in_static("**")')).not.toContain("leaf.md");
+      });
+
+      it("$backlinks_static().exists(d, pred) predicates on the other doc", async () => {
+        const actor = await aliceActor();
+        await mk(actor, "cited.md", "c");
+        await mk(actor, "draft.md", "[c](cited.md)", { status: "draft" });
+        expect(await paths(actor, '$backlinks_static().exists(d, d.status == "draft")')).toEqual([
+          "cited.md",
+        ]);
+      });
+
+      it("dangling targets count for $has_static", async () => {
+        const actor = await aliceActor();
+        await mk(actor, "note.md", "[g](ghost.md)");
+        expect(await paths(actor, '$has_static("ghost.md")')).toEqual(["note.md"]);
+      });
+
+      it("graph predicates respect read scope (visible = readable)", async () => {
+        const admin = await aliceActor();
+        await mk(admin, "public.md", "p");
+        await mk(admin, "secret/moc.md", "[p](/public.md)");
+        const alice = await storage.users_by_slug("alice");
+        const notes = await storage.repos_by_slug("notes");
+        if (!alice || !notes) throw new Error("seed");
+        const scoped: Actor = {
+          user_id: alice.id,
+          admin: false,
+          scopes: [{ repos: [notes.id], read: ["**", "!secret/**"], write: [] }],
+        };
+        // Admin sees public.md is referenced; scoped caller can't read the
+        // secret source, so the edge is invisible.
+        expect(await paths(admin, '$in_static("**")')).toContain("public.md");
+        expect(await paths(scoped, '$in_static("**")')).not.toContain("public.md");
+      });
+
+      it("bare names ship now (== _static in Phase 1)", async () => {
+        const actor = await aliceActor();
+        await mk(actor, "alice.md", "a");
+        await mk(actor, "moc.md", "[[alice]]");
+        const bare = (await kernel.query(actor, { repo: "notes", filter: '$in("moc.md")' })).map(
+          (v) => v.path,
+        );
+        expect(bare).toEqual(["alice.md"]);
+      });
+
+      it("only _dyn names are reserved (need Phase 2)", async () => {
+        const actor = await aliceActor();
+        await mk(actor, "x.md", "x");
+        for (const filter of ['$in_dyn("x.md")', "$backlinks_dyn()"]) {
+          try {
+            await kernel.query(actor, { repo: "notes", filter });
+            throw new Error(`expected throw for ${filter}`);
+          } catch (err) {
+            expect((err as KernelError).code).toBe("filter_invalid");
+          }
+        }
+      });
+
+      it("links.stale + repair round-trip", async () => {
+        const actor = await aliceActor();
+        const target = await mk(actor, "horses.md", "neigh");
+        await mk(actor, "note.md", "see [h](horses.md)");
+        await kernel.docs.put(actor, "notes", target.version_id, "animals/horses.md", {});
+
+        const stale = await kernel.links.stale(actor, "notes");
+        expect(stale.map((s) => s.source_path)).toEqual(["note.md"]);
+
+        const res = await kernel.links.repair(actor, "notes");
+        expect(res.repaired).toEqual([{ path: "note.md", edges: 1 }]);
+        const note = await kernel.docs.get(actor, "notes", "note.md");
+        expect(note.body).toContain("animals/horses.md");
+        expect(await kernel.links.stale(actor, "notes")).toEqual([]);
+      });
+
+      it("backfill rebuilds the index consistently", async () => {
+        const actor = await aliceActor();
+        await mk(actor, "a.md", "a");
+        await mk(actor, "note.md", "[a](a.md)");
+        const report = await kernel.links.backfill(actor, "notes");
+        expect(report.documents).toBeGreaterThanOrEqual(2);
+        // Query still works after an explicit rebuild.
+        expect(await paths(actor, '$has_static("a.md")')).toEqual(["note.md"]);
+      });
+
+      it("repos.set_link_config enables frontmatter-field extraction + re-extracts", async () => {
+        const actor = await aliceActor();
+        await mk(actor, "moc/employees.md", "team");
+        await mk(actor, "alice.md", "hi", { parent: "moc/employees.md" });
+        // Default config: no frontmatter fields → the parent edge isn't indexed.
+        expect(await paths(actor, '$has_static("moc/employees.md", "parent")')).toEqual([]);
+
+        // Opt into the `parent` field; the op re-extracts the whole repo.
+        const res = await kernel.repos.set_link_config(actor, "notes", { fields: ["parent"] });
+        expect(res.repo.repo).toBe("notes");
+        expect(res.reindexed.documents).toBeGreaterThanOrEqual(2);
+
+        // Now the field edge is queryable.
+        expect(await paths(actor, '$has_static("moc/employees.md", "parent")')).toEqual([
+          "alice.md",
+        ]);
+
+        // Clearing the override re-extracts back to defaults (edge gone).
+        await kernel.repos.set_link_config(actor, "notes", null);
+        expect(await paths(actor, '$has_static("moc/employees.md", "parent")')).toEqual([]);
+      });
+
+      it("repos.set_link_config rejects an invalid override", async () => {
+        const actor = await aliceActor();
+        try {
+          await kernel.repos.set_link_config(actor, "notes", { fields: ["bad index[0]"] });
+          throw new Error("expected throw");
+        } catch (err) {
+          expect((err as KernelError).code).toBe("link_config_invalid");
+        }
+      });
+    });
   });
 }
