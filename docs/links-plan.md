@@ -43,7 +43,7 @@ Branch `links` is cut from `main` (post-M5).
 
 **Out (deliberately):**
 
-- **Embedded queries, the `--in` operator, and all `_dyn` / bare-name variants** (§11.2 Phase 2; §11 `--in` bullet). Dynamic membership resolves at query time against embedded queries in list docs — a genuinely deep separate concern (repo-global invalidation, predicate inversion, corpus-bounded fan-out, `--dyn-scope` cap, `dynamic_scope_exceeded`). Phase 1 ships only `_static`; the bare names `$in` / `$has` / `$backlinks()` / `$links()` are **reserved, not implemented** — they land in Phase 2 alongside `_dyn` so bare-name union semantics are stable from birth (§11.2 "Phasing"). Writing `$in` in Phase 1 is a `filter_invalid` with a "use `$in_static` until Phase 2" message.
+- **Embedded queries, the `--in` operator, and the `_dyn` half of the union** (§11.2 Phase 2; §11 `--in` bullet). Dynamic membership resolves at query time against embedded queries in list docs — a genuinely deep separate concern (repo-global invalidation, predicate inversion, corpus-bounded fan-out, `--dyn-scope` cap, `dynamic_scope_exceeded`). Phase 1 ships the **bare names** `$in` / `$has` / `$backlinks()` / `$links()` (resolving to the static index today) plus the `_static` pin-to-static forms; the bare names widen to static∪dynamic when Phase 2 lands (see §5 decision 3). Only `$in_dyn`/… are `filter_invalid` in Phase 1.
 - **Multi-hop traversal `$reachable_from(...)`** (§11.2 "Multi-hop traversal", syntax `[OPEN]`). Recursive-CTE feasibility is settled but the syntax is open and it's static-only anyway; defer to keep Phase 1 single-hop.
 - **`auto_repair` policy** (§11.2 `[OPEN]`) — server-side repair loop after each move. Phase 1 ships the manual `mrplex links repair` trigger; the worker-driven variant is additive (identical mechanism, different trigger).
 - **Cross-repo references** (§11.2 `[OPEN]`, "Links are repo-local in this sketch"). Extraction and resolution are repo-local.
@@ -197,7 +197,7 @@ This document. Follows the m0–m5 skeleton (Target quote → §1 Scope In/Out �
   - `$backlinks_static()` / `$links_static()` as a **collection**: extend `compileSize` (`:376`) so `size($backlinks_static())` → `(SELECT COUNT(*) FROM links l ... WHERE ...)`; extend `compileComprehension` (`:435`) so `.exists(d, pred)` / `.all(d, pred)` iterate the joined *other-document* versions, compiling `pred` against that document's frontmatter/intrinsics (the iter-var substitution machinery at `:583` generalizes from `json_each` rows to a joined `versions` alias).
   - **Field restriction** = the optional 2nd arg → `AND l.field = ?` (or `l.field = '$body'` for the sentinel). `_dyn` rejection: a field arg is only legal on `_static` (bare/`_dyn` don't exist yet anyway → `filter_invalid`).
   - **Scope**: the subquery's `src`/`target` versions carry the same scope predicate the outer `SearchPlan.scope` compiles to (§8.2) — factor the scope-fragment builder so the graph subquery reuses it. This is what makes "visible graph = readable graph" true.
-- Bare `$in` / `$has` / `$backlinks` / `$links` (no suffix) → `filter_invalid` with "reserved for Phase 2, use `$in_static` etc." (keeps Phase 2 bare-name semantics unpolluted).
+- Bare `$in` / `$has` / `$backlinks()` / `$links()` compile identically to their `_static` forms in Phase 1 (the static set is the whole union today). Only `_dyn` forms → `filter_invalid` (need embedded queries).
 - **Acceptance:** `links-graph.test.ts` green on **both** adapters (parity is the referee): membership, set difference/intersection/union, `!$in_static("**")` orphan, `.size() == 0` leaf, `.exists`/`.all` over target fields, field-argument forms, `$body` restriction, scope-drop (a caller who can't read the source/target sees no edge). `compile-postgres` cases mirror `compile-sqlite` case-for-case (M5 precedent, `$n` numbering discipline).
 
 ### WS5 — `links.stale` + `mrplex links repair` (M)
@@ -234,7 +234,7 @@ WS1–WS2 are self-contained and land as independent green commits before any ke
 
 1. **Synchronous in-transaction extraction, not the backlog worker.** §11.2 says "extracted by the same post-write worker," but that wording predates the observation that link extraction — unlike embedding (§5.3) — has **no external I/O**: it's pure CPU over `body` + `frontmatter`. So the reasons embedding is async (never fail a write, dedup, exponential backoff, model changes) don't apply. Running extraction inside the version-insert `tx` (the kernel closures at `kernel.ts:437/:503/:580`) buys read-your-writes graph consistency — a `query` immediately after a `docs.put` sees the new edges, and tests/CLI don't race a worker. The FTS *trigger* (`0003_fts_docs.sql`) is the "in-tx derived index" precedent; links ride the kernel tx instead of a SQL trigger only because extraction is TS, not SQL. **Rejected alternative:** enqueue + drain on the existing worker (matches §11.2's literal "worker" wording, reuses backlog infra) — rejected because eventually-consistent backlinks create a read-your-writes gap with no compensating benefit here. *Update §11.2's "worker" language to "in the write path" for extraction; the worker still owns config-change re-extraction and backfill.*
 2. **A real CommonMark parser is a dependency, not a regex.** Add `micromark` (recommended: small, spec-conformant, token-stream API that skips code spans/fences by construction) or `markdown-it`. Correctness of "links in code fences aren't links," reference-link resolution, and treating an `!`-embed as an ordinary edge (not a special type) justifies the dep — the same reasoning that took `@bufbuild/cel` over a hand-rolled parser. Wikilinks + frontmatter fields layer on top. **Pin the exact package in WS2.**
-3. **`_static`-only Phase 1; bare names reserved and erroring.** Ship `$in_static`/`$has_static`/`$backlinks_static()`/`$links_static()` (incl. field args). Bare `$in`/`$has`/`$backlinks()`/`$links()` return `filter_invalid` ("reserved for Phase 2") rather than aliasing to static — so Phase 2's union semantics are stable from birth (§11.2 "Phasing" is explicit that bare-name meaning must not shift). *This is the design's stated intent; pinned here against the temptation to make bare names "just work" now.*
+3. **Ship bare names AND `_static` forms; only `_dyn` is reserved.** *(Revised during implementation — supersedes the original "bare names reserved" stance.)* Ship `$in`/`$has`/`$backlinks()`/`$links()` **and** `$in_static`/… — both resolve against the static index today. The bare name is *defined* as the future union `$x_static ∪ $x_dyn`; with no dynamic edges in Phase 1 the union equals the static set, so `$in` == `$in_static` for now and widens transparently when Phase 2 adds embedded queries. `_static` is the "pin to static, never widen" form. Only `$in_dyn`/… return `filter_invalid` (they need embedded queries). Rationale: there are no filters written against the old reserved behavior, and the README documents the widening contract, so shipping the ergonomic bare names now costs nothing and matches what users reach for. `$in_static` remains available for anyone who wants to intentionally restrict to written links forever.
 4. **Per-repo `link_config` storage shape.** Either a new `link_config` JSON column on `repos` or fold into existing per-repo config. Decide in WS1 by reading how `path_config` is stored/plumbed (`repos.path_config`, `parseRepoOverride`) and matching it. Lean: mirror `path_config` exactly (own JSON column + `set_link_config` op) for symmetry.
 5. **Scope-respecting graph subqueries.** The compiled `$*_static` subqueries must apply the caller's read-scope predicate to both source and target versions (§11.2 "Scope interaction"). Factor the `SearchPlan.scope` → SQL fragment builder so the graph subquery reuses it verbatim on both adapters. *Pin: no graph predicate may reveal an edge whose source or target the caller couldn't read directly.*
 6. **Dangling re-resolution runs in the write tx too.** `links_resolve_dangling(repo_id, path, document_id)` on create / move-in / restore is a cheap indexed UPDATE, so it rides the same tx — no separate pass except in backfill. *Pin the invariant: after any write, the index is fully consistent with the live corpus (no eventual-consistency window).*
@@ -251,21 +251,23 @@ mrplex docs put notes moc/employees.md --body '- [[alice]]
 mrplex docs put notes alice.md --frontmatter 'parent: moc/employees.md' --body 'see [horses](../horses.md)'
 mrplex links backfill --repo notes            # or automatic on write
 
-# Graph queries — static set algebra (§11.2)
-mrplex query --repo notes --filter '$in_static("moc/employees.md")'          # alice, bob
-mrplex query --repo notes --filter '$in_static("moc/**") && !$in_static("moc/contractors.md")'
-mrplex query --repo notes --filter '$has_static("horses.md")'                # alice (dangling target ok)
-mrplex query --repo notes --filter '$has_static("moc/employees.md", "parent")'  # field-restricted
-mrplex query --repo notes --filter '$links_static().size() == 0'             # leaf nodes
-mrplex query --repo notes --filter '!$in_static("**")'                       # orphans
-mrplex query --repo notes --filter '$backlinks_static().exists(d, d.status == "draft")'
-
-# Reserved bare names error clearly (Phase 2)
-mrplex query --repo notes --filter '$in("x")'   # → filter_invalid: reserved for Phase 2, use $in_static
+# Graph queries — bare-name set algebra (§11.2). Bare names resolve to the
+# static index today and widen to static∪dynamic in Phase 2; use _static to
+# pin to written links forever.
+mrplex query --repo notes --filter '$in("moc/employees.md")'          # alice, bob
+mrplex query --repo notes --filter '$in("moc/**") && !$in("moc/contractors.md")'
+mrplex query --repo notes --filter '$has("horses.md")'                # alice (dangling target ok)
+mrplex query --repo notes --filter '$has("moc/employees.md", "parent")'  # field-restricted
+mrplex query --repo notes --filter '$links().size() == 0'             # leaf nodes
+mrplex query --repo notes --filter '!$in("**")'                       # orphans
+mrplex query --repo notes --filter '$backlinks().exists(d, d.status == "draft")'
+mrplex query --repo notes --filter '$in_static("moc/employees.md")'   # pinned to written links
+# Only the _dyn forms error until Phase 2 ships embedded queries
+mrplex query --repo notes --filter '$in_dyn("x")'   # → filter_invalid: needs Phase 2
 
 # Identity survives rename; text goes stale; repair fixes text
 mrplex docs move notes alice.md people/alice.md
-mrplex query --repo notes --filter '$in_static("moc/employees.md")'          # still includes alice (identity-bound)
+mrplex query --repo notes --filter '$in("moc/employees.md")'          # still includes alice (identity-bound)
 mrplex links stale --repo notes                                              # employees.md's [[alice]] text is stale
 mrplex links repair --repo notes                                             # rewrites as normal authored versions
 
@@ -274,7 +276,7 @@ npm test                                          # SQLite: all green
 MRPLEX_TEST_POSTGRES_URL=postgres://… npm test    # both adapters, one suite
 ```
 
-Invariants: shared kernel suite green on both adapters; graph filters compile on both dialects with byte-parity test coverage; the index is fully consistent with the live corpus after every write (no eventual-consistency window); moves produce zero inbound edge churn; deleted docs' inbound edges persist but never surface in live-namespace queries; a caller never sees a graph edge whose endpoints they couldn't read directly; bare intrinsic names remain unimplemented (reserved) so Phase 2 union semantics stay clean; only new runtime dep is the CommonMark parser.
+Invariants: shared kernel suite green on both adapters; graph filters compile on both dialects with byte-parity test coverage; the index is fully consistent with the live corpus after every write (no eventual-consistency window); moves produce zero inbound edge churn; deleted docs' inbound edges persist but never surface in live-namespace queries; a caller never sees a graph edge whose endpoints they couldn't read directly; bare intrinsic names resolve to the static index today and are documented to widen to static∪dynamic in Phase 2 (`_static` pins to written links); only `_dyn` forms error; only new runtime dep is the CommonMark parser.
 
 ## 7. Key risks
 

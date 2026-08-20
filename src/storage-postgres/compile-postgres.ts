@@ -394,7 +394,7 @@ function compileCall(expr: CelExpr, b: Builder): string {
 
   if (asGraphCollection(expr)) {
     throw new KernelError("filter_invalid", {
-      reason: `$${(asGraphCollection(expr) as GraphCollection).direction}_static() is a collection; use .size(), .exists(), or .all()`,
+      reason: `$${(asGraphCollection(expr) as GraphCollection).direction}() is a collection; use .size(), .exists(), or .all()`,
     });
   }
 

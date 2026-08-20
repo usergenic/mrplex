@@ -778,10 +778,20 @@ export function runKernelSuite(factory: AdapterFactory): void {
         expect(await paths(scoped, '$in_static("**")')).not.toContain("public.md");
       });
 
-      it("reserved Phase-2 names are rejected", async () => {
+      it("bare names ship now (== _static in Phase 1)", async () => {
+        const actor = await aliceActor();
+        await mk(actor, "alice.md", "a");
+        await mk(actor, "moc.md", "[[alice]]");
+        const bare = (await kernel.query(actor, { repo: "notes", filter: '$in("moc.md")' })).map(
+          (v) => v.path,
+        );
+        expect(bare).toEqual(["alice.md"]);
+      });
+
+      it("only _dyn names are reserved (need Phase 2)", async () => {
         const actor = await aliceActor();
         await mk(actor, "x.md", "x");
-        for (const filter of ['$in("x.md")', "$backlinks()", '$in_dyn("x.md")']) {
+        for (const filter of ['$in_dyn("x.md")', "$backlinks_dyn()"]) {
           try {
             await kernel.query(actor, { repo: "notes", filter });
             throw new Error(`expected throw for ${filter}`);

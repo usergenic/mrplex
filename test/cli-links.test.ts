@@ -61,9 +61,17 @@ describe("cli links", () => {
     expect(rows.map((r) => r.path)).toEqual(["alice.md"]);
   });
 
-  it("reserved bare name errors with a clear message (exit 1)", async () => {
+  it("bare $in works (== $in_static today)", async () => {
+    createDoc("alice.md", "hi");
+    createDoc("moc.md", "- [[alice]]");
+    const out = run(["--json", "-r", "notes", "query", "--filter", '$in("moc.md")']);
+    expect(out.status).toBe(0);
+    expect((JSON.parse(out.stdout) as { path: string }[]).map((r) => r.path)).toEqual(["alice.md"]);
+  });
+
+  it("reserved _dyn name errors with a clear message (exit 1)", async () => {
     createDoc("x.md", "hi");
-    const out = run(["-r", "notes", "query", "--filter", '$in("x.md")']);
+    const out = run(["-r", "notes", "query", "--filter", '$in_dyn("x.md")']);
     expect(out.status).toBe(1);
     expect(out.stderr).toMatch(/Phase 2|_static/);
   });

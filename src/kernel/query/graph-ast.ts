@@ -15,9 +15,14 @@
  * iterRange of `.exists()`/`.all()`; a bare collection call as a boolean is
  * rejected by the dialect compiler (it never reaches a boolean context).
  *
- * Phase 1 ships only the `_static` variants. The bare names ($in/$has/…)
- * and the `_dyn` variants are reserved for Phase 2 and rejected here so
- * their union semantics stay clean when they land (§11.2 "Phasing").
+ * Phasing (§11.2): Phase 1 ships the **bare names** ($in/$has/$backlinks()/
+ * $links()) AND their `_static` forms — both resolve against the static
+ * index today. The bare name is defined as the future union $x_static ∪
+ * $x_dyn; with no dynamic edges yet, that union IS the static set, so
+ * `$in` == `$in_static` for now. When Phase 2 adds embedded queries, `$in`
+ * transparently widens to include them while `$in_static` stays pinned to
+ * the index. Only the `_dyn` variants are unimplemented (they need
+ * embedded queries) and are rejected with an actionable error.
  */
 
 import { KernelError } from "../errors.js";
@@ -45,23 +50,30 @@ export type GraphCollection = {
   direction: "backlinks" | "links";
 };
 
+// Bare names AND their `_static` forms both map to the static index today.
+// The bare name is the DESIGNED-FOR-THE-FUTURE union $x_static ∪ $x_dyn
+// (§11.2); Phase 1 has no dynamic edges, so the union is exactly the static
+// set — so `$in` == `$in_static` for now, and callers who want to *stay*
+// static-only forever write `$in_static`. When Phase 2 lands embedded
+// queries, `$in` transparently widens to include them; `$in_static` does
+// not. Only `_dyn` is unimplemented (it needs embedded queries).
 const MEMBERSHIP_FNS: Record<string, "in" | "has"> = {
+  [`${P}in`]: "in",
   [`${P}in_static`]: "in",
+  [`${P}has`]: "has",
   [`${P}has_static`]: "has",
 };
 
 const COLLECTION_FNS: Record<string, "backlinks" | "links"> = {
+  [`${P}backlinks`]: "backlinks",
   [`${P}backlinks_static`]: "backlinks",
+  [`${P}links`]: "links",
   [`${P}links_static`]: "links",
 };
 
-// Bare names + _dyn variants — reserved for Phase 2 (§11.2). Recognized only
-// to produce a clear error, never compiled.
+// `_dyn` variants — reserved until Phase 2 ships embedded queries. Recognized
+// only to produce a clear error, never compiled.
 const RESERVED_FNS = new Set<string>([
-  `${P}in`,
-  `${P}has`,
-  `${P}backlinks`,
-  `${P}links`,
   `${P}in_dyn`,
   `${P}has_dyn`,
   `${P}backlinks_dyn`,
@@ -74,16 +86,16 @@ function reservedName(fn: string): string {
 }
 
 /**
- * Throw if `fn` is a reserved Phase-2 graph name. Called by the dialect
+ * Throw if `fn` is a reserved (`_dyn`) graph name. Called by the dialect
  * compilers before their generic "unsupported function" fallthrough so the
- * message is actionable ("use $in_static").
+ * message is actionable ("use $in / $in_static").
  */
 export function assertNotReservedGraphName(fn: string): void {
   if (RESERVED_FNS.has(fn)) {
     const name = reservedName(fn);
     const base = name.replace(/_dyn$/, "");
     throw new KernelError("filter_invalid", {
-      reason: `${name}() is reserved for Phase 2 (embedded queries); use ${base}_static() for the static link index`,
+      reason: `${name}() needs Phase 2 (embedded queries); use ${base}() (static today, static∪dynamic later) or ${base}_static() to stay static-only`,
     });
   }
 }
@@ -100,20 +112,26 @@ function stringArg(expr: CelExpr | undefined): string | undefined {
  * structured form; otherwise null. Throws filter_invalid on a malformed
  * call (wrong arity, non-string args) so mistakes surface clearly.
  */
+/** Human name for a mangled graph fn (`__mrplex_i_in` → `$in`). */
+function displayName(fn: string): string {
+  return `$${fn.slice(P.length)}`;
+}
+
 export function asGraphMembership(expr: CelExpr): GraphMembership | null {
   if (expr.exprKind.case !== "callExpr") return null;
   const call = expr.exprKind.value;
   const direction = MEMBERSHIP_FNS[call.function];
   if (!direction) return null;
+  const name = displayName(call.function);
   if (call.target !== undefined) {
     throw new KernelError("filter_invalid", {
-      reason: `$${direction}_static is a free function, not a method`,
+      reason: `${name} is a free function, not a method`,
     });
   }
   const glob = stringArg(call.args[0]);
   if (glob === undefined || call.args.length < 1 || call.args.length > 2) {
     throw new KernelError("filter_invalid", {
-      reason: `$${direction}_static(path-or-glob [, field]) takes a string glob and an optional string field`,
+      reason: `${name}(path-or-glob [, field]) takes a string glob and an optional string field`,
     });
   }
   let field: string | undefined;
@@ -121,7 +139,7 @@ export function asGraphMembership(expr: CelExpr): GraphMembership | null {
     field = stringArg(call.args[1]);
     if (field === undefined) {
       throw new KernelError("filter_invalid", {
-        reason: `$${direction}_static field argument must be a string`,
+        reason: `${name} field argument must be a string`,
       });
     }
   }
@@ -129,8 +147,8 @@ export function asGraphMembership(expr: CelExpr): GraphMembership | null {
 }
 
 /**
- * If `expr` is a collection call ($backlinks_static() / $links_static()),
- * return its structured form; otherwise null. Throws on a call with args.
+ * If `expr` is a collection call ($backlinks / $links, or their _static
+ * forms), return its structured form; otherwise null. Throws on args.
  */
 export function asGraphCollection(expr: CelExpr): GraphCollection | null {
   if (expr.exprKind.case !== "callExpr") return null;
@@ -139,7 +157,7 @@ export function asGraphCollection(expr: CelExpr): GraphCollection | null {
   if (!direction) return null;
   if (call.target !== undefined || call.args.length !== 0) {
     throw new KernelError("filter_invalid", {
-      reason: `$${direction}_static() takes no arguments`,
+      reason: `${displayName(call.function)}() takes no arguments`,
     });
   }
   return { direction };

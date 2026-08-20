@@ -220,8 +220,39 @@ describe("$links_static() / $backlinks_static() collections", () => {
   });
 });
 
-describe("reserved Phase-2 names error clearly", () => {
-  const reserved = ['$in("x")', '$has("x")', "$backlinks()", "$links()", '$in_dyn("x")'];
+describe("bare names ship now (static today, static∪dynamic later)", () => {
+  it("$in behaves like $in_static in Phase 1", async () => {
+    await create("alice.md");
+    await create("moc.md", { body: "[[alice]]" });
+    expect(await q('$in("moc.md")')).toEqual(await q('$in_static("moc.md")'));
+    expect(await q('$in("moc.md")')).toEqual(["alice.md"]);
+  });
+
+  it("$has behaves like $has_static", async () => {
+    await create("horses.md");
+    await create("note.md", { body: "[h](horses.md)" });
+    expect(await q('$has("horses.md")')).toEqual(["note.md"]);
+  });
+
+  it("$backlinks() and $links() collections work bare", async () => {
+    await create("leaf.md");
+    await create("hub.md", { body: "[l](leaf.md)" });
+    expect(await q("$links().size() == 0")).toEqual(["leaf.md"]);
+    expect(await q("$backlinks().size() == 1")).toEqual(["leaf.md"]);
+  });
+
+  it("bare + _static compose together (same static set today)", async () => {
+    await create("alice.md");
+    await create("bob.md");
+    await create("moc/all.md", { body: "[[alice]] [[bob]]" });
+    await create("moc/contractors.md", { body: "[[bob]]" });
+    // bare $in on the left, _static on the right — bob is excluded.
+    expect(await q('$in("moc/all.md") && !$in_static("moc/contractors.md")')).toEqual(["alice.md"]);
+  });
+});
+
+describe("only _dyn names are reserved (need Phase 2 embedded queries)", () => {
+  const reserved = ['$in_dyn("x")', '$has_dyn("x")', "$backlinks_dyn()", "$links_dyn()"];
   for (const f of reserved) {
     it(`${f} → filter_invalid`, async () => {
       await create("x.md");
@@ -231,6 +262,9 @@ describe("reserved Phase-2 names error clearly", () => {
       } catch (err) {
         expect(err).toBeInstanceOf(KernelError);
         expect((err as KernelError).code).toBe("filter_invalid");
+        expect((err as KernelError).data).toMatchObject({
+          reason: expect.stringMatching(/Phase 2|_static/),
+        });
       }
     });
   }
