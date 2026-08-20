@@ -1,11 +1,11 @@
 /**
  * MCP tool registry — design §6.2.
  *
- * 24 tools mirroring the kernel one-to-one. Each entry names the tool,
+ * 25 tools mirroring the kernel one-to-one. Each entry names the tool,
  * describes it, carries a JSON Schema for the input, and delegates to a
  * kernel call with the resolved actor. M4 added `docs_diff` (the tool
  * m3 deferred); §11.2 added `links_backfill` / `links_stale` /
- * `links_repair`.
+ * `links_repair` and `repos_set_link_config`.
  *
  * Results shape:
  *   • On success: { structured, text } — structured is the wire type,
@@ -20,6 +20,7 @@ import type { Kernel } from "../kernel/kernel.js";
 import type { PathConfigOverride } from "../kernel/path-config.js";
 import type { QuerySpec } from "../kernel/query/query.js";
 import type { Version } from "../kernel/wire.js";
+import type { LinkConfigOverride } from "../links/link-config.js";
 import { appendSystemProperty, extractSystemProperties } from "../markdown/frontmatter.js";
 import {
   renderJson,
@@ -242,6 +243,36 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       const cfg = args.config as PathConfigOverride | null;
       const result = await kernel.repos.set_path_config(actor, argStr(args, "repo"), cfg);
       return { structured: result, text: `warnings: ${result.warnings.length}` };
+    },
+  },
+  {
+    name: "repos_set_link_config",
+    description:
+      "Set (or clear) a repo's link-extraction config override (§11.2); re-extracts the repo under the new config. Pass config = null to clear.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string" },
+        config: {
+          oneOf: [
+            {
+              type: "object",
+              additionalProperties: true,
+              description: "LinkConfig override — syntaxes / fields / resolution (§11.2).",
+            },
+            { type: "null" },
+          ],
+        },
+      },
+      required: ["repo", "config"],
+    },
+    handler: async (kernel, actor, args) => {
+      const cfg = args.config as LinkConfigOverride | null;
+      const result = await kernel.repos.set_link_config(actor, argStr(args, "repo"), cfg);
+      return {
+        structured: result,
+        text: `link_config updated; reindexed ${result.reindexed.documents} doc(s), ${result.reindexed.edges} edge(s)`,
+      };
     },
   },
 

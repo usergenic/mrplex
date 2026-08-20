@@ -17,10 +17,16 @@ import type { ScopeInput } from "../kernel/auth/scope.js";
 import type { UnifiedDiff } from "../kernel/diff.js";
 import { KernelError, isKernelErrorCode } from "../kernel/errors.js";
 import type { FrontmatterInput } from "../kernel/frontmatter-input.js";
-import type { LinksBackfillResult, RepairResult, StaleLinkWire } from "../kernel/kernel.js";
+import type {
+  LinksBackfillResult,
+  RepairResult,
+  SetLinkConfigResult,
+  StaleLinkWire,
+} from "../kernel/kernel.js";
 import type { PathConfigOverride } from "../kernel/path-config.js";
 import type { QuerySpec } from "../kernel/query/query.js";
 import type { PathWarning, Repo, Token, User, Version } from "../kernel/wire.js";
+import type { LinkConfigOverride } from "../links/link-config.js";
 import type {
   HistoryOptions,
   KernelClient,
@@ -121,6 +127,8 @@ function buildRemoteClient(client: Client): KernelClient {
       delete: (slug) => call<Repo>("repos_delete", { repo: slug }),
       set_path_config: (slug, cfg: PathConfigOverride | null) =>
         call<SetPathConfigResult>("repos_set_path_config", { repo: slug, config: cfg }),
+      set_link_config: (slug, cfg: LinkConfigOverride | null) =>
+        call<SetLinkConfigResult>("repos_set_link_config", { repo: slug, config: cfg }),
     },
     users: {
       list: () => callList<User>("users_list", {}),

@@ -13,10 +13,16 @@
 import type { ScopeInput } from "../kernel/auth/scope.js";
 import type { UnifiedDiff } from "../kernel/diff.js";
 import type { FrontmatterInput } from "../kernel/frontmatter-input.js";
-import type { LinksBackfillResult, RepairResult, StaleLinkWire } from "../kernel/kernel.js";
+import type {
+  LinksBackfillResult,
+  RepairResult,
+  SetLinkConfigResult,
+  StaleLinkWire,
+} from "../kernel/kernel.js";
 import type { PathConfigOverride } from "../kernel/path-config.js";
 import type { QuerySpec } from "../kernel/query/query.js";
 import type { PathWarning, Repo, Token, User, Version } from "../kernel/wire.js";
+import type { LinkConfigOverride } from "../links/link-config.js";
 
 export type HistoryOptions = { limit?: number; before?: string };
 export type SetPathConfigResult = { repo: Repo; warnings: PathWarning[] };
@@ -39,6 +45,7 @@ export type KernelClient = {
     rename(slug: string, new_slug: string): Promise<Repo>;
     delete(slug: string): Promise<Repo>;
     set_path_config(slug: string, config: PathConfigOverride | null): Promise<SetPathConfigResult>;
+    set_link_config(slug: string, config: LinkConfigOverride | null): Promise<SetLinkConfigResult>;
   };
   users: {
     list(): Promise<User[]>;

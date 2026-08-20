@@ -76,6 +76,7 @@ function buildClient(
       rename: (slug, ns) => kernel.repos.rename(actor, slug, ns),
       delete: (slug) => kernel.repos.delete(actor, slug),
       set_path_config: (slug, cfg) => kernel.repos.set_path_config(actor, slug, cfg),
+      set_link_config: (slug, cfg) => kernel.repos.set_link_config(actor, slug, cfg),
     },
     users: {
       list: () => kernel.users.list(actor),

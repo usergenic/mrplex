@@ -724,6 +724,20 @@ export function runKernelSuite(factory: AdapterFactory): void {
         expect(await paths(actor, '$has_static("a.md")')).toEqual([]);
       });
 
+      it("a source's inbound edge to a DELETED target is sigil-hidden from $has", async () => {
+        // note.md links to a.md; deleting a.md moves it into the :deleted
+        // namespace but leaves the inbound edge bound (identity). The edge
+        // must not surface via $has_static("**") — the target is now
+        // sigil-hidden, so the visible graph stays the readable graph.
+        const actor = await aliceActor();
+        const target = await mk(actor, "a.md", "a");
+        await mk(actor, "note.md", "[a](a.md)");
+        expect(await paths(actor, '$has_static("**")')).toContain("note.md");
+        await kernel.docs.delete(actor, "notes", target.version_id);
+        // The bound edge now points at a :deleted doc → excluded.
+        expect(await paths(actor, '$has_static("**")')).not.toContain("note.md");
+      });
+
       it("membership set algebra composes", async () => {
         const actor = await aliceActor();
         await mk(actor, "alice.md", "a");
@@ -825,6 +839,38 @@ export function runKernelSuite(factory: AdapterFactory): void {
         expect(report.documents).toBeGreaterThanOrEqual(2);
         // Query still works after an explicit rebuild.
         expect(await paths(actor, '$has_static("a.md")')).toEqual(["note.md"]);
+      });
+
+      it("repos.set_link_config enables frontmatter-field extraction + re-extracts", async () => {
+        const actor = await aliceActor();
+        await mk(actor, "moc/employees.md", "team");
+        await mk(actor, "alice.md", "hi", { parent: "moc/employees.md" });
+        // Default config: no frontmatter fields → the parent edge isn't indexed.
+        expect(await paths(actor, '$has_static("moc/employees.md", "parent")')).toEqual([]);
+
+        // Opt into the `parent` field; the op re-extracts the whole repo.
+        const res = await kernel.repos.set_link_config(actor, "notes", { fields: ["parent"] });
+        expect(res.repo.repo).toBe("notes");
+        expect(res.reindexed.documents).toBeGreaterThanOrEqual(2);
+
+        // Now the field edge is queryable.
+        expect(await paths(actor, '$has_static("moc/employees.md", "parent")')).toEqual([
+          "alice.md",
+        ]);
+
+        // Clearing the override re-extracts back to defaults (edge gone).
+        await kernel.repos.set_link_config(actor, "notes", null);
+        expect(await paths(actor, '$has_static("moc/employees.md", "parent")')).toEqual([]);
+      });
+
+      it("repos.set_link_config rejects an invalid override", async () => {
+        const actor = await aliceActor();
+        try {
+          await kernel.repos.set_link_config(actor, "notes", { fields: ["bad index[0]"] });
+          throw new Error("expected throw");
+        } catch (err) {
+          expect((err as KernelError).code).toBe("link_config_invalid");
+        }
       });
     });
   });

@@ -31,18 +31,20 @@ export function compileSearchPlan(plan: SearchPlan): CompiledSql {
   for (const id of plan.repo_ids) params.push(id);
 
   // Optional CEL filter. Graph predicates ($in_static etc.) need to apply
-  // the caller's read scope to the OTHER endpoint of an edge, so hand the
-  // filter compiler a scope-fragment builder bound to this plan's scope.
+  // the caller's visibility filter — BOTH read scope AND sigil-exclusion —
+  // to the OTHER endpoint of an edge (§11.2 "visible graph = readable
+  // graph"), so hand the filter compiler builders bound to this plan.
   if (plan.filter_ast) {
     const compiled = compileFilter(plan.filter_ast, {
       graphScope: (alias: string) => scopeFragmentForAlias(plan.scope, alias),
+      graphSigils: (alias: string) => compileSigilExclusion(plan.sigils, alias),
     });
     clauses.push(`(${compiled.sql})`);
     for (const p of compiled.params) params.push(p);
   }
 
   // Sigil exclusion.
-  const sigilFrag = compileSigilExclusion(plan.sigils);
+  const sigilFrag = compileSigilExclusion(plan.sigils, "versions");
   if (sigilFrag.sql.length > 0) {
     clauses.push(sigilFrag.sql);
     for (const p of sigilFrag.params) params.push(p);
@@ -95,7 +97,7 @@ export function compileSearchPlan(plan: SearchPlan): CompiledSql {
   return { sql, params };
 }
 
-function compileSigilExclusion(groups: readonly SigilExclusion[]): CompiledSql {
+function compileSigilExclusion(groups: readonly SigilExclusion[], alias: string): CompiledSql {
   const clauses: string[] = [];
   const params: (string | number | bigint | null)[] = [];
   for (const group of groups) {
@@ -106,12 +108,12 @@ function compileSigilExclusion(groups: readonly SigilExclusion[]): CompiledSql {
     const sigilClauses: string[] = [];
     for (const sigil of group.sigils) {
       const escaped = sigil.replace(/[\\%_]/g, (ch) => `\\${ch}`);
-      sigilClauses.push("versions.path NOT LIKE ? ESCAPE '\\'");
-      sigilClauses.push("versions.path NOT LIKE ? ESCAPE '\\'");
+      sigilClauses.push(`${alias}.path NOT LIKE ? ESCAPE '\\'`);
+      sigilClauses.push(`${alias}.path NOT LIKE ? ESCAPE '\\'`);
       params.push(`${escaped}%`);
       params.push(`%/${escaped}%`);
     }
-    clauses.push(`(versions.repo_id NOT IN (${repoPh}) OR (${sigilClauses.join(" AND ")}))`);
+    clauses.push(`(${alias}.repo_id NOT IN (${repoPh}) OR (${sigilClauses.join(" AND ")}))`);
   }
   if (clauses.length === 0) return { sql: "", params: [] };
   return { sql: clauses.join(" AND "), params };

@@ -105,16 +105,23 @@ function collectCommonMark(body: string, config: LinkConfig, hits: BodyHit[]): [
   const events = tokenize(body);
   const slice = (t: Token) => body.slice(t.start.offset, t.end.offset);
 
-  // Pass 1: build the label → destination map from link/image definitions.
-  const definitions = new Map<string, string>();
+  // Pass 1: build the label → definition map from link/image definitions.
+  // We keep the destination's byte-span too so reference-style links can be
+  // rewritten (repair edits the shared `[id]: dest` definition, §11.2).
+  const definitions = new Map<string, Definition>();
   for (const [kind, token] of events) {
     if (kind !== "enter") continue;
     if (token.type === "definition") {
       const label = childValue(events, body, token, "definitionLabelString");
-      const dest = childValue(events, body, token, "definitionDestinationString");
-      if (label !== undefined && dest !== undefined) {
+      const destTok = childToken(events, token, "definitionDestinationString");
+      if (label !== undefined && destTok !== undefined) {
         const key = normalizeLabel(label);
-        if (!definitions.has(key)) definitions.set(key, dest);
+        if (!definitions.has(key)) {
+          definitions.set(key, {
+            dest: body.slice(destTok.start.offset, destTok.end.offset),
+            span: { start: destTok.start.offset, end: destTok.end.offset },
+          });
+        }
       }
     }
   }
@@ -145,21 +152,17 @@ function collectCommonMark(body: string, config: LinkConfig, hits: BodyHit[]): [
     } else if (kind === "exit" && (T === "link" || T === "image")) {
       const frame = stack.pop();
       if (!frame) continue;
-      const enabled = frame.isImage
-        ? // an image edge follows whichever base syntax carried it; the `!`
-          // is cosmetic, so it's gated by that base syntax's toggle
-          resolveDestination(frame, definitions) !== undefined
-        : true;
-      if (!enabled) continue;
-      const target = resolveDestination(frame, definitions);
-      if (target !== undefined && target.length > 0 && syntaxEnabled(frame, config)) {
-        // Only inline links carry a rewritable destination span; reference
-        // links resolve via a separate [id]: definition.
+      const resolved = resolveDestination(frame, definitions);
+      if (resolved !== undefined && resolved.dest.length > 0 && syntaxEnabled(frame, config)) {
+        // Rewritable destination span: inline links carry their own; a
+        // reference link points at its shared `[id]: dest` definition span
+        // (so repairing it edits the definition once).
+        const span = frame.destSpan ?? resolved.span;
         hits.push({
           offset: frame.start,
-          target,
+          target: resolved.dest,
           wikilink: false,
-          ...(frame.destSpan ? { dest_span: frame.destSpan } : {}),
+          ...(span ? { dest_span: span } : {}),
         });
       }
     }
@@ -181,10 +184,17 @@ type Frame = {
  * reference (full → refKey, collapsed/shortcut → label). Whether the base
  * CommonMark syntax is enabled is decided by `syntaxEnabled`.
  */
-function resolveDestination(frame: Frame, definitions: Map<string, string>): string | undefined {
-  if (frame.dest !== undefined) return frame.dest;
+type Definition = { dest: string; span: { start: number; end: number } };
+type ResolvedDest = { dest: string; span?: { start: number; end: number } };
+
+function resolveDestination(
+  frame: Frame,
+  definitions: Map<string, Definition>,
+): ResolvedDest | undefined {
+  if (frame.dest !== undefined) return { dest: frame.dest, span: frame.destSpan };
   const key = frame.refKey && frame.refKey.length > 0 ? frame.refKey : normalizeLabel(frame.label);
-  return definitions.get(key);
+  const def = definitions.get(key);
+  return def ? { dest: def.dest, span: def.span } : undefined;
 }
 
 function syntaxEnabled(frame: Frame, config: LinkConfig): boolean {
@@ -203,11 +213,12 @@ function normalizeLabel(raw: string): string {
 // Wikilinks — [[page]], [[page|display]], ![[page]] (embed, cosmetic prefix).
 // -----------------------------------------------------------------------------
 
-const WIKILINK = /!?\[\[([^\]\n]+?)\]\]/g;
+// Fresh pattern per call via matchAll — no shared `/g` lastIndex state to
+// reset (avoids a footgun if extraction ever runs re-entrantly / in a worker).
+const WIKILINK = () => /!?\[\[([^\]\n]+?)\]\]/g;
 
 function collectWikilinks(body: string, codeRanges: [number, number][], hits: BodyHit[]): void {
-  WIKILINK.lastIndex = 0;
-  for (let m = WIKILINK.exec(body); m !== null; m = WIKILINK.exec(body)) {
+  for (const m of body.matchAll(WIKILINK())) {
     const offset = m.index;
     if (inAnyRange(offset, codeRanges)) continue;
     const full = m[0] as string;
@@ -335,6 +346,12 @@ function childValue(
   parent: Token,
   type: string,
 ): string | undefined {
+  const tok = childToken(events, parent, type);
+  return tok ? body.slice(tok.start.offset, tok.end.offset) : undefined;
+}
+
+/** Like childValue, but returns the token (so callers can read its span). */
+function childToken(events: Event[], parent: Token, type: string): Token | undefined {
   for (const [kind, token] of events) {
     if (kind !== "enter") continue;
     if (
@@ -342,7 +359,7 @@ function childValue(
       token.start.offset >= parent.start.offset &&
       token.end.offset <= parent.end.offset
     ) {
-      return body.slice(token.start.offset, token.end.offset);
+      return token;
     }
   }
   return undefined;

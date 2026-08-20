@@ -70,7 +70,11 @@ export async function planRepairs(
     }
 
     // Collect (span, replacement) rewrites for stale, span-bearing edges.
-    const rewrites: { start: number; end: number; text: string }[] = [];
+    // Keyed by span start so multiple reference links sharing one `[id]: dest`
+    // definition produce a SINGLE rewrite (they resolve to the same target,
+    // so the replacement is identical) — splicing the shared span twice would
+    // corrupt the body.
+    const rewriteBySpan = new Map<number, { start: number; end: number; text: string }>();
     for (let i = 0; i < stored.length && i < storableRaw.length; i++) {
       const row = stored[i];
       const edge = storableRaw[i];
@@ -78,18 +82,24 @@ export async function planRepairs(
       if (row.target_id === null) continue; // dangling — nothing to repair
       const currentPath = currentPathByDoc.get(row.target_id);
       if (currentPath === undefined) continue; // target not live
-      if (normalizeKey(row.target_norm) === normalizeKey(currentPath)) continue; // fresh
-      if (!edge.dest_span) continue; // reference-def link: not rewritable here
+      // row.target_norm is already folded (maintain.ts), so compare directly.
+      if (row.target_norm === normalizeKey(currentPath)) continue; // fresh
+      if (!edge.dest_span) continue; // no rewritable span (shouldn't happen post-R4)
 
       // Preserve any anchor the writer had on the destination.
       const anchorIx = edge.target.indexOf("#");
       const anchor = anchorIx >= 0 ? edge.target.slice(anchorIx) : "";
       // Wikilinks are written without the .md extension by convention; keep
-      // that shape. Inline links get the full repo-relative path.
+      // that shape. Inline / reference links get the full repo-relative path.
       const replacement = edge.wikilink ? stripMd(currentPath) + anchor : currentPath + anchor;
-      rewrites.push({ start: edge.dest_span.start, end: edge.dest_span.end, text: replacement });
+      rewriteBySpan.set(edge.dest_span.start, {
+        start: edge.dest_span.start,
+        end: edge.dest_span.end,
+        text: replacement,
+      });
     }
 
+    const rewrites = [...rewriteBySpan.values()];
     if (rewrites.length === 0) continue;
 
     // Splice right-to-left so earlier offsets remain valid.

@@ -72,7 +72,9 @@ export async function findStaleLinks(
       // folded form against the target's CURRENT folded path. A mismatch is
       // stale text. Comparison is case-insensitive (identity is folded), so
       // a pure recasing of the target isn't flagged unless the path changed.
-      if (normalizeKey(row.target_norm) !== normalizeKey(currentTargetPath)) {
+      // row.target_norm is already folded (maintain.ts stores it), so
+      // compare it directly against the folded current path.
+      if (row.target_norm !== normalizeKey(currentTargetPath)) {
         out.push({
           source_id: version.document_id,
           source_path: version.path,

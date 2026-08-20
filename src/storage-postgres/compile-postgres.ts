@@ -36,12 +36,14 @@ export type CompiledSql = {
 };
 
 // A running builder that keeps params + `$n` counter aligned as we
-// weave nested fragments together. Also carries the plan's scope so graph
-// subqueries can scope the OTHER endpoint (§11.2), plus an alias sequence
-// so nested graph subqueries don't collide.
+// weave nested fragments together. Also carries the plan's scope + sigils
+// so graph subqueries can apply the caller's full visibility filter to the
+// OTHER endpoint (§11.2), plus an alias sequence so nested graph subqueries
+// don't collide.
 class Builder {
   readonly params: unknown[] = [];
   scope: SearchPlan["scope"] = { kind: "allow_all" };
+  sigils: readonly SigilExclusion[] = [];
   private aliasSeq = 0;
   push(v: unknown): string {
     this.params.push(v);
@@ -58,7 +60,10 @@ class Builder {
 
 export function compileSearchPlan(plan: SearchPlan): CompiledSql {
   const b = new Builder();
-  b.scope = plan.scope; // graph subqueries scope the other endpoint (§11.2)
+  // Graph subqueries apply the caller's full visibility filter (scope +
+  // sigil-exclusion) to the other endpoint (§11.2).
+  b.scope = plan.scope;
+  b.sigils = plan.sigils;
   const clauses: string[] = ["versions.next_id IS NULL"];
 
   // repo_id filter.
@@ -68,7 +73,7 @@ export function compileSearchPlan(plan: SearchPlan): CompiledSql {
     clauses.push(`(${compileExpr(plan.filter_ast, b)})`);
   }
 
-  const sigilSql = compileSigilExclusion(plan.sigils, b);
+  const sigilSql = compileSigilExclusion(plan.sigils, b, "versions");
   if (sigilSql.length > 0) clauses.push(sigilSql);
 
   if (plan.scope.kind === "groups") {
@@ -113,22 +118,38 @@ export function compileSearchPlan(plan: SearchPlan): CompiledSql {
 // Sigil exclusion + scope groups
 // -----------------------------------------------------------------------------
 
-function compileSigilExclusion(groups: readonly SigilExclusion[], b: Builder): string {
+function compileSigilExclusion(
+  groups: readonly SigilExclusion[],
+  b: Builder,
+  alias: string,
+): string {
   const parts: string[] = [];
   for (const g of groups) {
     if (g.sigils.length === 0) continue;
     if (g.repo_ids.length === 0) continue;
     const repoPh = b.push(g.repo_ids);
-    const notInAny = `versions.repo_id <> ALL(${repoPh}::bigint[])`;
+    const notInAny = `${alias}.repo_id <> ALL(${repoPh}::bigint[])`;
     const sigilChecks: string[] = [];
     for (const sigil of g.sigils) {
       const escaped = sigil.replace(/[\\%_]/g, (ch) => `\\${ch}`);
-      sigilChecks.push(`versions.path NOT LIKE ${b.push(`${escaped}%`)}`);
-      sigilChecks.push(`versions.path NOT LIKE ${b.push(`%/${escaped}%`)}`);
+      sigilChecks.push(`${alias}.path NOT LIKE ${b.push(`${escaped}%`)}`);
+      sigilChecks.push(`${alias}.path NOT LIKE ${b.push(`%/${escaped}%`)}`);
     }
     parts.push(`(${notInAny} OR (${sigilChecks.join(" AND ")}))`);
   }
   return parts.join(" AND ");
+}
+
+/**
+ * Full visibility predicate for a joined endpoint `alias` — read scope AND
+ * sigil-exclusion (§11.2 "visible graph = readable graph"). Returns "TRUE"
+ * when nothing constrains it.
+ */
+function visibilityForAlias(b: Builder, alias: string): string {
+  const scope = scopeFragmentForAlias(b, alias);
+  const sigils = compileSigilExclusion(b.sigils, b, alias);
+  if (!sigils) return scope;
+  return `(${scope} AND ${sigils})`;
 }
 
 function compileScopeGroups(groups: readonly ScopeGroup[], b: Builder, alias: string): string {
@@ -392,9 +413,10 @@ function compileCall(expr: CelExpr, b: Builder): string {
   const membership = asGraphMembership(expr);
   if (membership) return compileGraphMembership(membership, b);
 
-  if (asGraphCollection(expr)) {
+  const collection = asGraphCollection(expr);
+  if (collection) {
     throw new KernelError("filter_invalid", {
-      reason: `$${(asGraphCollection(expr) as GraphCollection).direction}() is a collection; use .size(), .exists(), or .all()`,
+      reason: `$${collection.direction}() is a collection; use .size(), .exists(), or .all()`,
     });
   }
 
@@ -431,7 +453,7 @@ function graphSubqueryCore(
     if (opts.field !== undefined) {
       parts.push(`AND l.field = ${b.push(opts.field === "$body" ? BODY_FIELD : opts.field)}`);
     }
-    parts.push(`AND ${scopeFragmentForAlias(b, alias)}`);
+    parts.push(`AND ${visibilityForAlias(b, alias)}`);
     return { from: parts.join(" "), alias };
   }
 
@@ -446,7 +468,7 @@ function graphSubqueryCore(
   if (opts.field !== undefined) {
     parts.push(`AND l.field = ${b.push(opts.field === "$body" ? BODY_FIELD : opts.field)}`);
   }
-  parts.push(`AND (l.target_id IS NULL OR ${scopeFragmentForAlias(b, alias)})`);
+  parts.push(`AND (l.target_id IS NULL OR ${visibilityForAlias(b, alias)})`);
   return { from: parts.join(" "), alias };
 }
 

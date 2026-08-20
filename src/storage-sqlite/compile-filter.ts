@@ -44,33 +44,39 @@ export type SqlFragment = {
 };
 
 /**
- * Compile context. `graphScope(alias)` yields the read-scope predicate for
- * an aliased `versions` row inside a graph subquery (so the visible graph
- * equals the readable graph, §11.2). Absent when the caller doesn't support
- * graph predicates (compile-filter's own tests) — a graph predicate then
- * errors rather than leaking unscoped edges.
+ * Compile context. Graph predicates need the caller's full visibility
+ * filter applied to the OTHER endpoint of an edge (§11.2 "visible graph =
+ * readable graph"): `graphScope(alias)` is the read-scope predicate and
+ * `graphSigils(alias)` the sigil-exclusion predicate for an aliased
+ * `versions` row. Absent when the caller doesn't support graph predicates
+ * (compile-filter's own tests) — a graph predicate then errors rather than
+ * leaking unfiltered edges.
  */
 export type FilterCtx = {
   graphScope?: (alias: string) => SqlFragment;
+  graphSigils?: (alias: string) => SqlFragment;
 };
 
-// Module-level context for the current compile pass. Compilation is fully
-// synchronous (no await between set and clear), so this is safe and avoids
-// threading ctx through every compileExpr signature.
+// Per-compile state for the current pass: the context plus a graph-subquery
+// alias counter (reset each compileFilter so aliases are stable per query,
+// matching the Postgres compiler's per-Builder counter). Compilation is
+// fully synchronous, so a module-level cell is safe and avoids threading
+// state through every compileExpr signature.
 let CTX: FilterCtx = {};
+let GRAPH_ALIAS_SEQ = 0;
 
 export function compileFilter(expr: CelExpr, ctx: FilterCtx = {}): SqlFragment {
   CTX = ctx;
+  GRAPH_ALIAS_SEQ = 0;
   try {
     return compileExpr(expr);
   } finally {
     CTX = {};
+    GRAPH_ALIAS_SEQ = 0;
   }
 }
 
-// A monotonic alias counter so nested graph subqueries don't collide on
-// their `versions` alias name within one compiled statement.
-let GRAPH_ALIAS_SEQ = 0;
+/** Alias for a graph subquery's joined `versions` row; unique per compile. */
 function nextGraphAlias(): string {
   return `lv${GRAPH_ALIAS_SEQ++}`;
 }
@@ -299,13 +305,14 @@ function compileCall(expr: CelExpr): SqlFragment {
 
   // A bare collection call ($backlinks_static()) reaching a boolean context
   // is meaningless — collections only compose via .size()/.exists()/.all().
-  if (asGraphCollection(expr)) {
+  const collection = asGraphCollection(expr);
+  if (collection) {
     throw new KernelError("filter_invalid", {
-      reason: `$${(asGraphCollection(expr) as GraphCollection).direction}() is a collection; use .size(), .exists(), or .all()`,
+      reason: `$${collection.direction}() is a collection; use .size(), .exists(), or .all()`,
     });
   }
 
-  // Reserved Phase-2 graph names ($in, $backlinks(), _dyn variants).
+  // Reserved `_dyn` graph names (need Phase 2 embedded queries).
   assertNotReservedGraphName(fn);
 
   throw new KernelError("filter_invalid", {
@@ -341,13 +348,24 @@ const BIN_OPS: Record<string, string> = {
 // "$has_static(\"horses.md\") — dangling target ok").
 // -----------------------------------------------------------------------------
 
-function requireGraphScope(): (alias: string) => SqlFragment {
+/**
+ * The full visibility predicate for a joined endpoint `alias`: read scope
+ * AND sigil-exclusion, so the visible graph equals the readable graph
+ * (§11.2). Errors if the compile context didn't supply the builders (a
+ * graph predicate must never leak an unfiltered endpoint). Sigil-exclusion
+ * has no fragment when the plan excludes nothing (`include_hidden/system`),
+ * in which case only scope contributes.
+ */
+function graphVisibility(alias: string): SqlFragment {
   if (!CTX.graphScope) {
     throw new KernelError("filter_invalid", {
       reason: "graph predicates are not available in this query context",
     });
   }
-  return CTX.graphScope;
+  const scope = CTX.graphScope(alias);
+  const sigils = CTX.graphSigils ? CTX.graphSigils(alias) : { sql: "", params: [] };
+  if (!sigils.sql) return scope;
+  return { sql: `(${scope.sql} AND ${sigils.sql})`, params: [...scope.params, ...sigils.params] };
 }
 
 /** Anchored regexp over a path glob (gitignore-style, §8.2 machinery). */
@@ -372,7 +390,6 @@ function graphSubqueryCore(
   direction: "in" | "has" | "backlinks" | "links",
   opts: { glob?: string; field?: string; predicateAlias?: string },
 ): SqlFragment {
-  const scope = requireGraphScope();
   const params: SqlFragment["params"] = [];
 
   if (direction === "in" || direction === "backlinks") {
@@ -393,9 +410,9 @@ function graphSubqueryCore(
       parts.push(fc.sql.replace(/^ AND /, "AND "));
       params.push(...fc.params);
     }
-    const sc = scope(alias);
-    parts.push(`AND ${sc.sql}`);
-    params.push(...sc.params);
+    const vis = graphVisibility(alias);
+    parts.push(`AND ${vis.sql}`);
+    params.push(...vis.params);
     return { sql: parts.join(" "), params };
   }
 
@@ -419,11 +436,13 @@ function graphSubqueryCore(
     parts.push(fc.sql.replace(/^ AND /, "AND "));
     params.push(...fc.params);
   }
-  // Scope: a bound target must be readable; a dangling edge (no target row)
-  // is visible because the source is the caller's own readable row.
-  const sc = scope(alias);
-  parts.push(`AND (l.target_id IS NULL OR ${sc.sql})`);
-  params.push(...sc.params);
+  // Visibility: a bound target must be readable AND not sigil-hidden (so an
+  // inbound edge to a deleted/hidden doc doesn't surface the source); a
+  // dangling edge (no target row) is visible because the source is the
+  // caller's own already-filtered row.
+  const vis = graphVisibility(alias);
+  parts.push(`AND (l.target_id IS NULL OR ${vis.sql})`);
+  params.push(...vis.params);
   return { sql: parts.join(" "), params };
 }
 

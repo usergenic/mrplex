@@ -14,8 +14,10 @@ import { backfillRepoLinks } from "../links/backfill.js";
 import {
   HARDCODED_DEFAULTS as LINK_DEFAULTS,
   type LinkConfig,
+  type LinkConfigOverride,
   effectiveLinkConfig,
   parseRepoOverride as parseLinkOverride,
+  validateRepoOverride as validateLinkOverride,
 } from "../links/link-config.js";
 import { bindDanglingToPath, reindexOutboundLinks } from "../links/maintain.js";
 import { planRepairs } from "../links/repair.js";
@@ -74,6 +76,14 @@ export type TokenCreateResult = { token: string; meta: Token };
 
 export type LinksBackfillResult = { documents: number; edges: number };
 
+/**
+ * Result of `repos.set_link_config`: the updated repo plus the re-extraction
+ * report. A config change makes the link index stale, so the op re-extracts
+ * the whole repo under the new config in the same call (§11.2 "Config change
+ * ⇒ re-extraction") — the returned `reindexed` counts document it.
+ */
+export type SetLinkConfigResult = { repo: Repo; reindexed: LinksBackfillResult };
+
 /** A stale link on the wire — paths, never internal document ids. */
 export type StaleLinkWire = {
   repo: string;
@@ -101,6 +111,11 @@ export type Kernel = {
       slug: string,
       config: PathConfigOverride | null,
     ): Promise<SetPathConfigResult>;
+    set_link_config(
+      actor: Actor,
+      slug: string,
+      config: LinkConfigOverride | null,
+    ): Promise<SetLinkConfigResult>;
   };
   users: {
     list(actor: Actor): Promise<User[]>;
@@ -375,6 +390,26 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
           }
         }
         return { repo: toRepoWire(updated), warnings };
+      },
+      async set_link_config(actor, slug, config) {
+        authorize(actor, "admin", { kind: "server_admin" });
+        const repo = await storage.repos_by_slug(slug);
+        if (!repo) throw repoNotFound(slug);
+        if (config !== null) {
+          // Validates the merge; throws link_config_invalid on a bad override.
+          validateLinkOverride(config, serverLinkConfig);
+        }
+        const configJson = config === null ? null : JSON.stringify(config);
+        const updated = await storage.repos_set_link_config(repo.id, configJson);
+        // A config change makes the link index stale for this repo — re-extract
+        // the whole corpus under the new effective config now, so the index is
+        // immediately consistent (§11.2 "Config change ⇒ re-extraction").
+        const reindexed = await backfillRepoLinks(
+          storage,
+          repo.id,
+          effectiveLinkConfig(serverLinkConfig, config),
+        );
+        return { repo: toRepoWire(updated), reindexed };
       },
     },
 
@@ -693,10 +728,14 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
       async stale(actor, repoSlug) {
         const repo = await resolveRepo(actor, repoSlug, "read");
         const rows = await findStaleLinks(storage, repo.id, repoEffectiveLinkConfig(repo));
-        // Scope: only surface stale links whose SOURCE the caller can read
-        // (the source path is what we return + would rewrite).
+        // Scope (§11.2 "Scope interaction" — visible graph = readable graph):
+        // surface a stale link only when the caller can read BOTH endpoints.
+        // The SOURCE path is what we return + would rewrite; the `current`
+        // (TARGET) path we'd expose is private if the caller can't read it —
+        // dropping the row prevents leaking the moved target's new location.
+        const canRead = (p: string) => actor.admin || scopesGrant(actor.scopes, "read", repo.id, p);
         return rows
-          .filter((r) => actor.admin || scopesGrant(actor.scopes, "read", repo.id, r.source_path))
+          .filter((r) => canRead(r.source_path) && canRead(r.current))
           .map((r) => ({
             repo: repoSlug,
             source_path: r.source_path,

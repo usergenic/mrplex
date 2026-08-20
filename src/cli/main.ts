@@ -504,6 +504,26 @@ function buildProgram(): Command {
       }).catch(reportError);
     });
 
+  repos
+    .command("set-link-config <slug>")
+    .description("set the per-repo link-extraction config override (§11.2); re-extracts the repo")
+    .option("--from-file <file>", "read JSON override from file (- for stdin)")
+    .option("--clear", "clear the override — inherit from server config", false)
+    .action(function (this: Command, slug: string) {
+      const localOpts = this.opts<{ fromFile?: string; clear: boolean }>();
+      withClient(this, async (client, opts) => {
+        const config = localOpts.clear
+          ? null
+          : (JSON.parse(readFromFile(localOpts.fromFile ?? "-")) as never);
+        const result = await client.repos.set_link_config(slug, config);
+        emit(
+          result,
+          opts,
+          `updated ${slug}\nreindexed ${result.reindexed.documents} doc(s), ${result.reindexed.edges} edge(s)`,
+        );
+      }).catch(reportError);
+    });
+
   // -------- users --------
   const users = program.command("users").description("user management");
   users

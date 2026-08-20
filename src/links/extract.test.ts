@@ -245,9 +245,21 @@ describe("dest_span — the rewritable destination range (for links repair)", ()
     expect(spanText(body, edge as RawEdge)).toBe("foo.md#sec");
   });
 
-  it("omits the span for reference-style links (definition lives elsewhere)", () => {
-    const [edge] = extract("[Bob][b]\n\n[b]: people/bob.md");
-    expect(edge?.dest_span).toBeUndefined();
+  it("points a reference-style link's span at its [id]: definition destination", () => {
+    const body = "[Bob][b]\n\n[b]: people/bob.md";
+    const [edge] = extract(body);
+    // The rewritable span is the definition's destination, not the inline
+    // label — so repair edits the shared definition once.
+    expect(spanText(body, edge as RawEdge)).toBe("people/bob.md");
+  });
+
+  it("shortcut + collapsed references resolve their span to the definition", () => {
+    const body = "[carol] and [carol][]\n\n[carol]: people/carol.md";
+    const edges = extract(body);
+    expect(edges).toHaveLength(2);
+    // Both references share the single definition's destination span.
+    for (const e of edges) expect(spanText(body, e)).toBe("people/carol.md");
+    expect(edges[0]?.dest_span).toEqual(edges[1]?.dest_span);
   });
 
   it("omits the span for frontmatter edges", () => {

@@ -129,6 +129,26 @@ describe("mrplex links repair", () => {
     expect(await bodyAt("note.md")).toBe("[h](animals/horses.md#gaits)");
   });
 
+  it("rewrites a reference-style link by editing its [id]: definition", async () => {
+    const target = await create("horses.md", "neigh");
+    await create("note.md", "See [horses][h].\n\n[h]: horses.md");
+    await kernel.docs.put(actor, "notes", target.version_id, "animals/horses.md", {});
+    const res = await kernel.links.repair(actor, "notes");
+    expect(res.repaired).toEqual([{ path: "note.md", edges: 1 }]);
+    expect(await bodyAt("note.md")).toBe("See [horses][h].\n\n[h]: animals/horses.md");
+    expect(await kernel.links.stale(actor, "notes")).toEqual([]);
+  });
+
+  it("two references sharing one definition rewrite it once (no double-splice)", async () => {
+    const target = await create("horses.md", "neigh");
+    await create("note.md", "[one][h] and [two][h].\n\n[h]: horses.md");
+    await kernel.docs.put(actor, "notes", target.version_id, "animals/horses.md", {});
+    const res = await kernel.links.repair(actor, "notes");
+    // One rewrite (the shared definition span), not two.
+    expect(res.repaired).toEqual([{ path: "note.md", edges: 1 }]);
+    expect(await bodyAt("note.md")).toBe("[one][h] and [two][h].\n\n[h]: animals/horses.md");
+  });
+
   it("rewrites multiple stale destinations in one document (right-to-left splice)", async () => {
     const a = await create("a.md", "a");
     const b = await create("b.md", "b");
