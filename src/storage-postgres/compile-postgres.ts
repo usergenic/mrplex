@@ -135,11 +135,17 @@ function compileScopeGroups(groups: readonly ScopeGroup[], b: Builder, alias: st
   const parts: string[] = [];
   for (const g of groups) {
     if (g.globs.length === 0) continue;
-    const globExpr = compileScopeGlobs(g.globs, b, alias);
     if (g.repos === "*") {
+      const globExpr = compileScopeGlobs(g.globs, b, alias);
       parts.push(`(${globExpr})`);
     } else if (g.repos.length > 0) {
+      // Push the repo-array param BEFORE the globs so `$n` numbering matches
+      // the emitted text order (`repo_id = ANY($k) AND (<globs>)`). Getting
+      // this backwards silently swaps params — the bug the graph-scope
+      // parity test caught. (The `repos === "*"` branch has no repo param,
+      // so it was never exposed there.)
       const ph = b.push(g.repos);
+      const globExpr = compileScopeGlobs(g.globs, b, alias);
       parts.push(`(${alias}.repo_id = ANY(${ph}::bigint[]) AND (${globExpr}))`);
     }
   }
@@ -170,24 +176,21 @@ function compileScopeGlobs(globs: readonly string[], b: Builder, alias: string):
   //
   // Simpler: build a stack of {regex, verdict}, walk it outward and
   // push params in that order as we build the string.
-  let expr = "FALSE";
-  // Collect regexes in outer-to-inner order (i.e. last glob first, since
-  // last glob is outermost).
-  const entries: { regex: string; verdict: string }[] = [];
+  // Last-match-wins: the LAST glob is the OUTERMOST CASE (if it matches,
+  // its verdict wins; otherwise fall through to earlier globs). Build the
+  // nesting outermost-first via prefix/suffix so `$n` params land in text
+  // order (last glob's param first) — matching the SQLite compiler's shape.
+  let prefix = "";
+  let suffix = "";
   for (let i = globs.length - 1; i >= 0; i--) {
     const g = globs[i] as string;
     const negated = g.startsWith("!");
     const raw = negated ? g.slice(1) : g;
-    const regex = `^${globToRegexSource(raw)}$`;
-    entries.push({ regex, verdict: negated ? "FALSE" : "TRUE" });
+    const ph = b.push(`^${globToRegexSource(raw)}$`);
+    prefix += `(CASE WHEN ${alias}.path ~ ${ph} THEN ${negated ? "FALSE" : "TRUE"} ELSE `;
+    suffix = ` END)${suffix}`;
   }
-  // entries[0] is the outermost. Build outer-to-inner so outer's `$n`
-  // gets pushed first.
-  for (const e of entries) {
-    const ph = b.push(e.regex);
-    expr = `(CASE WHEN ${alias}.path ~ ${ph} THEN ${e.verdict} ELSE ${expr} END)`;
-  }
-  return expr;
+  return `${prefix}FALSE${suffix}`;
 }
 
 // -----------------------------------------------------------------------------
