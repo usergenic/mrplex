@@ -384,9 +384,10 @@ class SqliteStorage implements Storage {
     const res = this.db
       .prepare(
         `update links set target_id = ?
-         where repo_id = ? and target_norm = ? and target_id is null`,
+         where repo_id = ? and target_norm = ? and target_id is null
+           and source_id <> ?`,
       )
-      .run(document_id, repo_id, target_norm);
+      .run(document_id, repo_id, target_norm, document_id);
     return res.changes;
   }
 

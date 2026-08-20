@@ -85,8 +85,13 @@ export async function reindexOutboundLinks(
   for (const edge of normalized) {
     const stored = await resolveEdge(storage, repoId, edge);
     if (stored === null) continue;
-    // Re-pack ord densely: edges dropped as external must not leave gaps,
-    // and the PK is (source_id, ord). Extraction order is preserved.
+    // Drop self-links: an edge resolving to the source document itself is
+    // noise — it would make the doc appear in its own $backlinks_static() /
+    // $links_static() and match $in_static against itself. A self-reference
+    // is never a meaningful graph edge, so it never enters the index.
+    if (stored.target_id === sourceId) continue;
+    // Re-pack ord densely: dropped edges (external, self) must not leave
+    // gaps, and the PK is (source_id, ord). Extraction order is preserved.
     resolved.push({ ...stored, ord: ord++ });
   }
 

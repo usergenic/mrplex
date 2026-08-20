@@ -202,6 +202,62 @@ describe("outbound extraction on create", () => {
   });
 });
 
+describe("self-links are never indexed (noise suppression)", () => {
+  it("drops an inline link to the document's own path", async () => {
+    await create("self.md", { body: "see [me](self.md) and [other](other.md)" });
+    // Only the edge to other.md survives; the self-edge is dropped, ords dense.
+    const edges = await edgesFrom("self.md");
+    expect(edges.map((e) => e.target_raw)).toEqual(["other.md"]);
+    expect(edges.map((e) => e.ord)).toEqual([0]);
+  });
+
+  it("drops a self-link written as a bare relative path", async () => {
+    await create("dir/note.md", { body: "[self](note.md)" }); // resolves to dir/note.md
+    expect(await edgesFrom("dir/note.md")).toEqual([]);
+  });
+
+  it("drops a self-link written repo-absolute", async () => {
+    await create("dir/note.md", { body: "[self](/dir/note.md)" });
+    expect(await edgesFrom("dir/note.md")).toEqual([]);
+  });
+
+  it("drops a self-referential wikilink", async () => {
+    await create("alice.md", { body: "I am [[alice]]" });
+    expect(await edgesFrom("alice.md")).toEqual([]);
+  });
+
+  it("drops a self-link via a frontmatter field", async () => {
+    await withFields("canonical");
+    await create("page.md", { frontmatter: { canonical: "page.md" }, body: "x" });
+    expect(await edgesFrom("page.md")).toEqual([]);
+  });
+
+  it("keeps a self-referencing anchor out of the index too", async () => {
+    // [top](self.md#intro) still targets the same document → dropped.
+    await create("self.md", { body: "[top](self.md#intro)" });
+    expect(await edgesFrom("self.md")).toEqual([]);
+  });
+
+  it("a doc does NOT appear in its own $backlinks / $links", async () => {
+    await create("hub.md", { body: "[me](hub.md) and [a](a.md)" });
+    await create("a.md", { body: "x" });
+    const docId = await docIdAt("hub.md");
+    const rows = await storage.links_by_source(docId);
+    // Only the a.md edge; none pointing back at hub.md.
+    expect(rows.every((r) => r.target_id !== docId)).toBe(true);
+  });
+
+  it("a self-link created BEFORE the doc existed at that path stays dropped on move", async () => {
+    // b.md links to (future) c.md — dangling. Move b.md → c.md: the edge now
+    // targets the doc itself and must NOT bind as a self-link.
+    const b = await create("b.md", { body: "[future](c.md)" });
+    expect((await edgesFrom("b.md"))[0]?.target_id).toBeNull();
+    await kernel.docs.put(actor, "notes", b.version_id, "c.md", {});
+    // After the move the doc lives at c.md; its own edge to c.md is dropped.
+    expect(await edgesFrom("c.md")).toEqual([]);
+  });
+});
+
 describe("re-extraction on put (in-place update)", () => {
   it("replaces the outbound set when the body changes", async () => {
     await create("a.md", { body: "a" });

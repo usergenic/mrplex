@@ -272,8 +272,10 @@ export type Storage = {
    * identity-bound counterpart to "backlinks survive renames" (§11.2).
    * Bind-only: already-bound edges are never touched, and edges are never
    * unbound (a move produces zero inbound churn; a delete leaves inbound
-   * rows bound and lets visibility filtering hide them — §11.2). Returns
-   * the number of edges newly bound.
+   * rows bound and lets visibility filtering hide them — §11.2). A source's
+   * edge is never bound to the source itself (self-links are noise and are
+   * excluded, `source_id <> document_id`). Returns the number of edges
+   * newly bound.
    */
   links_resolve_dangling(
     repo_id: number,

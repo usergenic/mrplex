@@ -465,7 +465,8 @@ class PostgresStorage implements Storage {
     return this.withClient(async (c) => {
       const res = await c.query(
         `update links set target_id = $1
-         where repo_id = $2 and target_norm = $3 and target_id is null`,
+         where repo_id = $2 and target_norm = $3 and target_id is null
+           and source_id <> $1`,
         [document_id, repo_id, target_norm],
       );
       return res.rowCount ?? 0;

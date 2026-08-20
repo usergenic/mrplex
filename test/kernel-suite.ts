@@ -706,6 +706,15 @@ export function runKernelSuite(factory: AdapterFactory): void {
         expect(await paths(actor, '$in_static("note.md")')).toEqual(["future.md"]);
       });
 
+      it("self-links are not indexed (no doc is in its own set / backlinks)", async () => {
+        const actor = await aliceActor();
+        await mk(actor, "self.md", "I link to [me](self.md) and [[self]]");
+        // self.md is neither in its own set nor a backlink of itself.
+        expect(await paths(actor, '$in_static("self.md")')).toEqual([]);
+        expect(await paths(actor, "$backlinks_static().size() > 0")).not.toContain("self.md");
+        expect(await paths(actor, "$links_static().size() == 0")).toContain("self.md");
+      });
+
       it("a move keeps inbound edges resolved (identity-bound)", async () => {
         const actor = await aliceActor();
         const target = await mk(actor, "horses.md", "neigh");
