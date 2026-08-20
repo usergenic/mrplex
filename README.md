@@ -12,6 +12,7 @@ See [docs/design.md](docs/design.md) for the full design.
 - **Deletion is a move to a system-namespace path** (`:deleted/…/foo-v45129.md`, extension-aware). Restore is a `docs.put` back to a user-territory path. `docs.delete` is idempotent.
 - **Unified diff** between any two versions of the same document via `docs.diff` — kernel op, `/repos/{repo}/diff/{path}?from=&to=` REST route (JSON envelope or `Accept: text/plain` raw patch), `docs_diff` MCP tool, `mrplex docs diff` CLI. `patch(1)`-applicable output.
 - **CEL filter queries** over frontmatter fields and `$`-prefixed intrinsics (`$path`, `$updated_at`, `$body`). `list()` polymorphism handles scalar-or-list frontmatter uniformly.
+- **Link graph** — a derived index over Markdown links (CommonMark inline/reference, wikilinks `[[page]]`, and opt-in frontmatter reference fields), maintained in the write transaction and bound to document *identity* so backlinks survive renames. Query it in CEL with possession-language intrinsics: `$in_static(glob)` / `$has_static(glob)` (membership, optional field restriction) and `$backlinks_static()` / `$links_static()` collections (`.size()`, `.exists()`, `.all()`). Composes as set algebra: `$in_static("moc/**") && !$in_static("moc/contractors.md")`, `!$in_static("**")` (orphans), `$links_static().size() == 0` (leaves). Every predicate respects the caller's read scope — the visible graph equals the readable graph. `mrplex links stale` / `repair` fix link *text* after a move (the graph itself never breaks). See §11.2.
 - **Full-text search** over document body — SQLite FTS5 (porter+unicode61) or Postgres `websearch_to_tsquery`. Composes with filter via AND. Portable syntax subset across both engines: bare terms and quoted phrases.
 - **Semantic rank via embeddings** — pluggable hook (`--embed-url` HTTP or `--embed-cmd` subprocess); mrplex never calls a provider itself. Chunker + backlog worker + brute-force cosine k-NN over `sqlite-vec`; results current-version only, deduped by content hash. Composes with filter/text/scope/sigil-exclusion. No hook configured → `rank_unavailable` (no zero-vector default — silent garbage is worse than a visible gap).
 - **Bearer-token auth** with capability scopes — repo-scoped `read` / `write` path globs (gitignore-style, with negation), admin bit, per-token subset semantics for self-issued tokens.
@@ -148,6 +149,30 @@ Diff any two versions of a document — history + diff give you the versioned re
 ```bash
 mrplex docs history greetings/hi.md
 mrplex docs diff greetings/hi.md --from v1 --to v3
+```
+
+Query and maintain the link graph (§11.2):
+
+```bash
+# Documents referenced by a map-of-content; set algebra composes.
+mrplex query -r notes --filter '$in_static("moc/employees.md")'
+mrplex query -r notes --filter '$in_static("moc/**") && !$in_static("moc/contractors.md")'
+
+# Orphans (in nobody's set) and leaves (link to nothing).
+mrplex query -r notes --filter '!$in_static("**")'
+mrplex query -r notes --filter '$links_static().size() == 0'
+
+# Docs a draft cites; docs referencing any project via their `parent` field.
+mrplex query -r notes --filter '$backlinks_static().exists(d, d.status == "draft")'
+mrplex query -r notes --filter '$has_static("projects/**", "parent")'
+
+# After moving a target, fix stale link *text* (the graph itself never broke).
+mrplex -r notes links stale
+mrplex -r notes links repair --dry-run
+mrplex -r notes links repair
+
+# Rebuild the index from scratch (e.g. after changing link_config).
+mrplex -r notes links backfill
 ```
 
 Serve the HTTP surfaces and drive the CLI remotely:
