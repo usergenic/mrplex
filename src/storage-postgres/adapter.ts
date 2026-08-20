@@ -16,6 +16,7 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import pg, { Pool, type PoolClient } from "pg";
+import { normalizeKey } from "../kernel/casefold.js";
 import { KernelError } from "../kernel/errors.js";
 import type { SearchPlan } from "../storage/search-plan.js";
 import type {
@@ -212,8 +213,8 @@ class PostgresStorage implements Storage {
   async users_create(input: { slug: string; created_at: string }): Promise<UserRow> {
     return this.withClient(async (c) => {
       const res = await c.query<UserRow>(
-        "insert into users(slug, created_at) values ($1, $2) returning id, slug, created_at",
-        [input.slug, input.created_at],
+        "insert into users(slug, slug_norm, created_at) values ($1, $2, $3) returning id, slug, created_at",
+        [input.slug, normalizeKey(input.slug), input.created_at],
       );
       return res.rows[0] as UserRow;
     });
@@ -222,8 +223,8 @@ class PostgresStorage implements Storage {
   async users_rename(id: number, new_slug: string): Promise<UserRow> {
     return this.withClient(async (c) => {
       const res = await c.query<UserRow>(
-        "update users set slug = $1 where id = $2 returning id, slug, created_at",
-        [new_slug, id],
+        "update users set slug = $1, slug_norm = $2 where id = $3 returning id, slug, created_at",
+        [new_slug, normalizeKey(new_slug), id],
       );
       if (res.rows.length === 0) throw new Error(`users_rename: user ${id} not found`);
       return res.rows[0] as UserRow;
@@ -232,9 +233,11 @@ class PostgresStorage implements Storage {
 
   async users_by_slug(slug: string): Promise<UserRow | null> {
     return this.withClient(async (c) => {
-      const res = await c.query<UserRow>("select id, slug, created_at from users where slug = $1", [
-        slug,
-      ]);
+      // Case-insensitive identity: fold the query key to slug_norm (§3.5.1).
+      const res = await c.query<UserRow>(
+        "select id, slug, created_at from users where slug_norm = $1",
+        [normalizeKey(slug)],
+      );
       return res.rows[0] ?? null;
     });
   }
@@ -268,8 +271,8 @@ class PostgresStorage implements Storage {
         path_config: unknown;
         created_at: string;
       }>(
-        "insert into repos(slug, created_at) values ($1, $2) returning id, slug, path_config, created_at",
-        [input.slug, input.created_at],
+        "insert into repos(slug, slug_norm, created_at) values ($1, $2, $3) returning id, slug, path_config, created_at",
+        [input.slug, normalizeKey(input.slug), input.created_at],
       );
       return hydrateRepo(res.rows[0] as never);
     });
@@ -282,10 +285,10 @@ class PostgresStorage implements Storage {
         slug: string;
         path_config: unknown;
         created_at: string;
-      }>("update repos set slug = $1 where id = $2 returning id, slug, path_config, created_at", [
-        new_slug,
-        id,
-      ]);
+      }>(
+        "update repos set slug = $1, slug_norm = $2 where id = $3 returning id, slug, path_config, created_at",
+        [new_slug, normalizeKey(new_slug), id],
+      );
       if (res.rows.length === 0) throw new Error(`repos_rename: repo ${id} not found`);
       return hydrateRepo(res.rows[0] as never);
     });
@@ -315,7 +318,9 @@ class PostgresStorage implements Storage {
         slug: string;
         path_config: unknown;
         created_at: string;
-      }>("select id, slug, path_config, created_at from repos where slug = $1", [slug]);
+      }>("select id, slug, path_config, created_at from repos where slug_norm = $1", [
+        normalizeKey(slug),
+      ]);
       return res.rows[0] ? hydrateRepo(res.rows[0] as never) : null;
     });
   }
@@ -361,9 +366,9 @@ class PostgresStorage implements Storage {
         }
         const ins = await c.query<VersionRawRow>(
           `insert into versions
-             (document_id, repo_id, prev_id, next_id, path,
+             (document_id, repo_id, prev_id, next_id, path, path_norm,
               frontmatter_raw, frontmatter, body, author_id, created_at)
-           values ($1, $2, $3, null, $4, $5, $6::jsonb, $7, $8, $9)
+           values ($1, $2, $3, null, $4, $5, $6, $7::jsonb, $8, $9, $10)
            returning id, document_id, repo_id, prev_id, next_id, path,
                      frontmatter_raw, frontmatter, body, author_id, created_at`,
           [
@@ -371,6 +376,7 @@ class PostgresStorage implements Storage {
             input.repo_id,
             input.prev_id,
             input.path,
+            normalizeKey(input.path),
             input.frontmatter_raw,
             JSON.stringify(input.frontmatter),
             input.body,
@@ -404,11 +410,12 @@ class PostgresStorage implements Storage {
 
   async version_current(repo_id: number, path: string): Promise<VersionRow | null> {
     return this.withClient(async (c) => {
+      // Case-insensitive identity: fold the query key to path_norm (§3.5.1).
       const res = await c.query<VersionRawRow>(
         `select id, document_id, repo_id, prev_id, next_id, path,
                 frontmatter_raw, frontmatter, body, author_id, created_at
-         from versions where repo_id = $1 and path = $2 and next_id is null`,
-        [repo_id, path],
+         from versions where repo_id = $1 and path_norm = $2 and next_id is null`,
+        [repo_id, normalizeKey(path)],
       );
       return (res.rows[0] as VersionRow | undefined) ?? null;
     });

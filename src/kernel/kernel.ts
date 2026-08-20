@@ -292,7 +292,10 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
         if (!repo) throw repoNotFound(slug);
         if (new_slug === slug) return toRepoWire(repo);
         validateSlug(new_slug, serverPathConfig);
-        if (await storage.repos_by_slug(new_slug)) throw slugCollisionError(new_slug);
+        // A folded-equal collision that resolves to THIS repo is a recasing
+        // (e.g. "notes" → "Notes"), not a conflict — allow it (§3.5.1).
+        const occupant = await storage.repos_by_slug(new_slug);
+        if (occupant && occupant.id !== repo.id) throw slugCollisionError(new_slug);
         return toRepoWire(await storage.repos_rename(repo.id, new_slug));
       },
       async delete(actor, slug) {
@@ -351,7 +354,9 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
         if (!user) throw userNotFound(slug);
         if (new_slug === slug) return { user: user.slug };
         validateSlug(new_slug, serverPathConfig);
-        if (await storage.users_by_slug(new_slug)) throw slugCollisionError(new_slug);
+        // A folded-equal collision resolving to THIS user is a recasing (§3.5.1).
+        const occupant = await storage.users_by_slug(new_slug);
+        if (occupant && occupant.id !== user.id) throw slugCollisionError(new_slug);
         const updated = await storage.users_rename(user.id, new_slug);
         return { user: updated.slug };
       },

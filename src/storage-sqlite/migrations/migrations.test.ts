@@ -58,7 +58,7 @@ describe("migrate", () => {
     expect(versionAfterFirst).toBeGreaterThan(0);
   });
 
-  it("creates the two partial unique indexes from §3.2", () => {
+  it("creates the two partial unique indexes from §3.2 (plus the casefold twin)", () => {
     const db = new Database(":memory:");
     db.pragma("foreign_keys = ON");
     migrate(db);
@@ -70,6 +70,27 @@ describe("migrate", () => {
     expect(indexes.map((i) => i.name)).toEqual([
       "versions_document_current_uidx",
       "versions_repo_path_current_uidx",
+      "versions_repo_pathnorm_current_uidx",
     ]);
+  });
+
+  it("creates the norm columns + case-insensitive unique indexes (migration 0004)", () => {
+    const db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    migrate(db);
+
+    const versionCols = db.prepare("pragma table_info(versions)").all() as { name: string }[];
+    expect(versionCols.map((c) => c.name)).toContain("path_norm");
+    const repoCols = db.prepare("pragma table_info(repos)").all() as { name: string }[];
+    expect(repoCols.map((c) => c.name)).toContain("slug_norm");
+    const userCols = db.prepare("pragma table_info(users)").all() as { name: string }[];
+    expect(userCols.map((c) => c.name)).toContain("slug_norm");
+
+    const slugIndexes = db
+      .prepare(
+        "select name from sqlite_master where type='index' and name like '%slugnorm%' order by name",
+      )
+      .all() as { name: string }[];
+    expect(slugIndexes.map((i) => i.name)).toEqual(["repos_slugnorm_uidx", "users_slugnorm_uidx"]);
   });
 });

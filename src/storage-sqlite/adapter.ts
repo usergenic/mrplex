@@ -1,5 +1,6 @@
 import { RE2JS } from "@bufbuild/re2";
 import Database from "better-sqlite3";
+import { normalizeKey } from "../kernel/casefold.js";
 import type { SearchPlan } from "../storage/search-plan.js";
 import type {
   BacklogRow,
@@ -158,23 +159,28 @@ class SqliteStorage implements Storage {
 
   async users_create(input: { slug: string; created_at: string }): Promise<UserRow> {
     return this.db
-      .prepare("insert into users(slug, created_at) values (?, ?) returning id, slug, created_at")
-      .get(input.slug, input.created_at) as UserRow;
+      .prepare(
+        "insert into users(slug, slug_norm, created_at) values (?, ?, ?) returning id, slug, created_at",
+      )
+      .get(input.slug, normalizeKey(input.slug), input.created_at) as UserRow;
   }
 
   async users_rename(id: number, new_slug: string): Promise<UserRow> {
     const row = this.db
-      .prepare("update users set slug = ? where id = ? returning id, slug, created_at")
-      .get(new_slug, id) as UserRow | undefined;
+      .prepare(
+        "update users set slug = ?, slug_norm = ? where id = ? returning id, slug, created_at",
+      )
+      .get(new_slug, normalizeKey(new_slug), id) as UserRow | undefined;
     if (!row) throw new Error(`users_rename: user ${id} not found`);
     return row;
   }
 
   async users_by_slug(slug: string): Promise<UserRow | null> {
+    // Case-insensitive identity: fold the query key to slug_norm (§3.5.1).
     return (
-      (this.db.prepare("select id, slug, created_at from users where slug = ?").get(slug) as
-        | UserRow
-        | undefined) ?? null
+      (this.db
+        .prepare("select id, slug, created_at from users where slug_norm = ?")
+        .get(normalizeKey(slug)) as UserRow | undefined) ?? null
     );
   }
 
@@ -195,15 +201,17 @@ class SqliteStorage implements Storage {
   async repos_create(input: { slug: string; created_at: string }): Promise<RepoRow> {
     return this.db
       .prepare(
-        "insert into repos(slug, created_at) values (?, ?) returning id, slug, path_config, created_at",
+        "insert into repos(slug, slug_norm, created_at) values (?, ?, ?) returning id, slug, path_config, created_at",
       )
-      .get(input.slug, input.created_at) as RepoRow;
+      .get(input.slug, normalizeKey(input.slug), input.created_at) as RepoRow;
   }
 
   async repos_rename(id: number, new_slug: string): Promise<RepoRow> {
     const row = this.db
-      .prepare("update repos set slug = ? where id = ? returning id, slug, path_config, created_at")
-      .get(new_slug, id) as RepoRow | undefined;
+      .prepare(
+        "update repos set slug = ?, slug_norm = ? where id = ? returning id, slug, path_config, created_at",
+      )
+      .get(new_slug, normalizeKey(new_slug), id) as RepoRow | undefined;
     if (!row) throw new Error(`repos_rename: repo ${id} not found`);
     return row;
   }
@@ -219,10 +227,11 @@ class SqliteStorage implements Storage {
   }
 
   async repos_by_slug(slug: string): Promise<RepoRow | null> {
+    // Case-insensitive identity: fold the query key to slug_norm (§3.5.1).
     return (
       (this.db
-        .prepare("select id, slug, path_config, created_at from repos where slug = ?")
-        .get(slug) as RepoRow | undefined) ?? null
+        .prepare("select id, slug, path_config, created_at from repos where slug_norm = ?")
+        .get(normalizeKey(slug)) as RepoRow | undefined) ?? null
     );
   }
 
@@ -258,9 +267,9 @@ class SqliteStorage implements Storage {
       const inserted = this.db
         .prepare(
           `insert into versions
-            (document_id, repo_id, prev_id, next_id, path,
+            (document_id, repo_id, prev_id, next_id, path, path_norm,
              frontmatter_raw, frontmatter, body, author_id, created_at)
-           values (?, ?, ?, null, ?, ?, ?, ?, ?, ?)
+           values (?, ?, ?, null, ?, ?, ?, ?, ?, ?, ?)
            returning id, document_id, repo_id, prev_id, next_id, path,
                      frontmatter_raw, frontmatter, body, author_id, created_at`,
         )
@@ -269,6 +278,7 @@ class SqliteStorage implements Storage {
           input.repo_id,
           input.prev_id,
           input.path,
+          normalizeKey(input.path),
           input.frontmatter_raw,
           JSON.stringify(input.frontmatter),
           input.body,
@@ -298,13 +308,14 @@ class SqliteStorage implements Storage {
   }
 
   async version_current(repo_id: number, path: string): Promise<VersionRow | null> {
+    // Case-insensitive identity: fold the query key to path_norm (§3.5.1).
     const row = this.db
       .prepare(
         `select id, document_id, repo_id, prev_id, next_id, path,
                 frontmatter_raw, frontmatter, body, author_id, created_at
-         from versions where repo_id = ? and path = ? and next_id is null`,
+         from versions where repo_id = ? and path_norm = ? and next_id is null`,
       )
-      .get(repo_id, path) as VersionRawRow | undefined;
+      .get(repo_id, normalizeKey(path)) as VersionRawRow | undefined;
     return row ? hydrateVersion(row) : null;
   }
 

@@ -563,5 +563,110 @@ export function runKernelSuite(factory: AdapterFactory): void {
         ).rejects.toThrow();
       });
     });
+
+    // -----------------------------------------------------------------
+    // Case & Unicode folding — case-insensitive, NFC-normalized identity
+    // with case-preserving storage (design §3.5.1; case-folding-plan.md).
+    // -----------------------------------------------------------------
+    describe("case & unicode folding", () => {
+      it("path identity is case-insensitive — create at a folding-equal path conflicts", async () => {
+        const actor = await aliceActor();
+        await kernel.docs.create(actor, "notes", "Alice.md", { frontmatter_raw: "", body: "a" });
+        try {
+          await kernel.docs.create(actor, "notes", "alice.md", { frontmatter_raw: "", body: "b" });
+          throw new Error("expected throw");
+        } catch (err) {
+          expect((err as KernelError).code).toBe("create_conflict");
+        }
+      });
+
+      it("lookup folds the key but returns the stored (case-preserved) path", async () => {
+        const actor = await aliceActor();
+        await kernel.docs.create(actor, "notes", "People/Bob.md", {
+          frontmatter_raw: "",
+          body: "b",
+        });
+        const v = await kernel.docs.get(actor, "notes", "people/bob.MD");
+        expect(v.path).toBe("People/Bob.md"); // stored case, not the folded key
+      });
+
+      it("NFC and NFD spellings of a path address the same document", async () => {
+        const actor = await aliceActor();
+        const nfc = "caf\u00e9.md"; // e + acute, composed (NFC)
+        const nfd = "cafe\u0301.md"; // e + combining acute (NFD)
+        await kernel.docs.create(actor, "notes", nfc, { frontmatter_raw: "", body: "x" });
+        const v = await kernel.docs.get(actor, "notes", nfd);
+        expect(v.path).toBe(nfc);
+      });
+
+      it("moving onto a folding-equal occupied path → path_taken", async () => {
+        const actor = await aliceActor();
+        await kernel.docs.create(actor, "notes", "Home.md", { frontmatter_raw: "", body: "h" });
+        const other = await kernel.docs.create(actor, "notes", "other.md", {
+          frontmatter_raw: "",
+          body: "o",
+        });
+        try {
+          await kernel.docs.put(actor, "notes", other.version_id, "home.md", { body: "o" });
+          throw new Error("expected throw");
+        } catch (err) {
+          expect((err as KernelError).code).toBe("path_taken");
+        }
+      });
+
+      it("recasing a document's own path is allowed (same identity)", async () => {
+        const actor = await aliceActor();
+        const v1 = await kernel.docs.create(actor, "notes", "recase.md", {
+          frontmatter_raw: "",
+          body: "r",
+        });
+        const v2 = await kernel.docs.put(actor, "notes", v1.version_id, "Recase.md", { body: "r" });
+        expect(v2.path).toBe("Recase.md");
+        expect(v2.prev_version_id).toBe(v1.version_id);
+      });
+
+      it("deleting a document frees its folded path key for reuse", async () => {
+        const actor = await aliceActor();
+        const v = await kernel.docs.create(actor, "notes", "Reuse.md", {
+          frontmatter_raw: "",
+          body: "1",
+        });
+        await kernel.docs.delete(actor, "notes", v.version_id);
+        // A differently-cased create at the freed key now succeeds.
+        const again = await kernel.docs.create(actor, "notes", "reuse.md", {
+          frontmatter_raw: "",
+          body: "2",
+        });
+        expect(again.path).toBe("reuse.md");
+      });
+
+      it("repo slug identity is case-insensitive", async () => {
+        try {
+          await kernel.repos.create(SYSTEM_ACTOR, "Notes"); // "notes" seeded
+          throw new Error("expected throw");
+        } catch (err) {
+          expect((err as KernelError).code).toBe("slug_taken");
+        }
+      });
+
+      it("repo lookup folds the key but returns the stored slug", async () => {
+        const repo = await kernel.repos.get(SYSTEM_ACTOR, "NOTES");
+        expect(repo.repo).toBe("notes");
+      });
+
+      it("recasing a repo slug is allowed (same identity)", async () => {
+        const renamed = await kernel.repos.rename(SYSTEM_ACTOR, "notes", "Notes");
+        expect(renamed.repo).toBe("Notes");
+      });
+
+      it("user slug identity is case-insensitive", async () => {
+        try {
+          await kernel.users.create(SYSTEM_ACTOR, "Alice"); // "alice" seeded
+          throw new Error("expected throw");
+        } catch (err) {
+          expect((err as KernelError).code).toBe("slug_taken");
+        }
+      });
+    });
   });
 }

@@ -40,6 +40,10 @@ export function isSerializationRetryable(err: unknown): err is PgError {
 export const VERSION_UNIQUE_CONSTRAINTS = new Set<string>([
   "versions_document_current_uidx",
   "versions_repo_path_current_uidx",
+  // Case-insensitive path twin (§3.5.1, 0002_casefold.sql) — a concurrent
+  // case-collision races here; the retried tx's folded pre-check raises
+  // path_taken / create_conflict.
+  "versions_repo_pathnorm_current_uidx",
 ]);
 
 export function isVersionRaceViolation(err: unknown): boolean {
