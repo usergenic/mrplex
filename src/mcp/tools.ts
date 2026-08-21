@@ -14,7 +14,7 @@
  *     in-band tool error ({ code, data }) per §6.2.
  */
 
-import type { CallContext } from "../kernel/context.js";
+import { type CallContext, validateScopeClaims } from "../kernel/context.js";
 import type { Kernel } from "../kernel/kernel.js";
 import type { PathConfigOverride } from "../kernel/path-config.js";
 import type { QuerySpec } from "../kernel/query/query.js";
@@ -137,8 +137,9 @@ function queryCtx(ctx: CallContext, args: Record<string, unknown>): CallContext 
   if (ctx.scope !== undefined) return ctx;
   const scope = args.scope;
   if (scope === undefined || scope === null) return ctx;
-  if (!Array.isArray(scope)) throw new Error('tool arg "scope" must be an array of claims');
-  return { ...ctx, scope: scope as CallContext["scope"] };
+  // Same structural check as the header/body paths — a repo-less claim is a
+  // loud filter_invalid, not a silent deny_all empty result.
+  return { ...ctx, scope: validateScopeClaims(scope) };
 }
 
 /**

@@ -83,9 +83,15 @@ function parseScopeArg(value: string): ScopeClaim[] {
   try {
     return parseScopeClaims(value);
   } catch (err) {
-    throw new InvalidArgumentError(
-      `--scope must be a JSON ScopeClaim array: ${err instanceof Error ? err.message : String(err)}`,
-    );
+    // parseScopeClaims throws KernelError("filter_invalid") with the human
+    // reason in .data.reason (its .message is just the code).
+    const reason =
+      err instanceof KernelError
+        ? String((err.data as { reason?: unknown }).reason)
+        : err instanceof Error
+          ? err.message
+          : String(err);
+    throw new InvalidArgumentError(`--scope must be a JSON ScopeClaim array: ${reason}`);
   }
 }
 

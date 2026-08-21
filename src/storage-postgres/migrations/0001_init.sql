@@ -21,7 +21,7 @@ create extension if not exists vector;
 create table repos (
   id          bigserial primary key,
   slug        text not null unique,
-  slug_norm   text,
+  slug_norm   text not null,
   path_config jsonb,
   link_config jsonb,
   created_at  text not null
@@ -43,7 +43,7 @@ create table versions (
   prev_id         bigint      references versions(id),
   next_id         bigint      references versions(id),
   path            text   not null,
-  path_norm       text,
+  path_norm       text   not null,
   frontmatter_raw text   not null,
   frontmatter     jsonb  not null,
   body            text   not null,

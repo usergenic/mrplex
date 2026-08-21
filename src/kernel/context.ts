@@ -18,6 +18,8 @@
  *     token.
  */
 
+import { KernelError } from "./errors.js";
+
 /**
  * A read-visibility claim. `repo` is a slug, glob, or "*" — evaluated against
  * the repos existing at call time, every call (no issuance snapshot, no id
@@ -50,54 +52,84 @@ function hasControlChar(s: string): boolean {
 }
 
 /**
- * Parse a JSON string into `ScopeClaim[]`, with structural sanity checks.
- * Used by surfaces to decode the `X-Mrplex-Scope` header / `--scope` flag /
- * `scope` body field. Throws on malformed input so a bad claim is a loud
- * client error, not a silent full-access fallback.
+ * Structurally validate an already-parsed value as `ScopeClaim[]`. This is the
+ * single validation path shared by every surface that accepts a scope — the
+ * `X-Mrplex-Scope` header (via [[parseScopeClaims]]), the `POST /query` body
+ * `scope` field, the MCP query tool-arg, and the CLI `--scope` flag. Routing
+ * all of them here means a claim missing `repo` (or with wrong types) is a loud
+ * `filter_invalid`, not a silent `deny_all` empty result (see the note in
+ * kernel/auth/scope.ts on how `normalizeClaims` treats a repo-less claim).
+ *
+ * Throws `KernelError("filter_invalid")` on bad input so surfaces map it to a
+ * 4xx uniformly rather than a 500.
  */
-export function parseScopeClaims(json: string): ScopeClaim[] {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(json);
-  } catch {
-    throw new Error("scope must be valid JSON (a ScopeClaim array)");
-  }
+export function validateScopeClaims(parsed: unknown): ScopeClaim[] {
   if (!Array.isArray(parsed)) {
-    throw new Error("scope must be a JSON array of claims");
+    throw new KernelError("filter_invalid", { reason: "scope must be an array of claims" });
   }
   const isStrOrStrList = (v: unknown): boolean =>
     typeof v === "string" || (Array.isArray(v) && v.every((x) => typeof x === "string"));
   for (const entry of parsed) {
     if (typeof entry !== "object" || entry === null) {
-      throw new Error("scope claim must be an object");
+      throw new KernelError("filter_invalid", { reason: "scope claim must be an object" });
     }
     const e = entry as { repo?: unknown; read?: unknown };
     if (!isStrOrStrList(e.repo)) {
-      throw new Error("scope claim `repo` must be a string or string[]");
+      throw new KernelError("filter_invalid", {
+        reason: "scope claim `repo` must be a string or string[]",
+      });
     }
     if (e.read !== undefined && !isStrOrStrList(e.read)) {
-      throw new Error("scope claim `read` must be a string or string[]");
+      throw new KernelError("filter_invalid", {
+        reason: "scope claim `read` must be a string or string[]",
+      });
     }
   }
   return parsed as ScopeClaim[];
 }
 
 /**
+ * Parse a JSON string into `ScopeClaim[]`. Used to decode the `X-Mrplex-Scope`
+ * header and the CLI `--scope` flag. Throws `KernelError("filter_invalid")` on
+ * malformed input so a bad claim is a loud client error, not a silent
+ * full-access fallback.
+ */
+export function parseScopeClaims(json: string): ScopeClaim[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    throw new KernelError("filter_invalid", {
+      reason: "scope must be valid JSON (a ScopeClaim array)",
+    });
+  }
+  return validateScopeClaims(parsed);
+}
+
+/**
  * Resolve + validate the author for a write. Opaque: we sanity-check only
  * (non-empty, no control characters, length-capped) and never parse the value.
  * An empty/absent author yields the default "mrplex".
+ *
+ * Throws `KernelError("filter_invalid")` on bad input — the author is reachable
+ * verbatim from the `X-Mrplex-Author` header, so a control-char or over-length
+ * value is a client mistake and must stay in the 4xx band, not surface as a 500.
  */
 export function resolveAuthor(ctx: CallContext): string {
   const raw = ctx.author;
   if (raw === undefined || raw === "") return DEFAULT_AUTHOR;
   if (typeof raw !== "string") {
-    throw new Error("author must be a string");
+    throw new KernelError("filter_invalid", { reason: "author must be a string" });
   }
   if (raw.length > MAX_AUTHOR_LENGTH) {
-    throw new Error(`author exceeds ${MAX_AUTHOR_LENGTH} characters`);
+    throw new KernelError("filter_invalid", {
+      reason: `author exceeds ${MAX_AUTHOR_LENGTH} characters`,
+    });
   }
   if (hasControlChar(raw)) {
-    throw new Error("author must not contain control characters");
+    throw new KernelError("filter_invalid", {
+      reason: "author must not contain control characters",
+    });
   }
   return raw;
 }

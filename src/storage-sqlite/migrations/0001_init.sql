@@ -17,7 +17,7 @@
 create table repos (
   id          integer primary key,
   slug        text not null unique,
-  slug_norm   text,
+  slug_norm   text not null,
   path_config text check (path_config is null or json_valid(path_config)),
   link_config text check (link_config is null or json_valid(link_config)),
   created_at  text not null
@@ -40,7 +40,7 @@ create table versions (
   prev_id         integer      references versions(id),
   next_id         integer      references versions(id),
   path            text    not null,
-  path_norm       text,
+  path_norm       text    not null,
   frontmatter_raw text    not null,
   frontmatter     text    not null check (json_valid(frontmatter)),
   body            text    not null,

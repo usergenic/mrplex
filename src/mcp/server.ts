@@ -19,9 +19,10 @@ import { Server as McpLowLevelServer } from "@modelcontextprotocol/sdk/server/in
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { type CallContext, parseScopeClaims } from "../kernel/context.js";
+import type { CallContext } from "../kernel/context.js";
 import { KernelError } from "../kernel/errors.js";
 import type { Kernel } from "../kernel/kernel.js";
+import { contextFromHeaders } from "../server/headers.js";
 import type { Storage } from "../storage/types.js";
 import { TOOL_REGISTRY, toolByName } from "./tools.js";
 
@@ -29,26 +30,6 @@ export type McpConfig = {
   kernel: Kernel;
   storage: Storage;
 };
-
-/**
- * Build a CallContext from the `X-Mrplex-*` request headers. Malformed scope
- * JSON throws — a bad claim is a loud client error, not a silent full-access
- * fallback (see [[scope-claim-semantics]]).
- */
-export function contextFromHeaders(req: IncomingMessage): CallContext {
-  const ctx: CallContext = {};
-  const author = headerValue(req.headers["x-mrplex-author"]);
-  if (author !== undefined) ctx.author = author;
-  const scope = headerValue(req.headers["x-mrplex-scope"]);
-  if (scope !== undefined) ctx.scope = parseScopeClaims(scope);
-  return ctx;
-}
-
-function headerValue(v: string | string[] | undefined): string | undefined {
-  if (v === undefined) return undefined;
-  const s = Array.isArray(v) ? v[0] : v;
-  return s !== undefined && s.length > 0 ? s : undefined;
-}
 
 export type McpMount = {
   handle: (req: IncomingMessage, res: ServerResponse) => Promise<void>;
@@ -68,7 +49,8 @@ export async function mountMcpStreamableHttp(config: McpConfig): Promise<McpMoun
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     // Read the per-request CallContext from headers. A malformed X-Mrplex-Scope
-    // is a client error — refuse before the SDK parses the frame.
+    // is a client error (KernelError "filter_invalid") — refuse before the SDK
+    // parses the frame.
     let ctx: CallContext;
     try {
       ctx = contextFromHeaders(req);
@@ -76,10 +58,11 @@ export async function mountMcpStreamableHttp(config: McpConfig): Promise<McpMoun
       res.statusCode = 400;
       res.setHeader("Content-Type", "application/json");
       res.end(
-        JSON.stringify({
-          code: "filter_invalid",
-          data: { reason: err instanceof Error ? err.message : String(err) },
-        }),
+        JSON.stringify(
+          err instanceof KernelError
+            ? { code: err.code, data: err.data }
+            : { code: "filter_invalid", data: { reason: String(err) } },
+        ),
       );
       return;
     }

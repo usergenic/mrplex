@@ -466,6 +466,24 @@ describe("REST scope header", () => {
     expect((await readJson<{ code: string }>(r)).code).toBe("filter_invalid");
   });
 
+  it("a structurally-invalid claim (missing repo) → 400 filter_invalid, not silent deny", async () => {
+    const r = await fetch(`${base}/repos`, {
+      headers: { "X-Mrplex-Scope": JSON.stringify([{ read: ["**"] }]) },
+    });
+    expect(r.status).toBe(400);
+    expect((await readJson<{ code: string }>(r)).code).toBe("filter_invalid");
+  });
+
+  it("POST /query body scope: a repo-less claim → 400 filter_invalid, not empty results", async () => {
+    const r = await fetch(`${base}/query`, {
+      method: "POST",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ repo: "notes", scope: [{ read: ["public.md"] }] }),
+    });
+    expect(r.status).toBe(400);
+    expect((await readJson<{ code: string }>(r)).code).toBe("filter_invalid");
+  });
+
   it("X-Mrplex-Author stamps the author on a write", async () => {
     const r = await fetch(`${base}/repos/notes/docs/authored.md`, {
       method: "PUT",
@@ -480,6 +498,24 @@ describe("REST scope header", () => {
     expect(r.status).toBe(201);
     const v = await readJson<{ author: string }>(r);
     expect(v.author).toBe("Ripley <ripley@nostromo>");
+  });
+
+  it("an over-length X-Mrplex-Author → 400 filter_invalid (not a 500)", async () => {
+    // A raw control char can't ride an HTTP header (undici rejects it
+    // client-side), so exercise the same resolveAuthor rejection path via the
+    // length cap — the point is that bad author input stays 4xx, not 500.
+    const r = await fetch(`${base}/repos/notes/docs/bad-author.md`, {
+      method: "PUT",
+      headers: {
+        ...authHeaders(),
+        "Content-Type": "text/markdown",
+        "If-None-Match": "*",
+        "X-Mrplex-Author": "a".repeat(513),
+      },
+      body: "log\n",
+    });
+    expect(r.status).toBe(400);
+    expect((await readJson<{ code: string }>(r)).code).toBe("filter_invalid");
   });
 });
 

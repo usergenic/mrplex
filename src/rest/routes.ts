@@ -14,13 +14,14 @@
 
 import { createHash } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { type CallContext, parseScopeClaims } from "../kernel/context.js";
+import { type CallContext, validateScopeClaims } from "../kernel/context.js";
 import { KernelError } from "../kernel/errors.js";
 import type { Kernel } from "../kernel/kernel.js";
 import type { PathConfigOverride } from "../kernel/path-config.js";
 import type { QuerySpec } from "../kernel/query/query.js";
 import type { Version } from "../kernel/wire.js";
 import { appendSystemProperty, extractSystemProperties } from "../markdown/frontmatter.js";
+import { contextFromHeaders } from "../server/headers.js";
 import { httpErrorForThrowable } from "../server/http-error.js";
 import type { Storage } from "../storage/types.js";
 import { etagOf, parseIfMatch, parseIfNoneMatch } from "./conditional.js";
@@ -241,35 +242,6 @@ async function dispatch(
   }
 
   notFound(res);
-}
-
-// -----------------------------------------------------------------------------
-// CallContext from X-Mrplex-* headers (noauth plan §4). No auth — the header is
-// the shell-injection path. `X-Mrplex-Author` stamps writes; `X-Mrplex-Scope`
-// (JSON ScopeClaim[]) narrows reads. Malformed scope JSON → filter_invalid.
-// -----------------------------------------------------------------------------
-
-function contextFromHeaders(req: IncomingMessage): CallContext {
-  const ctx: CallContext = {};
-  const author = headerValue(req.headers["x-mrplex-author"]);
-  if (author !== undefined) ctx.author = author;
-  const scope = headerValue(req.headers["x-mrplex-scope"]);
-  if (scope !== undefined) {
-    try {
-      ctx.scope = parseScopeClaims(scope);
-    } catch (err) {
-      throw new KernelError("filter_invalid", {
-        reason: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
-  return ctx;
-}
-
-function headerValue(v: string | string[] | undefined): string | undefined {
-  if (v === undefined) return undefined;
-  const s = Array.isArray(v) ? v[0] : v;
-  return s !== undefined && s.length > 0 ? s : undefined;
 }
 
 // -----------------------------------------------------------------------------
@@ -629,13 +601,12 @@ async function dispatchQuery(
     const body = parseJsonBody(await readBody(req)) as Record<string, unknown>;
     // POST /query accepts a `scope` field in the body — but the header wins
     // when both are present (the shell sits closer to the credential than the
-    // body author does; noauth plan §4, decision 8).
+    // body author does; noauth plan §4, decision 8). Validate the body claim
+    // structurally (same path as the header) so a repo-less claim is a loud
+    // filter_invalid, not a silent deny_all empty result.
     if (body.scope !== undefined) {
       if (ctx.scope === undefined) {
-        if (!Array.isArray(body.scope)) {
-          throw new KernelError("filter_invalid", { reason: "scope must be an array of claims" });
-        }
-        ctx.scope = body.scope as CallContext["scope"];
+        ctx.scope = validateScopeClaims(body.scope);
       }
       const { scope: _scope, ...rest } = body;
       spec = coerceQuerySpec(rest);

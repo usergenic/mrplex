@@ -278,6 +278,13 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
         if (claims && !claimsGrantRepo(claims, repo.slug)) throw repoNotFound(slug);
         return toRepoWire(repo);
       },
+      // The five destructive repo ops below intentionally ignore `ctx` (hence
+      // `_ctx`): per noauth-plan decision 11, destructive repo ops are ungated —
+      // reachable = allowed; the shell gates them by route/tool-name. This is
+      // deliberately asymmetric with `list`/`get` above, which DO filter by
+      // read claim: a scoped caller can `delete` a repo it can't `list`. That
+      // asymmetry is the design, not an oversight — don't "fix" it by threading
+      // claims through here.
       async create(_ctx, slug) {
         validateSlug(slug, serverPathConfig);
         if (await storage.repos_by_slug(slug)) throw slugCollisionError(slug);
