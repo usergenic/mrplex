@@ -14,8 +14,9 @@
  * itself ignores it. serve deliberately bypasses the seam — it IS the server.
  */
 
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { Command, InvalidArgumentError, Option } from "commander";
+import { parseDocument as parseYamlDocument } from "yaml";
 import type { KernelClient } from "../client/kernel-client.js";
 import { openLocalClient } from "../client/local.js";
 import { openRemoteClient } from "../client/remote-mcp.js";
@@ -28,6 +29,10 @@ import { KernelError } from "../kernel/errors.js";
 import { extractSystemProperties, split as splitFrontmatter } from "../markdown/frontmatter.js";
 import { startMcpStdio } from "../mcp/server.js";
 import { startServer } from "../server/serve.js";
+import { fileAuditSink } from "../shell/audit.js";
+import { mintKey } from "../shell/keys.js";
+import { type Entitlement, PolicyError, compile, loadPolicyFile } from "../shell/policy.js";
+import { startShellServer } from "../shell/serve.js";
 import { normalizeDatabaseUrl, openStorage } from "../storage/registry.js";
 import { type CliConfig, loadConfig, saveConfig } from "./config.js";
 import { exitCodeForKernelError } from "./exit-codes.js";
@@ -137,6 +142,25 @@ function resolveServer(opts: GlobalOpts): string | undefined {
 }
 
 /**
+ * The policy|unsafe gate (auth-shell plan decision 11). A server-starting
+ * command demands EXACTLY ONE of --policy or --unsafe. Throws a cli_usage
+ * error otherwise so the CLI exits non-zero with a clear message — the raw
+ * kernel is a choice you spell out, never a default you fall into.
+ */
+function assertServeGate(policy: string | undefined, unsafe: boolean): void {
+  const hasPolicy = policy !== undefined;
+  if (hasPolicy === unsafe) {
+    const err = new Error(
+      hasPolicy
+        ? "--policy and --unsafe are mutually exclusive; pick one"
+        : "refusing to start: pass --policy <file> (authenticated) or --unsafe (full-trust, no auth)",
+    );
+    (err as unknown as { code: string }).code = "cli_usage";
+    throw err;
+  }
+}
+
+/**
  * Resolve the target repo slug for `docs *` commands — flag → env → config.
  * Throws a friendly cli-usage error if none is set; the CLI turns that into
  * a non-zero exit.
@@ -239,6 +263,55 @@ function reportError(err: unknown): never {
   process.exit(1);
 }
 
+/**
+ * Append a minted key's hash under `principals.<id>.keys` in a policy file,
+ * preserving comments and formatting via the yaml Document API (issuance is a
+ * diff, auth-shell decision 3). Throws if the principal isn't present — mint
+ * doesn't invent principals.
+ */
+function appendKeyToPolicy(policyPath: string, principalId: string, hash: string): void {
+  const text = readFileSync(policyPath, "utf8");
+  const doc = parseYamlDocument(text);
+  const principals = doc.getIn(["principals"]);
+  if (!principals || !doc.hasIn(["principals", principalId])) {
+    const err = new Error(`policy: principal "${principalId}" not found in ${policyPath}`);
+    (err as unknown as { code: string }).code = "cli_usage";
+    throw err;
+  }
+  if (!doc.hasIn(["principals", principalId, "keys"])) {
+    doc.setIn(["principals", principalId, "keys"], doc.createNode([hash]));
+  } else {
+    const keys = doc.getIn(["principals", principalId, "keys"]) as {
+      add?: (v: unknown) => void;
+    };
+    if (typeof keys.add !== "function") {
+      const err = new Error(`policy: principals.${principalId}.keys is not a list`);
+      (err as unknown as { code: string }).code = "cli_usage";
+      throw err;
+    }
+    keys.add(hash);
+  }
+  writeFileSync(policyPath, String(doc));
+}
+
+/** Human-readable dump of an effective entitlement — the operator's "why can't
+ * X read Y" answer. */
+function renderEntitlement(principalId: string, e: Entitlement): string {
+  const claims = (list: Entitlement["read"]): string =>
+    list.length === 0
+      ? "    (none)\n"
+      : list
+          .map((c) => `    repo=${JSON.stringify(c.repo)} paths=${JSON.stringify(c.paths)}\n`)
+          .join("");
+  return (
+    `principal: ${principalId}\n` +
+    `author:    ${e.author}\n` +
+    `destructive: ${e.destructive}   impersonate: ${e.impersonate}\n` +
+    `read:\n${claims(e.read)}` +
+    `write:\n${claims(e.write)}`
+  );
+}
+
 function readFromFile(pathOrDash: string): string {
   if (pathOrDash === "-") {
     return readFileSync(0, "utf8"); // fd 0 = stdin
@@ -311,17 +384,27 @@ function buildProgram(): Command {
     });
 
   // -------- serve --------
+  // The policy|unsafe gate (auth-shell plan decision 11): a command that starts
+  // a server over a local database must spell out exactly one of --policy (run
+  // the authenticating shell) or --unsafe (raw full-trust kernel). Neither →
+  // refuse; both → refuse. Full trust is never the result of a forgotten flag.
   program
     .command("serve")
     .description("start HTTP surfaces (REST + MCP Streamable HTTP) — §7.3")
+    .option("--policy <file>", "YAML policy file — run the authenticating shell (auth-shell plan)")
+    .option("--unsafe", "serve the raw full-trust kernel with NO auth (say what it is)", false)
+    .option("--audit <file>", "append a JSONL audit line per authenticated call (--policy only)")
     .option("--port <n>", "TCP port (default 8321)", parsePositiveInt)
     .option("--host <h>", "bind host (default 127.0.0.1)")
-    .option("--mcp-stdio", "also expose MCP over STDIO for the launch token", false)
+    .option("--mcp-stdio", "also expose MCP over STDIO for the launch token (--unsafe only)", false)
     .option("--embed-url <url>", "HTTP embedding endpoint (§5.3)")
     .option("--embed-cmd <cmd>", "subprocess embedding command (JSON-lines over stdio)")
     .action(function (this: Command) {
       const gopts = this.optsWithGlobals<GlobalOpts>();
       const localOpts = this.opts<{
+        policy?: string;
+        unsafe: boolean;
+        audit?: string;
         port?: number;
         host?: string;
         mcpStdio: boolean;
@@ -330,11 +413,49 @@ function buildProgram(): Command {
       }>();
       (async () => {
         try {
+          assertServeGate(localOpts.policy, localOpts.unsafe);
           const database = resolveDatabase(gopts);
           const embedCfg = resolveEmbedConfig({
             embed_url: localOpts.embedUrl,
             embed_cmd: localOpts.embedCmd,
           });
+
+          // Authenticated shell mode.
+          if (localOpts.policy !== undefined) {
+            if (localOpts.mcpStdio) {
+              const err = new Error(
+                "--mcp-stdio is unsafe-mode only; use `mrplex mcp-stdio` instead",
+              );
+              (err as unknown as { code: string }).code = "cli_conflict";
+              throw err;
+            }
+            const shellHandle = await startShellServer({
+              database,
+              policyPath: localOpts.policy,
+              host: localOpts.host,
+              port: localOpts.port,
+              embed: embedCfg,
+              auditPath: localOpts.audit,
+              auditSinkFor: localOpts.audit
+                ? (principal) => fileAuditSink(localOpts.audit as string, principal)
+                : undefined,
+            });
+            process.on("SIGHUP", () => shellHandle.reloadPolicy());
+            const shutdown = async () => {
+              await shellHandle.close();
+              process.exit(0);
+            };
+            process.on("SIGINT", () => void shutdown());
+            process.on("SIGTERM", () => void shutdown());
+            return;
+          }
+
+          // Unsafe raw-kernel mode.
+          if (localOpts.audit !== undefined) {
+            const err = new Error("--audit requires --policy (nothing to attribute without auth)");
+            (err as unknown as { code: string }).code = "cli_conflict";
+            throw err;
+          }
           const handle = await startServer({
             database,
             host: localOpts.host,
@@ -423,6 +544,67 @@ function buildProgram(): Command {
         process.stdout.write(
           `database: ${c.database ?? "(unset)"}\nserver:   ${c.server ?? "(unset)"}\nrepo:     ${c.repo ?? "(unset)"}\nauthor:   ${c.author ?? "(unset)"}\ntoken:    ${c.token ? "(set)" : "(unset)"}\n`,
         );
+      }
+    });
+
+  // -------- key (policy tooling) --------
+  // `key mint` and `policy check` read/edit the policy file by definition, so
+  // they take --policy directly and never touch the serve gate (auth-shell §1
+  // "Policy tooling").
+  const key = program.command("key").description("API-key tooling for the auth shell");
+  key
+    .command("mint <principal>")
+    .description("generate a new API key; print the plaintext ONCE and the sha256 hash to store")
+    .option("--policy <file>", "append the hash under the principal's `keys:` in this policy file")
+    .action(function (this: Command, principal: string) {
+      const localOpts = this.opts<{ policy?: string }>();
+      try {
+        const { plaintext, hash } = mintKey();
+        if (localOpts.policy !== undefined) {
+          appendKeyToPolicy(localOpts.policy, principal, hash);
+          process.stderr.write(`key: appended hash under principals.${principal}.keys\n`);
+        } else {
+          process.stderr.write(
+            `key: add this line under principals.${principal}.keys in your policy file:\n  - ${hash}\n`,
+          );
+        }
+        // The plaintext is shown ONCE, on stdout, so it can be piped/captured;
+        // it is never stored — only the hash lives in the policy file.
+        process.stdout.write(`${plaintext}\n`);
+      } catch (err) {
+        reportError(err);
+      }
+    });
+
+  // -------- policy --------
+  const policy = program.command("policy").description("policy-file tooling for the auth shell");
+  policy
+    .command("check [principal]")
+    .description("validate a policy file; with a principal, print its effective entitlement")
+    .requiredOption("--policy <file>", "policy file to load")
+    .action(function (this: Command, principal: string | undefined) {
+      const localOpts = this.opts<{ policy: string }>();
+      const gopts = this.optsWithGlobals<GlobalOpts>();
+      try {
+        const loaded = loadPolicyFile(localOpts.policy);
+        if (principal === undefined) {
+          const nP = Object.keys(loaded.principals).length;
+          const nR = Object.keys(loaded.roles).length;
+          process.stderr.write(`policy OK: ${nR} role(s), ${nP} principal(s)\n`);
+          return;
+        }
+        const entitlement = compile(loaded, principal);
+        if (gopts.json) {
+          process.stdout.write(`${JSON.stringify(entitlement, null, 2)}\n`);
+        } else {
+          process.stdout.write(renderEntitlement(principal, entitlement));
+        }
+      } catch (err) {
+        if (err instanceof PolicyError) {
+          process.stderr.write(`policy: ${err.message}\n`);
+          process.exit(1);
+        }
+        reportError(err);
       }
     });
 

@@ -21,7 +21,11 @@ import type { PathConfigOverride } from "../kernel/path-config.js";
 import type { QuerySpec } from "../kernel/query/query.js";
 import type { Version } from "../kernel/wire.js";
 import { appendSystemProperty, extractSystemProperties } from "../markdown/frontmatter.js";
-import { type ContextForRequest, contextFromHeaders } from "../server/headers.js";
+import {
+  type ContextForRequest,
+  type KernelForRequest,
+  contextFromHeaders,
+} from "../server/headers.js";
 import { httpErrorForThrowable } from "../server/http-error.js";
 import type { Storage } from "../storage/types.js";
 import { etagOf, parseIfMatch, parseIfNoneMatch } from "./conditional.js";
@@ -45,6 +49,12 @@ export type RestConfig = {
    * entitlement-derived context here.
    */
   contextForRequest?: ContextForRequest;
+  /**
+   * How each request obtains its Kernel. Defaults to the shared `kernel`; an
+   * authenticating shell returns a per-principal guarded kernel (and may throw
+   * to reject the request before any dispatch).
+   */
+  kernelForRequest?: KernelForRequest;
 };
 
 // -----------------------------------------------------------------------------
@@ -211,10 +221,14 @@ function queryEtag(versions: readonly Version[]): string {
 export function mountRestSurface(config: RestConfig): RestMount {
   const { kernel, storage } = config;
   const contextForRequest = config.contextForRequest ?? contextFromHeaders;
+  const kernelForRequest = config.kernelForRequest ?? (() => kernel);
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     try {
-      await dispatch(req, res, kernel, storage, contextForRequest);
+      // Resolve the per-request kernel FIRST — the shell authenticates here and
+      // may throw (e.g. 401) before any routing happens.
+      const reqKernel = await kernelForRequest(req);
+      await dispatch(req, res, reqKernel, storage, contextForRequest);
     } catch (err) {
       writeError(res, err);
     }
