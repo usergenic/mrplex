@@ -272,7 +272,7 @@ describe("scope: the visible graph is the readable graph (§5 decision 5)", () =
     await create("secret/moc.md", { body: "[p](/public.md)" });
 
     const scoped: CallContext = {
-      scope: [{ repo: "notes", read: ["**", "!secret/**"] }],
+      scope: [{ repo: "notes", paths: ["**", "!secret/**"] }],
     };
     // public.md is referenced only by an unreadable source → not "in" it.
     expect(await q('$in_static("**")', scoped)).toEqual([]);
@@ -284,7 +284,7 @@ describe("scope: the visible graph is the readable graph (§5 decision 5)", () =
     await create("secret/target.md");
     await create("note.md", { body: "[t](secret/target.md)" });
     const scoped: CallContext = {
-      scope: [{ repo: "notes", read: ["**", "!secret/**"] }],
+      scope: [{ repo: "notes", paths: ["**", "!secret/**"] }],
     };
     // note.md links to a secret target → $has_static hides it for the caller.
     expect(await q('$has_static("secret/**")', scoped)).toEqual([]);

@@ -21,13 +21,17 @@
 import { KernelError } from "./errors.js";
 
 /**
- * A read-visibility claim. `repo` is a slug, glob, or "*" — evaluated against
- * the repos existing at call time, every call (no issuance snapshot, no id
- * binding). `read` is a gitignore-style path glob list (§8.2 semantics).
+ * A territory claim. `repo` is a slug, glob, or "*" — evaluated against the
+ * repos existing at call time, every call (no issuance snapshot, no id
+ * binding). `paths` is a gitignore-style path glob list (§8.2 semantics).
+ *
+ * Deliberately direction-neutral: a claim names repos/paths, not a direction.
+ * Meaning comes from where it sits — `ctx.scope` is read visibility; the
+ * auth-shell reuses the same type for its shell-enforced write matcher.
  */
 export type ScopeClaim = {
   repo: string | string[];
-  read?: string | string[];
+  paths?: string | string[];
 };
 
 export type CallContext = {
@@ -73,15 +77,15 @@ export function validateScopeClaims(parsed: unknown): ScopeClaim[] {
     if (typeof entry !== "object" || entry === null) {
       throw new KernelError("filter_invalid", { reason: "scope claim must be an object" });
     }
-    const e = entry as { repo?: unknown; read?: unknown };
+    const e = entry as { repo?: unknown; paths?: unknown };
     if (!isStrOrStrList(e.repo)) {
       throw new KernelError("filter_invalid", {
         reason: "scope claim `repo` must be a string or string[]",
       });
     }
-    if (e.read !== undefined && !isStrOrStrList(e.read)) {
+    if (e.paths !== undefined && !isStrOrStrList(e.paths)) {
       throw new KernelError("filter_invalid", {
-        reason: "scope claim `read` must be a string or string[]",
+        reason: "scope claim `paths` must be a string or string[]",
       });
     }
   }

@@ -22,13 +22,19 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import type { CallContext } from "../kernel/context.js";
 import { KernelError } from "../kernel/errors.js";
 import type { Kernel } from "../kernel/kernel.js";
-import { contextFromHeaders } from "../server/headers.js";
+import { type ContextForRequest, contextFromHeaders } from "../server/headers.js";
 import type { Storage } from "../storage/types.js";
 import { TOOL_REGISTRY, toolByName } from "./tools.js";
 
 export type McpConfig = {
   kernel: Kernel;
   storage: Storage;
+  /**
+   * How each request becomes a CallContext. Defaults to reading the
+   * `X-Mrplex-*` headers; an authenticating shell substitutes an
+   * entitlement-derived context here.
+   */
+  contextForRequest?: ContextForRequest;
 };
 
 export type McpMount = {
@@ -46,14 +52,16 @@ export type McpMount = {
  */
 export async function mountMcpStreamableHttp(config: McpConfig): Promise<McpMount> {
   const { kernel } = config;
+  const contextForRequest = config.contextForRequest ?? contextFromHeaders;
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    // Read the per-request CallContext from headers. A malformed X-Mrplex-Scope
-    // is a client error (KernelError "filter_invalid") — refuse before the SDK
-    // parses the frame.
+    // Resolve the per-request CallContext (headers by default; a shell front
+    // may derive it from a credential). A malformed X-Mrplex-Scope — or a
+    // shell's auth rejection — is a client error (KernelError "filter_invalid")
+    // refused before the SDK parses the frame.
     let ctx: CallContext;
     try {
-      ctx = contextFromHeaders(req);
+      ctx = await contextForRequest(req);
     } catch (err) {
       res.statusCode = 400;
       res.setHeader("Content-Type", "application/json");

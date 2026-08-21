@@ -449,7 +449,7 @@ describe("REST scope header", () => {
   });
 
   it("X-Mrplex-Scope narrows query visibility", async () => {
-    const scope = JSON.stringify([{ repo: "notes", read: ["public.md"] }]);
+    const scope = JSON.stringify([{ repo: "notes", paths: ["public.md"] }]);
     const r = await fetch(`${base}/query?repo=notes`, {
       headers: { "X-Mrplex-Scope": scope },
     });
@@ -468,7 +468,7 @@ describe("REST scope header", () => {
 
   it("a structurally-invalid claim (missing repo) → 400 filter_invalid, not silent deny", async () => {
     const r = await fetch(`${base}/repos`, {
-      headers: { "X-Mrplex-Scope": JSON.stringify([{ read: ["**"] }]) },
+      headers: { "X-Mrplex-Scope": JSON.stringify([{ paths: ["**"] }]) },
     });
     expect(r.status).toBe(400);
     expect((await readJson<{ code: string }>(r)).code).toBe("filter_invalid");
@@ -478,7 +478,7 @@ describe("REST scope header", () => {
     const r = await fetch(`${base}/query`, {
       method: "POST",
       headers: { ...authHeaders(), "Content-Type": "application/json" },
-      body: JSON.stringify({ repo: "notes", scope: [{ read: ["public.md"] }] }),
+      body: JSON.stringify({ repo: "notes", scope: [{ paths: ["public.md"] }] }),
     });
     expect(r.status).toBe(400);
     expect((await readJson<{ code: string }>(r)).code).toBe("filter_invalid");
