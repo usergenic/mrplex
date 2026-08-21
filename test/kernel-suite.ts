@@ -6,12 +6,15 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { Actor } from "../src/kernel/auth/actor.js";
-import { SYSTEM_ACTOR } from "../src/kernel/auth/actor.js";
+import type { CallContext } from "../src/kernel/context.js";
 import { KernelError } from "../src/kernel/errors.js";
 import { type Kernel, createKernel } from "../src/kernel/kernel.js";
 import { decodeVersionId } from "../src/kernel/version-id.js";
 import type { Storage } from "../src/storage/types.js";
+
+// Full-access context — empty context is full visibility with the default
+// author (noauth plan §1). The suite's "root" caller.
+const ROOT: CallContext = {};
 
 export type AdapterFactory = {
   name: string;
@@ -38,8 +41,6 @@ export function runKernelSuite(factory: AdapterFactory): void {
       teardown = opened.teardown;
       kernel = createKernel(storage);
 
-      const alice = await storage.users_create({ slug: "alice", created_at: T(0) });
-      await storage.users_create({ slug: "bob", created_at: T(1) });
       const notes = await storage.repos_create({ slug: "notes", created_at: T(2) });
       await storage.repos_create({ slug: ":deleted-old", created_at: T(3) });
 
@@ -53,7 +54,7 @@ export function runKernelSuite(factory: AdapterFactory): void {
         frontmatter_raw: "title: Welcome\n",
         frontmatter: { title: "Welcome" },
         body: "one\n",
-        author_id: alice.id,
+        author: "alice",
         created_at: T(10),
       });
       const w2 = await storage.version_insert({
@@ -64,7 +65,7 @@ export function runKernelSuite(factory: AdapterFactory): void {
         frontmatter_raw: "title: Welcome\n",
         frontmatter: { title: "Welcome" },
         body: "two\n",
-        author_id: alice.id,
+        author: "alice",
         created_at: T(11),
       });
       await storage.version_insert({
@@ -75,7 +76,7 @@ export function runKernelSuite(factory: AdapterFactory): void {
         frontmatter_raw: "title: Welcome\n",
         frontmatter: { title: "Welcome" },
         body: "three\n",
-        author_id: alice.id,
+        author: "alice",
         created_at: T(12),
       });
 
@@ -89,7 +90,7 @@ export function runKernelSuite(factory: AdapterFactory): void {
         frontmatter_raw: "",
         frontmatter: {},
         body: "hello world\n",
-        author_id: alice.id,
+        author: "alice",
         created_at: T(20),
       });
     });
@@ -101,19 +102,19 @@ export function runKernelSuite(factory: AdapterFactory): void {
 
     describe("repos.list", () => {
       it("hides system-namespaced repos by default", async () => {
-        const repos = await kernel.repos.list(SYSTEM_ACTOR);
+        const repos = await kernel.repos.list(ROOT);
         expect(repos.map((r) => r.repo)).toEqual(["notes"]);
       });
 
       it("surfaces system-namespaced repos when include_system: true", async () => {
-        const repos = await kernel.repos.list(SYSTEM_ACTOR, { include_system: true });
+        const repos = await kernel.repos.list(ROOT, { include_system: true });
         expect(repos.map((r) => r.repo)).toEqual([":deleted-old", "notes"]);
       });
     });
 
     describe("repos.get", () => {
       it("returns the repo envelope", async () => {
-        expect(await kernel.repos.get(SYSTEM_ACTOR, "notes")).toEqual({
+        expect(await kernel.repos.get(ROOT, "notes")).toEqual({
           repo: "notes",
           path_config: null,
         });
@@ -121,7 +122,7 @@ export function runKernelSuite(factory: AdapterFactory): void {
 
       it("throws repo_not_found for an unknown slug", async () => {
         try {
-          await kernel.repos.get(SYSTEM_ACTOR, "nope");
+          await kernel.repos.get(ROOT, "nope");
           throw new Error("expected throw");
         } catch (err) {
           expect(err).toBeInstanceOf(KernelError);
@@ -131,15 +132,9 @@ export function runKernelSuite(factory: AdapterFactory): void {
       });
     });
 
-    describe("users.list", () => {
-      it("returns all users, ordered by slug", async () => {
-        expect(await kernel.users.list(SYSTEM_ACTOR)).toEqual([{ user: "alice" }, { user: "bob" }]);
-      });
-    });
-
     describe("docs.get", () => {
       it("returns the current version at a path with the full envelope", async () => {
-        const v = await kernel.docs.get(SYSTEM_ACTOR, "notes", "welcome.md");
+        const v = await kernel.docs.get(ROOT, "notes", "welcome.md");
         expect(v.body).toBe("three\n");
         expect(v.next_version_id).toBeNull();
         expect(v.prev_version_id).toMatch(/^v\d+$/);
@@ -148,11 +143,11 @@ export function runKernelSuite(factory: AdapterFactory): void {
         expect(v.path).toBe("welcome.md");
         expect(v.frontmatter).toEqual({ title: "Welcome" });
         expect(v.frontmatter_raw).toBe("title: Welcome\n");
-        expect(v.author).toEqual({ user: "alice" });
+        expect(v.author).toBe("alice");
       });
 
       it("returns a document with empty frontmatter", async () => {
-        const v = await kernel.docs.get(SYSTEM_ACTOR, "notes", "readme.md");
+        const v = await kernel.docs.get(ROOT, "notes", "readme.md");
         expect(v.frontmatter).toEqual({});
         expect(v.frontmatter_raw).toBe("");
         expect(v.body).toBe("hello world\n");
@@ -160,7 +155,7 @@ export function runKernelSuite(factory: AdapterFactory): void {
 
       it("throws doc_not_found for an unknown path", async () => {
         try {
-          await kernel.docs.get(SYSTEM_ACTOR, "notes", "missing.md");
+          await kernel.docs.get(ROOT, "notes", "missing.md");
           throw new Error("expected throw");
         } catch (err) {
           expect((err as KernelError).code).toBe("doc_not_found");
@@ -173,7 +168,7 @@ export function runKernelSuite(factory: AdapterFactory): void {
 
       it("throws repo_not_found for an unknown repo", async () => {
         try {
-          await kernel.docs.get(SYSTEM_ACTOR, "nope", "welcome.md");
+          await kernel.docs.get(ROOT, "nope", "welcome.md");
           throw new Error("expected throw");
         } catch (err) {
           expect((err as KernelError).code).toBe("repo_not_found");
@@ -183,17 +178,17 @@ export function runKernelSuite(factory: AdapterFactory): void {
 
     describe("docs.get_version", () => {
       it("returns a historical version by id", async () => {
-        const current = await kernel.docs.get(SYSTEM_ACTOR, "notes", "welcome.md");
+        const current = await kernel.docs.get(ROOT, "notes", "welcome.md");
         const prevId = current.prev_version_id;
         if (!prevId) throw new Error("expected prev version");
-        const prev = await kernel.docs.get_version(SYSTEM_ACTOR, "notes", prevId);
+        const prev = await kernel.docs.get_version(ROOT, "notes", prevId);
         expect(prev.body).toBe("two\n");
         expect(prev.next_version_id).toBe(current.version_id);
       });
 
       it("throws version_not_found for a malformed id", async () => {
         try {
-          await kernel.docs.get_version(SYSTEM_ACTOR, "notes", "not-a-version");
+          await kernel.docs.get_version(ROOT, "notes", "not-a-version");
           throw new Error("expected throw");
         } catch (err) {
           expect((err as KernelError).code).toBe("version_not_found");
@@ -203,8 +198,6 @@ export function runKernelSuite(factory: AdapterFactory): void {
       it("throws version_not_found for an id in a different repo", async () => {
         const other = await storage.repos_create({ slug: "other", created_at: T(30) });
         const doc = await storage.documents_create(other.id);
-        const alice = await storage.users_by_slug("alice");
-        if (!alice) throw new Error("expected alice");
         const v = await storage.version_insert({
           document_id: doc.id,
           repo_id: other.id,
@@ -213,11 +206,11 @@ export function runKernelSuite(factory: AdapterFactory): void {
           frontmatter_raw: "",
           frontmatter: {},
           body: "x\n",
-          author_id: alice.id,
+          author: "alice",
           created_at: T(31),
         });
         try {
-          await kernel.docs.get_version(SYSTEM_ACTOR, "notes", `v${v.id}`);
+          await kernel.docs.get_version(ROOT, "notes", `v${v.id}`);
           throw new Error("expected throw");
         } catch (err) {
           expect((err as KernelError).code).toBe("version_not_found");
@@ -227,12 +220,12 @@ export function runKernelSuite(factory: AdapterFactory): void {
 
     describe("docs.history", () => {
       it("returns all versions of a document newest-first", async () => {
-        const history = await kernel.docs.history(SYSTEM_ACTOR, "notes", "welcome.md");
+        const history = await kernel.docs.history(ROOT, "notes", "welcome.md");
         expect(history.map((v) => v.body)).toEqual(["three\n", "two\n", "one\n"]);
       });
 
       it("honors --limit", async () => {
-        const history = await kernel.docs.history(SYSTEM_ACTOR, "notes", "welcome.md", {
+        const history = await kernel.docs.history(ROOT, "notes", "welcome.md", {
           limit: 2,
         });
         expect(history).toHaveLength(2);
@@ -240,7 +233,7 @@ export function runKernelSuite(factory: AdapterFactory): void {
       });
 
       it("honors --before", async () => {
-        const history = await kernel.docs.history(SYSTEM_ACTOR, "notes", "welcome.md", {
+        const history = await kernel.docs.history(ROOT, "notes", "welcome.md", {
           before: T(12),
         });
         expect(history.map((v) => v.body)).toEqual(["two\n", "one\n"]);
@@ -248,7 +241,7 @@ export function runKernelSuite(factory: AdapterFactory): void {
 
       it("throws doc_not_found when the path has no live document", async () => {
         try {
-          await kernel.docs.history(SYSTEM_ACTOR, "notes", "missing.md");
+          await kernel.docs.history(ROOT, "notes", "missing.md");
           throw new Error("expected throw");
         } catch (err) {
           expect((err as KernelError).code).toBe("doc_not_found");
@@ -263,10 +256,9 @@ export function runKernelSuite(factory: AdapterFactory): void {
     // race case.
     // -----------------------------------------------------------------
 
-    async function aliceActor(): Promise<Actor> {
-      const alice = await storage.users_by_slug("alice");
-      if (!alice) throw new Error("alice not seeded");
-      return { user_id: alice.id, admin: true, scopes: [] };
+    // Full-access context that stamps "alice" as the author on writes.
+    async function aliceActor(): Promise<CallContext> {
+      return { author: "alice" };
     }
 
     describe("docs.create / put / delete round-trip", () => {
@@ -471,32 +463,24 @@ export function runKernelSuite(factory: AdapterFactory): void {
       });
     });
 
-    describe("query — scope (§8.2 silent drop)", () => {
-      it("non-admin caller sees only rows their read globs cover", async () => {
+    describe("query — scope claim (§8.2 silent drop)", () => {
+      it("a read claim narrows results to the globs it covers", async () => {
         const admin = await aliceActor();
         await kernel.docs.create(admin, "notes", "public.md", { frontmatter_raw: "", body: "" });
         await kernel.docs.create(admin, "notes", "secret/hidden.md", {
           frontmatter_raw: "",
           body: "",
         });
-        const repo = await storage.repos_by_slug("notes");
-        if (!repo) throw new Error("notes not seeded");
-        const scoped: Actor = {
-          user_id: admin.user_id,
-          admin: false,
-          scopes: [{ repos: [repo.id], read: ["public.md"] }],
-        };
+        const scoped: CallContext = { scope: [{ repo: "notes", read: ["public.md"] }] };
         const rows = await kernel.query(scoped, { repo: "notes" });
         expect(rows.map((r) => r.path)).toEqual(["public.md"]);
       });
 
-      it("no scopes at all → empty result (deny_all), never a 403", async () => {
+      it("an empty scope array → empty result (deny_all), never a 403", async () => {
         const admin = await aliceActor();
         await kernel.docs.create(admin, "notes", "any.md", { frontmatter_raw: "", body: "" });
-        const empty: Actor = { user_id: admin.user_id, admin: false, scopes: [] };
-        // Empty scopes → actorBindsRepo excludes notes entirely, so
-        // targetRepos = [] and result = []. No forbidden thrown.
-        const rows = await kernel.query(empty, { repo: "notes" });
+        // No claim binds notes → targetRepos = [] and result = []. No throw.
+        const rows = await kernel.query({ scope: [] }, { repo: "notes" });
         expect(rows).toEqual([]);
       });
     });
@@ -513,9 +497,8 @@ export function runKernelSuite(factory: AdapterFactory): void {
         // Direct storage-level insert bypassing the kernel: try to add
         // another live row for the same document. The partial unique
         // index must reject it.
-        const alice = await storage.users_by_slug("alice");
         const notes = await storage.repos_by_slug("notes");
-        if (!alice || !notes) throw new Error("expected seeded fixtures");
+        if (!notes) throw new Error("expected seeded fixtures");
         await expect(
           storage.version_insert({
             document_id: inserted.document_id,
@@ -525,16 +508,15 @@ export function runKernelSuite(factory: AdapterFactory): void {
             frontmatter_raw: "",
             frontmatter: {},
             body: "b",
-            author_id: alice.id,
+            author: "alice",
             created_at: T(200),
           }),
         ).rejects.toThrow();
       });
 
       it("versions_repo_path_current_uidx: two live documents at the same (repo, path) rejected", async () => {
-        const alice = await storage.users_by_slug("alice");
         const notes = await storage.repos_by_slug("notes");
-        if (!alice || !notes) throw new Error("expected seeded fixtures");
+        if (!notes) throw new Error("expected seeded fixtures");
         const docA = await storage.documents_create(notes.id);
         const docB = await storage.documents_create(notes.id);
         await storage.version_insert({
@@ -545,7 +527,7 @@ export function runKernelSuite(factory: AdapterFactory): void {
           frontmatter_raw: "",
           frontmatter: {},
           body: "a",
-          author_id: alice.id,
+          author: "alice",
           created_at: T(210),
         });
         await expect(
@@ -557,7 +539,7 @@ export function runKernelSuite(factory: AdapterFactory): void {
             frontmatter_raw: "",
             frontmatter: {},
             body: "b",
-            author_id: alice.id,
+            author: "alice",
             created_at: T(211),
           }),
         ).rejects.toThrow();
@@ -642,7 +624,7 @@ export function runKernelSuite(factory: AdapterFactory): void {
 
       it("repo slug identity is case-insensitive", async () => {
         try {
-          await kernel.repos.create(SYSTEM_ACTOR, "Notes"); // "notes" seeded
+          await kernel.repos.create(ROOT, "Notes"); // "notes" seeded
           throw new Error("expected throw");
         } catch (err) {
           expect((err as KernelError).code).toBe("slug_taken");
@@ -650,22 +632,13 @@ export function runKernelSuite(factory: AdapterFactory): void {
       });
 
       it("repo lookup folds the key but returns the stored slug", async () => {
-        const repo = await kernel.repos.get(SYSTEM_ACTOR, "NOTES");
+        const repo = await kernel.repos.get(ROOT, "NOTES");
         expect(repo.repo).toBe("notes");
       });
 
       it("recasing a repo slug is allowed (same identity)", async () => {
-        const renamed = await kernel.repos.rename(SYSTEM_ACTOR, "notes", "Notes");
+        const renamed = await kernel.repos.rename(ROOT, "notes", "Notes");
         expect(renamed.repo).toBe("Notes");
-      });
-
-      it("user slug identity is case-insensitive", async () => {
-        try {
-          await kernel.users.create(SYSTEM_ACTOR, "Alice"); // "alice" seeded
-          throw new Error("expected throw");
-        } catch (err) {
-          expect((err as KernelError).code).toBe("slug_taken");
-        }
       });
     });
 
@@ -678,7 +651,7 @@ export function runKernelSuite(factory: AdapterFactory): void {
     // -----------------------------------------------------------------
     describe("links (graph index) — adapter parity", () => {
       const mk = async (
-        actor: Actor,
+        actor: CallContext,
         path: string,
         body: string,
         frontmatter?: Record<string, unknown>,
@@ -686,7 +659,7 @@ export function runKernelSuite(factory: AdapterFactory): void {
         const fm = frontmatter ? { frontmatter } : { frontmatter_raw: "" };
         return kernel.docs.create(actor, "notes", path, { ...fm, body });
       };
-      const paths = async (actor: Actor, filter: string) =>
+      const paths = async (actor: CallContext, filter: string) =>
         (await kernel.query(actor, { repo: "notes", filter })).map((v) => v.path).sort();
 
       it("extracts + resolves an inline link on write", async () => {
@@ -787,16 +760,11 @@ export function runKernelSuite(factory: AdapterFactory): void {
         const admin = await aliceActor();
         await mk(admin, "public.md", "p");
         await mk(admin, "secret/moc.md", "[p](/public.md)");
-        const alice = await storage.users_by_slug("alice");
-        const notes = await storage.repos_by_slug("notes");
-        if (!alice || !notes) throw new Error("seed");
-        const scoped: Actor = {
-          user_id: alice.id,
-          admin: false,
-          scopes: [{ repos: [notes.id], read: ["**", "!secret/**"], write: [] }],
+        const scoped: CallContext = {
+          scope: [{ repo: "notes", read: ["**", "!secret/**"] }],
         };
-        // Admin sees public.md is referenced; scoped caller can't read the
-        // secret source, so the edge is invisible.
+        // Full-access caller sees public.md is referenced; the scoped caller
+        // can't read the secret source, so the edge is invisible.
         expect(await paths(admin, '$in_static("**")')).toContain("public.md");
         expect(await paths(scoped, '$in_static("**")')).not.toContain("public.md");
       });

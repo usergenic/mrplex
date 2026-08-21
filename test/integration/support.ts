@@ -14,7 +14,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type SeedRepoOptions, seedRepo } from "../../scripts/seed.js";
-import type { Actor } from "../../src/kernel/auth/actor.js";
+import type { CallContext } from "../../src/kernel/context.js";
 import { type Kernel, createKernel } from "../../src/kernel/kernel.js";
 import { sqliteAdapter } from "../../src/storage-sqlite/adapter.js";
 import type { Storage } from "../../src/storage/types.js";
@@ -27,8 +27,8 @@ export const STARSHIP_LINK_CONFIG = {
 export type Session = {
   kernel: Kernel;
   storage: Storage;
-  /** Admin actor — sessions read the whole graph without scope friction. */
-  actor: Actor;
+  /** Full-access context — sessions read the whole graph without scope friction. */
+  actor: CallContext;
   repo: string;
   /** Run a CEL filter; return matching paths, sorted. */
   query(filter: string): Promise<string[]>;
@@ -50,14 +50,14 @@ export async function seededSession(
   const storage = await sqliteAdapter.open({ database: `sqlite:${join(dir, "session.db")}` });
   const kernel = createKernel(storage);
 
-  const seed = await seedRepo(storage, {
+  await seedRepo(storage, {
     fixtureDir: opts.fixtureDir ?? repoSlug,
     repoSlug,
     linkConfig: opts.linkConfig,
     ...opts,
   });
 
-  const actor: Actor = { user_id: seed.authorId, admin: true, scopes: [] };
+  const actor: CallContext = {};
 
   return {
     kernel,

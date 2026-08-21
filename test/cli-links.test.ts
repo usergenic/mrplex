@@ -9,14 +9,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { bootstrap } from "../src/cli/bootstrap.js";
 
 const REPO_ROOT = join(fileURLToPath(new URL(".", import.meta.url)), "..");
 const CLI = join(REPO_ROOT, "src", "cli", "main.ts");
 
 let workDir: string;
 let dbUrl: string;
-let rootToken: string;
 
 function run(args: string[], input?: string): { stdout: string; stderr: string; status: number } {
   const res = spawnSync("node", ["--import", "tsx", CLI, "--database", dbUrl, ...args], {
@@ -25,7 +23,6 @@ function run(args: string[], input?: string): { stdout: string; stderr: string; 
     ...(input !== undefined && { input }),
     env: {
       ...(process.env as Record<string, string>),
-      MRPLEX_TOKEN: rootToken,
       XDG_CONFIG_HOME: workDir,
     },
   });
@@ -43,7 +40,6 @@ beforeEach(async () => {
   workDir = mkdtempSync(join(tmpdir(), "mrplex-cli-links-"));
   mkdirSync(workDir, { recursive: true });
   dbUrl = `sqlite:${join(workDir, "links.db")}`;
-  ({ token: rootToken } = await bootstrap(dbUrl));
   run(["repos", "create", "notes"]);
 });
 

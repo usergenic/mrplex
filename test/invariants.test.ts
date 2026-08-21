@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { sqliteAdapter } from "../src/storage-sqlite/adapter.js";
-import type { RepoRow, Storage, UserRow, VersionRow } from "../src/storage/types.js";
+import type { RepoRow, Storage, VersionRow } from "../src/storage/types.js";
 
 async function fresh(): Promise<Storage> {
   const path = join(tmpdir(), `mrplex-invariants-${Date.now()}-${Math.random()}.db`);
@@ -18,7 +18,6 @@ async function fresh(): Promise<Storage> {
 }
 
 let storage: Storage;
-let user: UserRow;
 let repo: RepoRow;
 
 const NOW = "2026-08-13T00:00:00Z";
@@ -27,7 +26,6 @@ const LATER_STILL = "2026-08-13T00:00:02Z";
 
 beforeEach(async () => {
   storage = await fresh();
-  user = await storage.users_create({ slug: "alice", created_at: NOW });
   repo = await storage.repos_create({ slug: "notes", created_at: NOW });
 });
 
@@ -46,7 +44,7 @@ describe("versions partial index: one current per document", () => {
       frontmatter_raw: "",
       frontmatter: {},
       body: "hi\n",
-      author_id: user.id,
+      author: "alice",
       created_at: NOW,
     });
     expect(v.next_id).toBeNull();
@@ -62,7 +60,7 @@ describe("versions partial index: one current per document", () => {
       frontmatter_raw: "",
       frontmatter: {},
       body: "one\n",
-      author_id: user.id,
+      author: "alice",
       created_at: NOW,
     });
     const v2 = await storage.version_insert({
@@ -73,7 +71,7 @@ describe("versions partial index: one current per document", () => {
       frontmatter_raw: "",
       frontmatter: {},
       body: "two\n",
-      author_id: user.id,
+      author: "alice",
       created_at: LATER,
     });
     // v1 should be reloaded with next_id = v2.id; v2 is current.
@@ -94,7 +92,7 @@ describe("versions partial index: one current per document", () => {
       frontmatter_raw: "",
       frontmatter: {},
       body: "one\n",
-      author_id: user.id,
+      author: "alice",
       created_at: NOW,
     });
     // First advance: valid.
@@ -106,7 +104,7 @@ describe("versions partial index: one current per document", () => {
       frontmatter_raw: "",
       frontmatter: {},
       body: "two\n",
-      author_id: user.id,
+      author: "alice",
       created_at: LATER,
     });
     // Second advance using v1 (now stale) as prev must fail — v1 no longer
@@ -120,7 +118,7 @@ describe("versions partial index: one current per document", () => {
         frontmatter_raw: "",
         frontmatter: {},
         body: "three\n",
-        author_id: user.id,
+        author: "alice",
         created_at: LATER_STILL,
       }),
     ).rejects.toThrow();
@@ -139,7 +137,7 @@ describe("versions cross-document prev rejection", () => {
       frontmatter_raw: "",
       frontmatter: {},
       body: "a\n",
-      author_id: user.id,
+      author: "alice",
       created_at: NOW,
     });
     // Passing docA's current version as prev while advancing docB must fail:
@@ -154,7 +152,7 @@ describe("versions cross-document prev rejection", () => {
         frontmatter_raw: "",
         frontmatter: {},
         body: "b\n",
-        author_id: user.id,
+        author: "alice",
         created_at: LATER,
       }),
     ).rejects.toThrow();
@@ -176,7 +174,7 @@ describe("versions partial index: one live doc per (repo, path)", () => {
       frontmatter_raw: "",
       frontmatter: {},
       body: "a\n",
-      author_id: user.id,
+      author: "alice",
       created_at: NOW,
     });
     await expect(
@@ -188,7 +186,7 @@ describe("versions partial index: one live doc per (repo, path)", () => {
         frontmatter_raw: "",
         frontmatter: {},
         body: "b\n",
-        author_id: user.id,
+        author: "alice",
         created_at: LATER,
       }),
     ).rejects.toThrow();
@@ -206,7 +204,7 @@ describe("versions partial index: one live doc per (repo, path)", () => {
       frontmatter_raw: "",
       frontmatter: {},
       body: "a\n",
-      author_id: user.id,
+      author: "alice",
       created_at: NOW,
     });
     const b = await storage.version_insert({
@@ -217,18 +215,14 @@ describe("versions partial index: one live doc per (repo, path)", () => {
       frontmatter_raw: "",
       frontmatter: {},
       body: "b\n",
-      author_id: user.id,
+      author: "alice",
       created_at: LATER,
     });
     expect(b.next_id).toBeNull();
   });
 });
 
-describe("uniqueness: slugs are unique for users and repos", () => {
-  it("rejects duplicate user slug", async () => {
-    await expect(storage.users_create({ slug: "alice", created_at: NOW })).rejects.toThrow();
-  });
-
+describe("uniqueness: slugs are unique for repos", () => {
   it("rejects duplicate repo slug", async () => {
     await expect(storage.repos_create({ slug: "notes", created_at: NOW })).rejects.toThrow();
   });
@@ -245,7 +239,7 @@ describe("history walks the chain in order", () => {
       frontmatter_raw: "",
       frontmatter: {},
       body: "one\n",
-      author_id: user.id,
+      author: "alice",
       created_at: "2026-08-13T00:00:00Z",
     });
     const v2 = await storage.version_insert({
@@ -256,7 +250,7 @@ describe("history walks the chain in order", () => {
       frontmatter_raw: "",
       frontmatter: {},
       body: "two\n",
-      author_id: user.id,
+      author: "alice",
       created_at: "2026-08-13T00:00:01Z",
     });
     const v3 = await storage.version_insert({
@@ -267,7 +261,7 @@ describe("history walks the chain in order", () => {
       frontmatter_raw: "",
       frontmatter: {},
       body: "three\n",
-      author_id: user.id,
+      author: "alice",
       created_at: "2026-08-13T00:00:02Z",
     });
     const history = await storage.version_history(doc.id);
@@ -287,7 +281,7 @@ describe("history walks the chain in order", () => {
       frontmatter_raw: "",
       frontmatter: {},
       body: "one\n",
-      author_id: user.id,
+      author: "alice",
       created_at: "2026-08-13T00:00:10Z",
     });
     const v2 = await storage.version_insert({
@@ -298,7 +292,7 @@ describe("history walks the chain in order", () => {
       frontmatter_raw: "",
       frontmatter: {},
       body: "two\n",
-      author_id: user.id,
+      author: "alice",
       created_at: "2026-08-13T00:00:05Z", // BEFORE v1
     });
     const v3 = await storage.version_insert({
@@ -309,7 +303,7 @@ describe("history walks the chain in order", () => {
       frontmatter_raw: "",
       frontmatter: {},
       body: "three\n",
-      author_id: user.id,
+      author: "alice",
       created_at: "2026-08-13T00:00:07Z", // between them
     });
     const history = await storage.version_history(doc.id);
@@ -327,7 +321,7 @@ describe("history walks the chain in order", () => {
       frontmatter_raw: "",
       frontmatter: {},
       body: "one\n",
-      author_id: user.id,
+      author: "alice",
       created_at: "2026-08-13T00:00:00Z",
     });
     const v2 = await storage.version_insert({
@@ -338,7 +332,7 @@ describe("history walks the chain in order", () => {
       frontmatter_raw: "",
       frontmatter: {},
       body: "two\n",
-      author_id: user.id,
+      author: "alice",
       created_at: "2026-08-13T00:00:01Z",
     });
     await storage.version_insert({
@@ -349,7 +343,7 @@ describe("history walks the chain in order", () => {
       frontmatter_raw: "",
       frontmatter: {},
       body: "three\n",
-      author_id: user.id,
+      author: "alice",
       created_at: "2026-08-13T00:00:02Z",
     });
     const filtered = await storage.version_history(doc.id, {
@@ -371,20 +365,20 @@ describe("tx rollback on error leaves no half-state", () => {
       frontmatter_raw: "",
       frontmatter: {},
       body: "one\n",
-      author_id: user.id,
+      author: "alice",
       created_at: NOW,
     });
-    // Force the second insert to fail by supplying an invalid author_id (FK).
+    // Force the second insert to fail by supplying an invalid repo_id (FK).
     await expect(
       storage.version_insert({
         document_id: doc.id,
-        repo_id: repo.id,
+        repo_id: 9_999_999,
         prev_id: v1.id,
         path: "hello.md",
         frontmatter_raw: "",
         frontmatter: {},
         body: "two\n",
-        author_id: 9_999_999,
+        author: "alice",
         created_at: LATER,
       }),
     ).rejects.toThrow();
@@ -399,28 +393,28 @@ describe("tx rollback on error leaves no half-state", () => {
 describe("nested tx via savepoint", () => {
   it("commits inner and outer together on success", async () => {
     await storage.tx(async () => {
-      await storage.users_create({ slug: "outer", created_at: NOW });
+      await storage.repos_create({ slug: "outer", created_at: NOW });
       await storage.tx(async () => {
-        await storage.users_create({ slug: "inner", created_at: NOW });
+        await storage.repos_create({ slug: "inner", created_at: NOW });
       });
     });
-    expect(await storage.users_by_slug("outer")).not.toBeNull();
-    expect(await storage.users_by_slug("inner")).not.toBeNull();
+    expect(await storage.repos_by_slug("outer")).not.toBeNull();
+    expect(await storage.repos_by_slug("inner")).not.toBeNull();
   });
 
   it("rolls back only the inner scope when the inner throws and is caught", async () => {
     await storage.tx(async () => {
-      await storage.users_create({ slug: "outer2", created_at: NOW });
+      await storage.repos_create({ slug: "outer2", created_at: NOW });
       try {
         await storage.tx(async () => {
-          await storage.users_create({ slug: "inner2", created_at: NOW });
+          await storage.repos_create({ slug: "inner2", created_at: NOW });
           throw new Error("boom");
         });
       } catch {
         // swallow
       }
     });
-    expect(await storage.users_by_slug("outer2")).not.toBeNull();
-    expect(await storage.users_by_slug("inner2")).toBeNull();
+    expect(await storage.repos_by_slug("outer2")).not.toBeNull();
+    expect(await storage.repos_by_slug("inner2")).toBeNull();
   });
 });

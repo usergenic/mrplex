@@ -1,16 +1,16 @@
 /**
  * KernelClient — the CLI's transport seam.
  *
- * Mirrors the shape of the `Kernel` type (design §6.1) minus the `Actor`
- * argument: transport supplies identity. In-process (`local.ts`) resolves
- * a token to an actor at construction and forwards each call; remote
- * (`remote-mcp.ts`) sends each call as a `tools/call` over Streamable HTTP.
+ * Mirrors the shape of the `Kernel` type (design §6.1) minus the `CallContext`
+ * argument: the client is constructed with a default context (author + scope)
+ * and forwards it on every call. In-process (`local.ts`) builds a Kernel and
+ * calls it directly; remote (`remote-mcp.ts`) sends each call as a `tools/call`
+ * over Streamable HTTP, injecting context via the `X-Mrplex-*` headers.
  *
  * All methods are async so the local and remote implementations share one
  * shape — the CLI awaits them regardless of which transport is in play.
  */
 
-import type { ScopeInput } from "../kernel/auth/scope.js";
 import type { UnifiedDiff } from "../kernel/diff.js";
 import type { FrontmatterInput } from "../kernel/frontmatter-input.js";
 import type {
@@ -21,12 +21,11 @@ import type {
 } from "../kernel/kernel.js";
 import type { PathConfigOverride } from "../kernel/path-config.js";
 import type { QuerySpec } from "../kernel/query/query.js";
-import type { PathWarning, Repo, Token, User, Version } from "../kernel/wire.js";
+import type { PathWarning, Repo, Version } from "../kernel/wire.js";
 import type { LinkConfigOverride } from "../links/link-config.js";
 
 export type HistoryOptions = { limit?: number; before?: string };
 export type SetPathConfigResult = { repo: Repo; warnings: PathWarning[] };
-export type TokenCreateResult = { token: string; meta: Token };
 
 /**
  * Options for document reads. `raw` suppresses server-injected system
@@ -46,12 +45,6 @@ export type KernelClient = {
     delete(slug: string): Promise<Repo>;
     set_path_config(slug: string, config: PathConfigOverride | null): Promise<SetPathConfigResult>;
     set_link_config(slug: string, config: LinkConfigOverride | null): Promise<SetLinkConfigResult>;
-  };
-  users: {
-    list(): Promise<User[]>;
-    create(slug: string): Promise<User>;
-    rename(slug: string, new_slug: string): Promise<User>;
-    delete(slug: string): Promise<User>;
   };
   docs: {
     get(repo: string, path: string, opts?: DocGetOptions): Promise<Version>;
@@ -80,15 +73,6 @@ export type KernelClient = {
     backfill(repo: string): Promise<LinksBackfillResult>;
     stale(repo: string): Promise<StaleLinkWire[]>;
     repair(repo: string, opts?: { dry_run?: boolean }): Promise<RepairResult>;
-  };
-  tokens: {
-    list(): Promise<Token[]>;
-    create(
-      label: string | null,
-      scopes: ScopeInput[],
-      opts?: { admin?: boolean; expires_at?: string | null; for_user?: string | null },
-    ): Promise<TokenCreateResult>;
-    revoke(token_id: string): Promise<Token>;
   };
   query(spec: QuerySpec): Promise<Version[]>;
 

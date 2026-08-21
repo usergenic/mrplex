@@ -8,10 +8,10 @@
  * candidate-id whitelist.
  */
 
-import type { ScopeGroup, SearchPlan, SigilExclusion } from "../../storage/search-plan.js";
+import type { SearchPlan, SigilExclusion } from "../../storage/search-plan.js";
 import type { RepoRow, Storage, VersionRow } from "../../storage/types.js";
-import type { Actor } from "../auth/actor.js";
 import { slugMatchesPattern } from "../auth/glob.js";
+import { type ClaimMatcher, claimsGrantRepo, claimsToScopeGroups } from "../auth/scope.js";
 import { KernelError } from "../errors.js";
 import type { PathConfig } from "../path-config.js";
 import { effectivePathConfig, parseRepoOverride } from "../path-config.js";
@@ -43,7 +43,7 @@ const KNOWN_SPEC_FIELDS = new Set<keyof QuerySpec>([
 export type QueryDeps = {
   storage: Storage;
   serverPathConfig: PathConfig;
-  toVersionWire: (row: VersionRow, repoSlug: string) => Promise<Version>;
+  toVersionWire: (row: VersionRow, repoSlug: string) => Version;
   /**
    * Optional rank-time embed hook. When absent and `spec.rank` is set,
    * runQuery throws `rank_unavailable` (m4-plan §5 decision 4).
@@ -54,13 +54,21 @@ export type QueryDeps = {
 /** M2 default when the spec omits limit. */
 export const DEFAULT_QUERY_LIMIT = 50;
 
-export async function runQuery(actor: Actor, spec: QuerySpec, deps: QueryDeps): Promise<Version[]> {
+/**
+ * `claims` is null when the call supplies no scope (full visibility) or a
+ * normalized `ClaimMatcher[]` narrowing what's visible (noauth plan §1).
+ */
+export async function runQuery(
+  claims: ClaimMatcher[] | null,
+  spec: QuerySpec,
+  deps: QueryDeps,
+): Promise<Version[]> {
   validateSpec(spec);
 
   // 1. Resolve repos the caller can address.
   const reposById = new Map<number, RepoRow>();
   for (const row of await deps.storage.repos_list()) reposById.set(row.id, row);
-  const targetRepos = filterReposByAccessAndSpec(actor, spec, reposById, deps.serverPathConfig);
+  const targetRepos = filterReposByAccessAndSpec(claims, spec, reposById, deps.serverPathConfig);
   if (targetRepos.length === 0) return [];
 
   // 2. Parse CEL filter eagerly — `filter_invalid` before storage.
@@ -81,8 +89,8 @@ export async function runQuery(actor: Actor, spec: QuerySpec, deps: QueryDeps): 
     spec.include_system ?? false,
   );
 
-  // 4. Scope filter — admins bypass; anyone else contributes scope groups.
-  const scope = buildScope(actor);
+  // 4. Scope filter — absent claims see everything; claims contribute groups.
+  const scope = buildScope(claims, targetRepos);
 
   const userLimit = spec.limit ?? DEFAULT_QUERY_LIMIT;
   if (userLimit <= 0) return [];
@@ -192,7 +200,7 @@ function validateSpec(spec: QuerySpec): void {
 // -----------------------------------------------------------------------------
 
 function filterReposByAccessAndSpec(
-  actor: Actor,
+  claims: ClaimMatcher[] | null,
   spec: QuerySpec,
   reposById: Map<number, RepoRow>,
   serverConfig: PathConfig,
@@ -202,18 +210,12 @@ function filterReposByAccessAndSpec(
   const systemSigils = serverConfig.system_sigils;
   return [...reposById.values()]
     .filter((repo) => {
-      if (!actor.admin && !actorBindsRepo(actor, repo.id)) return false;
+      if (claims !== null && !claimsGrantRepo(claims, repo.slug)) return false;
       if (systemSigils.some((sigil) => repo.slug.startsWith(sigil))) return false;
       if (patterns === undefined) return true;
       return patterns.some((pattern) => slugMatchesPattern(pattern, repo.slug));
     })
     .sort((a, b) => a.slug.localeCompare(b.slug));
-}
-
-function actorBindsRepo(actor: Actor, repoId: number): boolean {
-  return actor.scopes.some(
-    (s) => s.repos === "*" || (Array.isArray(s.repos) && s.repos.includes(repoId)),
-  );
 }
 
 // -----------------------------------------------------------------------------
@@ -253,19 +255,15 @@ function buildPerRepoSigilExclusion(
 // Scope → SearchPlan.scope (§8.2)
 // -----------------------------------------------------------------------------
 
-function buildScope(actor: Actor): SearchPlan["scope"] {
-  if (actor.admin) return { kind: "allow_all" };
-  if (actor.scopes.length === 0) return { kind: "deny_all" };
-  const groups: ScopeGroup[] = [];
-  for (const scope of actor.scopes) {
-    const globs = scope.read ?? [];
-    if (globs.length === 0) continue;
-    if (scope.repos === "*") {
-      groups.push({ repos: "*", globs });
-    } else if (scope.repos.length > 0) {
-      groups.push({ repos: scope.repos, globs });
-    }
-  }
+function buildScope(
+  claims: ClaimMatcher[] | null,
+  targetRepos: readonly RepoRow[],
+): SearchPlan["scope"] {
+  // Absent scope = full visibility. The repo-access filter already limited
+  // targetRepos, so an empty groups list here means the claims grant no path
+  // in any addressable repo — deny.
+  if (claims === null) return { kind: "allow_all" };
+  const groups = claimsToScopeGroups(claims, targetRepos);
   if (groups.length === 0) return { kind: "deny_all" };
   return { kind: "groups", groups };
 }

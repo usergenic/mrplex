@@ -12,7 +12,7 @@
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { Actor } from "../src/kernel/auth/actor.js";
+import type { CallContext } from "../src/kernel/context.js";
 import { KernelError } from "../src/kernel/errors.js";
 import { type Kernel, createKernel } from "../src/kernel/kernel.js";
 import { sqliteAdapter } from "../src/storage-sqlite/adapter.js";
@@ -20,9 +20,7 @@ import type { Storage } from "../src/storage/types.js";
 
 let storage: Storage;
 let kernel: Kernel;
-let actor: Actor;
 let repoId: number;
-let aliceId: number;
 
 async function fresh(): Promise<Storage> {
   return sqliteAdapter.open({
@@ -35,7 +33,7 @@ function create(
   input: { body?: string; frontmatter?: Record<string, unknown> } = {},
 ) {
   const fm = input.frontmatter ? { frontmatter: input.frontmatter } : { frontmatter_raw: "" };
-  return kernel.docs.create(actor, "notes", path, { ...fm, body: input.body ?? "" });
+  return kernel.docs.create({}, "notes", path, { ...fm, body: input.body ?? "" });
 }
 
 async function fields(...fs: string[]): Promise<void> {
@@ -43,19 +41,16 @@ async function fields(...fs: string[]): Promise<void> {
 }
 
 /** Query with a filter; return the matching paths, sorted. */
-async function q(filter: string, a: Actor = actor): Promise<string[]> {
-  const rows = await kernel.query(a, { repo: "notes", filter });
+async function q(filter: string, ctx: CallContext = {}): Promise<string[]> {
+  const rows = await kernel.query(ctx, { repo: "notes", filter });
   return rows.map((r) => r.path).sort();
 }
 
 beforeEach(async () => {
   storage = await fresh();
   kernel = createKernel(storage);
-  const alice = await storage.users_create({ slug: "alice", created_at: "2026-08-14T00:00:00Z" });
-  aliceId = alice.id;
   const notes = await storage.repos_create({ slug: "notes", created_at: "2026-08-14T00:00:01Z" });
   repoId = notes.id;
-  actor = { user_id: alice.id, admin: true, scopes: [] };
 });
 
 afterEach(async () => {
@@ -276,10 +271,8 @@ describe("scope: the visible graph is the readable graph (§5 decision 5)", () =
     await create("public.md");
     await create("secret/moc.md", { body: "[p](/public.md)" });
 
-    const scoped: Actor = {
-      user_id: aliceId,
-      admin: false,
-      scopes: [{ repos: [repoId], read: ["**", "!secret/**"], write: [] }],
+    const scoped: CallContext = {
+      scope: [{ repo: "notes", read: ["**", "!secret/**"] }],
     };
     // public.md is referenced only by an unreadable source → not "in" it.
     expect(await q('$in_static("**")', scoped)).toEqual([]);
@@ -290,10 +283,8 @@ describe("scope: the visible graph is the readable graph (§5 decision 5)", () =
   it("hides an outbound edge whose (resolved) target the caller cannot read", async () => {
     await create("secret/target.md");
     await create("note.md", { body: "[t](secret/target.md)" });
-    const scoped: Actor = {
-      user_id: aliceId,
-      admin: false,
-      scopes: [{ repos: [repoId], read: ["**", "!secret/**"], write: [] }],
+    const scoped: CallContext = {
+      scope: [{ repo: "notes", read: ["**", "!secret/**"] }],
     };
     // note.md links to a secret target → $has_static hides it for the caller.
     expect(await q('$has_static("secret/**")', scoped)).toEqual([]);

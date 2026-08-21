@@ -20,6 +20,7 @@ export type CliConfig = {
   server?: string;
   token?: string;
   repo?: string;
+  author?: string;
 };
 
 export function configPath(): string {

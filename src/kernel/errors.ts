@@ -7,10 +7,8 @@
 
 export type KernelErrorCode =
   | "repo_not_found"
-  | "user_not_found"
   | "doc_not_found"
   | "version_not_found"
-  | "token_not_found"
   | "version_not_in_document"
   | "slug_invalid"
   | "path_invalid"
@@ -21,7 +19,6 @@ export type KernelErrorCode =
   | "create_conflict"
   | "path_taken"
   | "slug_taken"
-  | "unauthorized"
   | "forbidden"
   // Surface-emitted; the kernel itself never throws these but they share the
   // catalog because clients (and the CLI's exit-code families) discriminate
@@ -54,10 +51,8 @@ export class KernelError<D = Record<string, unknown>> extends Error {
  */
 export const KERNEL_ERROR_CODES: ReadonlySet<KernelErrorCode> = new Set<KernelErrorCode>([
   "repo_not_found",
-  "user_not_found",
   "doc_not_found",
   "version_not_found",
-  "token_not_found",
   "version_not_in_document",
   "slug_invalid",
   "path_invalid",
@@ -68,7 +63,6 @@ export const KERNEL_ERROR_CODES: ReadonlySet<KernelErrorCode> = new Set<KernelEr
   "create_conflict",
   "path_taken",
   "slug_taken",
-  "unauthorized",
   "forbidden",
   "precondition_required",
   "payload_too_large",
@@ -82,22 +76,17 @@ export function isKernelErrorCode(code: string): code is KernelErrorCode {
 
 export const repoNotFound = (slug: string) => new KernelError("repo_not_found", { slug });
 
-export const userNotFound = (slug: string) => new KernelError("user_not_found", { slug });
-
 export const docNotFound = (repo: string, path: string) =>
   new KernelError("doc_not_found", { repo, path });
 
 export const versionNotFound = (versionId: string) =>
   new KernelError("version_not_found", { version_id: versionId });
 
-export const tokenNotFound = (tokenId: string) =>
-  new KernelError("token_not_found", { token_id: tokenId });
-
 export const versionNotInDocument = (versionId: string, repo: string, path: string) =>
   new KernelError("version_not_in_document", { version_id: versionId, repo, path });
 
-// Auth (§8.4). `unauthorized` = no/bad/expired token; `forbidden` = valid
-// token, insufficient scope. Both errors deliberately omit resource details
-// per §8.4 (don't leak existence via forbidden-vs-not-found ambiguity).
-export const unauthorized = () => new KernelError("unauthorized", {});
+// `forbidden` (§8.4): the scope claim supplied with this call excludes the
+// target. Still HTTP 403; still omits resource details so out-of-claim and
+// nonexistent look identical (shells can hand mrplex errors to their untrusted
+// callers unfiltered). `unauthorized` is gone — the engine trusts every caller.
 export const forbidden = () => new KernelError("forbidden", {});

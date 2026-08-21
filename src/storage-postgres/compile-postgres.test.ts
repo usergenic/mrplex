@@ -20,7 +20,6 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { PG_URL, openTestPostgres } from "../../test/pg-harness.js";
 import { KernelError } from "../kernel/errors.js";
 import { parseCel } from "../kernel/query/cel-parse.js";
-import type { UserRow } from "../storage/types.js";
 import { compileSearchPlan } from "./compile-postgres.js";
 
 if (!PG_URL) {
@@ -31,17 +30,12 @@ if (!PG_URL) {
     // absolute. Teardown drops the schema.
     let storage: Awaited<ReturnType<typeof openTestPostgres>>["storage"];
     let cleanup: () => Promise<void>;
-    let user: UserRow;
     let repoId: number;
 
     beforeEach(async () => {
       const h = await openTestPostgres();
       storage = h.storage;
       cleanup = h.cleanup;
-      user = await storage.users_create({
-        slug: "alice",
-        created_at: "2026-08-14T00:00:00Z",
-      });
       repoId = (
         await storage.repos_create({
           slug: "notes",
@@ -69,7 +63,7 @@ if (!PG_URL) {
           frontmatter_raw: "",
           frontmatter: e.frontmatter,
           body: e.body ?? "",
-          author_id: user.id,
+          author: "alice",
           created_at: new Date(Date.UTC(2026, 7, 14, 0, 0, clock++)).toISOString(),
         });
         ids.push(v.id);

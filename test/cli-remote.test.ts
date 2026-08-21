@@ -10,7 +10,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { bootstrap } from "../src/cli/bootstrap.js";
 
 const REPO_ROOT = join(fileURLToPath(new URL(".", import.meta.url)), "..");
 const CLI = join(REPO_ROOT, "src", "cli", "main.ts");
@@ -47,7 +46,6 @@ async function waitForServer(url: string, timeoutMs = 5000): Promise<void> {
 
 let workDir: string;
 let dbUrl: string;
-let rootToken: string;
 let serveProc: ChildProcess | null = null;
 let baseUrl: string;
 const PORT = 18400 + Math.floor(Math.random() * 100);
@@ -56,8 +54,6 @@ beforeEach(async () => {
   workDir = mkdtempSync(join(tmpdir(), "mrplex-cli-remote-"));
   mkdirSync(workDir, { recursive: true });
   dbUrl = `sqlite:${join(workDir, "test.db")}`;
-  const b = await bootstrap(dbUrl);
-  rootToken = b.token;
 
   serveProc = spawn(
     "node",
@@ -91,7 +87,6 @@ afterEach(async () => {
 describe("CLI --server round-trip", () => {
   it("repos create/list via --server", () => {
     const env: Record<string, string> = {
-      MRPLEX_TOKEN: rootToken,
       MRPLEX_REPO: "notes",
       XDG_CONFIG_HOME: workDir,
     };
@@ -108,7 +103,6 @@ describe("CLI --server round-trip", () => {
 
   it("docs create + get via --server matches local", () => {
     const env: Record<string, string> = {
-      MRPLEX_TOKEN: rootToken,
       MRPLEX_REPO: "notes",
       XDG_CONFIG_HOME: workDir,
     };
@@ -149,7 +143,6 @@ describe("CLI --server round-trip", () => {
 
   it("query via --server", () => {
     const env: Record<string, string> = {
-      MRPLEX_TOKEN: rootToken,
       MRPLEX_REPO: "notes",
       XDG_CONFIG_HOME: workDir,
     };
@@ -179,7 +172,6 @@ describe("CLI --server round-trip", () => {
 
   it("stale_prev over remote surfaces as exit 2 with code", () => {
     const env: Record<string, string> = {
-      MRPLEX_TOKEN: rootToken,
       MRPLEX_REPO: "notes",
       XDG_CONFIG_HOME: workDir,
     };
@@ -208,7 +200,6 @@ describe("CLI --server round-trip", () => {
 
   it("--database + --server → exit 1 with clear message", () => {
     const env: Record<string, string> = {
-      MRPLEX_TOKEN: rootToken,
       MRPLEX_REPO: "notes",
       XDG_CONFIG_HOME: workDir,
     };
@@ -219,7 +210,6 @@ describe("CLI --server round-trip", () => {
 
   it("bad --server URL → exit 10 (network)", () => {
     const env: Record<string, string> = {
-      MRPLEX_TOKEN: "fake",
       MRPLEX_REPO: "notes",
       XDG_CONFIG_HOME: workDir,
     };

@@ -125,7 +125,7 @@ export async function startServer(config: ServeConfig): Promise<ServeHandle> {
 
   const log = config.log ?? ((m: string) => process.stderr.write(`${m}\n`));
   log(`mrplex: serving on ${baseUrl}`);
-  log(`mrplex:   REST   ${baseUrl}/repos, /users, /query, /me/tokens, ...`);
+  log(`mrplex:   REST   ${baseUrl}/repos, /query, ...`);
   log(`mrplex:   MCP    ${baseUrl}/mcp  (Streamable HTTP)`);
   log(`mrplex:   embed  ${describeEmbedConfig(embedCfg)}`);
 

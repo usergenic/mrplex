@@ -9,18 +9,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { bootstrap } from "../src/cli/bootstrap.js";
 import { sqliteAdapter } from "../src/storage-sqlite/adapter.js";
-import type { Storage, UserRow } from "../src/storage/types.js";
+import type { Storage } from "../src/storage/types.js";
 
 const REPO_ROOT = join(fileURLToPath(new URL(".", import.meta.url)), "..");
 const CLI = join(REPO_ROOT, "src", "cli", "main.ts");
 
 let workDir: string;
 let dbUrl: string;
-let rootToken: string;
 let storage: Storage;
-let alice: UserRow;
 let notesRepoId: number;
 
 function run(...args: string[]): { stdout: string; stderr: string; status: number } {
@@ -29,7 +26,6 @@ function run(...args: string[]): { stdout: string; stderr: string; status: numbe
     encoding: "utf8",
     env: {
       ...(process.env as Record<string, string>),
-      MRPLEX_TOKEN: rootToken,
       XDG_CONFIG_HOME: workDir,
     },
   });
@@ -67,7 +63,7 @@ async function seedAll(): Promise<void> {
       frontmatter_raw: "",
       frontmatter: r.fm,
       body: r.body,
-      author_id: alice.id,
+      author: "alice",
       created_at: new Date(Date.UTC(2026, 7, 14, 0, 0, clock++)).toISOString(),
     });
   }
@@ -77,9 +73,7 @@ beforeEach(async () => {
   workDir = mkdtempSync(join(tmpdir(), "mrplex-cli-query-"));
   mkdirSync(workDir, { recursive: true });
   dbUrl = `sqlite:${join(workDir, "q.db")}`;
-  ({ token: rootToken } = await bootstrap(dbUrl));
   storage = await sqliteAdapter.open({ database: dbUrl });
-  alice = await storage.users_create({ slug: "alice", created_at: "2026-08-14T00:00:00Z" });
   await seedAll();
   await storage.close();
 });

@@ -1,14 +1,12 @@
 /**
- * In-process KernelClient — opens storage, resolves the actor from a token,
- * builds a Kernel, and forwards every call. Kernel calls are already
- * async so the client is a thin passthrough (m5-plan WS1 dropped the
- * Promise.resolve shim).
+ * In-process KernelClient — opens storage, builds a Kernel, and forwards every
+ * call with a default CallContext (author + scope). No token resolution: the
+ * process boundary is the trust boundary (design §8, noauth plan §2). Kernel
+ * calls are already async so the client is a thin passthrough.
  */
 
 import type { EmbedHook } from "../embed/hook.js";
-import type { Actor } from "../kernel/auth/actor.js";
-import { resolveActor } from "../kernel/auth/tokens.js";
-import { KernelError } from "../kernel/errors.js";
+import type { CallContext } from "../kernel/context.js";
 import type { Kernel } from "../kernel/kernel.js";
 import { createKernel } from "../kernel/kernel.js";
 import type { Version } from "../kernel/wire.js";
@@ -20,8 +18,11 @@ import type { DocGetOptions, KernelClient } from "./kernel-client.js";
 export type LocalClientConfig = {
   /** sqlite:./path.db or postgres://…; the CLI resolves this. */
   database: string;
-  /** Bearer secret. */
-  token: string;
+  /**
+   * Default context for every call — author for writes, scope for reads.
+   * Absent = full access with the default "mrplex" author.
+   */
+  context?: CallContext;
   /**
    * Optional embed hook for rank queries in embedded-CLI mode. Also
    * enables write-time backlog enqueue so writes done via the local
@@ -30,18 +31,9 @@ export type LocalClientConfig = {
   embed?: EmbedHook | null;
 };
 
-/**
- * Open a local kernel client. Throws `KernelError("unauthorized")` if the
- * token doesn't resolve — the CLI's `reportError` turns that into exit
- * code 3.
- */
+/** Open a local kernel client. The process that can open the file is trusted. */
 export async function openLocalClient(config: LocalClientConfig): Promise<KernelClient> {
   const storage: Storage = await openStorage(config.database);
-  const actor = await resolveActor(config.token, storage);
-  if (!actor) {
-    await storage.close();
-    throw new KernelError("unauthorized", {});
-  }
   const hook = config.embed ?? null;
   const kernel = createKernel({
     storage,
@@ -57,12 +49,12 @@ export async function openLocalClient(config: LocalClientConfig): Promise<Kernel
         }
       : undefined,
   });
-  return buildClient(kernel, actor, storage, hook);
+  return buildClient(kernel, config.context ?? {}, storage, hook);
 }
 
 function buildClient(
   kernel: Kernel,
-  actor: Actor,
+  ctx: CallContext,
   storage: Storage,
   hook: EmbedHook | null,
 ): KernelClient {
@@ -70,42 +62,31 @@ function buildClient(
 
   return {
     repos: {
-      list: (opts) => kernel.repos.list(actor, opts),
-      get: (slug) => kernel.repos.get(actor, slug),
-      create: (slug) => kernel.repos.create(actor, slug),
-      rename: (slug, ns) => kernel.repos.rename(actor, slug, ns),
-      delete: (slug) => kernel.repos.delete(actor, slug),
-      set_path_config: (slug, cfg) => kernel.repos.set_path_config(actor, slug, cfg),
-      set_link_config: (slug, cfg) => kernel.repos.set_link_config(actor, slug, cfg),
-    },
-    users: {
-      list: () => kernel.users.list(actor),
-      create: (slug) => kernel.users.create(actor, slug),
-      rename: (slug, ns) => kernel.users.rename(actor, slug, ns),
-      delete: (slug) => kernel.users.delete(actor, slug),
+      list: (opts) => kernel.repos.list(ctx, opts),
+      get: (slug) => kernel.repos.get(ctx, slug),
+      create: (slug) => kernel.repos.create(ctx, slug),
+      rename: (slug, ns) => kernel.repos.rename(ctx, slug, ns),
+      delete: (slug) => kernel.repos.delete(ctx, slug),
+      set_path_config: (slug, cfg) => kernel.repos.set_path_config(ctx, slug, cfg),
+      set_link_config: (slug, cfg) => kernel.repos.set_link_config(ctx, slug, cfg),
     },
     docs: {
       get: async (repo, path, opts) =>
-        maybeInjectVersion(await kernel.docs.get(actor, repo, path), opts),
+        maybeInjectVersion(await kernel.docs.get(ctx, repo, path), opts),
       get_version: async (repo, vid, opts) =>
-        maybeInjectVersion(await kernel.docs.get_version(actor, repo, vid), opts),
-      history: (repo, path, opts) => kernel.docs.history(actor, repo, path, opts),
-      diff: (repo, path, from, to) => kernel.docs.diff(actor, repo, path, from, to),
-      create: (repo, path, input) => kernel.docs.create(actor, repo, path, input),
-      put: (repo, prev, path, input) => kernel.docs.put(actor, repo, prev, path, input),
-      delete: (repo, prev) => kernel.docs.delete(actor, repo, prev),
+        maybeInjectVersion(await kernel.docs.get_version(ctx, repo, vid), opts),
+      history: (repo, path, opts) => kernel.docs.history(ctx, repo, path, opts),
+      diff: (repo, path, from, to) => kernel.docs.diff(ctx, repo, path, from, to),
+      create: (repo, path, input) => kernel.docs.create(ctx, repo, path, input),
+      put: (repo, prev, path, input) => kernel.docs.put(ctx, repo, prev, path, input),
+      delete: (repo, prev) => kernel.docs.delete(ctx, repo, prev),
     },
     links: {
-      backfill: (repo) => kernel.links.backfill(actor, repo),
-      stale: (repo) => kernel.links.stale(actor, repo),
-      repair: (repo, opts) => kernel.links.repair(actor, repo, opts),
+      backfill: (repo) => kernel.links.backfill(ctx, repo),
+      stale: (repo) => kernel.links.stale(ctx, repo),
+      repair: (repo, opts) => kernel.links.repair(ctx, repo, opts),
     },
-    tokens: {
-      list: () => kernel.tokens.list(actor),
-      create: (label, scopes, opts) => kernel.tokens.create(actor, label, scopes, opts),
-      revoke: (id) => kernel.tokens.revoke(actor, id),
-    },
-    query: (spec) => kernel.query(actor, spec),
+    query: (spec) => kernel.query(ctx, spec),
     close: async () => {
       if (closed) return;
       closed = true;

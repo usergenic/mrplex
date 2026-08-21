@@ -13,7 +13,6 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { afterEach, describe, expect, it } from "vitest";
-import { bootstrap } from "../src/cli/bootstrap.js";
 import { startServer } from "../src/server/serve.js";
 
 async function ephemeralPort(): Promise<number> {
@@ -44,7 +43,6 @@ describe("docs.diff — surfaces", () => {
   });
 
   it("REST /diff and MCP docs_diff both return the unified diff", async () => {
-    const { token } = await bootstrap(`sqlite:${tmpDb}`);
     const port = await ephemeralPort();
     const handle = await startServer({
       database: `sqlite:${tmpDb}`,
@@ -54,7 +52,7 @@ describe("docs.diff — surfaces", () => {
     handles.push(handle);
 
     const base = `http://127.0.0.1:${handle.port}`;
-    const auth = { Authorization: `Bearer ${token}` };
+    const auth: Record<string, string> = {};
 
     // Set up: create repo, write two versions.
     await fetch(`${base}/repos`, {
@@ -107,9 +105,7 @@ describe("docs.diff — surfaces", () => {
     // MCP tool call.
     const url = new URL(`${base}/mcp`);
     const client = new Client({ name: "diff-test", version: "0.0.0" });
-    const transport = new StreamableHTTPClientTransport(url, {
-      requestInit: { headers: { Authorization: `Bearer ${token}` } },
-    });
+    const transport = new StreamableHTTPClientTransport(url);
     await client.connect(transport);
     try {
       const tools = await client.listTools();
@@ -129,7 +125,6 @@ describe("docs.diff — surfaces", () => {
   }, 20000);
 
   it("version_not_in_document maps to 422 + tool-error", async () => {
-    const { token } = await bootstrap(`sqlite:${tmpDb}`);
     const port = await ephemeralPort();
     const handle = await startServer({
       database: `sqlite:${tmpDb}`,
@@ -138,7 +133,7 @@ describe("docs.diff — surfaces", () => {
     });
     handles.push(handle);
     const base = `http://127.0.0.1:${handle.port}`;
-    const auth = { Authorization: `Bearer ${token}` };
+    const auth: Record<string, string> = {};
 
     await fetch(`${base}/repos`, {
       method: "POST",

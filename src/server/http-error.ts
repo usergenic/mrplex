@@ -29,8 +29,6 @@ export type HttpError = {
 /** Return the HTTP status for a given KernelErrorCode. */
 export function httpStatusFor(code: KernelErrorCode): number {
   switch (code) {
-    case "unauthorized":
-      return 401;
     case "forbidden":
       return 403;
     case "stale_prev":
@@ -44,10 +42,8 @@ export function httpStatusFor(code: KernelErrorCode): number {
     case "slug_taken":
       return 409;
     case "repo_not_found":
-    case "user_not_found":
     case "doc_not_found":
     case "version_not_found":
-    case "token_not_found":
       return 404;
     case "version_not_in_document":
       return 422;

@@ -16,21 +16,27 @@ describe("migrate", () => {
     const names = tables
       .map((t) => t.name)
       .filter((n) => !n.startsWith("sqlite_") && !n.startsWith("fts_docs"));
+    // No-auth: no users / api_tokens tables in the collapsed 0001 schema.
     expect(names.sort()).toEqual(
-      [
-        "api_tokens",
-        "chunks",
-        "documents",
-        "embedding_backlog",
-        "links",
-        "repos",
-        "users",
-        "versions",
-      ].sort(),
+      ["chunks", "documents", "embedding_backlog", "links", "repos", "versions"].sort(),
     );
   });
 
-  it("creates the FTS5 virtual table + triggers (migration 0003)", () => {
+  it("versions carries an opaque `author` text column, not author_id", () => {
+    const db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    migrate(db);
+    const cols = db.prepare("pragma table_info(versions)").all() as {
+      name: string;
+      type: string;
+    }[];
+    const author = cols.find((c) => c.name === "author");
+    expect(author).toBeDefined();
+    expect(author?.type.toUpperCase()).toBe("TEXT");
+    expect(cols.map((c) => c.name)).not.toContain("author_id");
+  });
+
+  it("creates the FTS5 virtual table + triggers", () => {
     const db = new Database(":memory:");
     db.pragma("foreign_keys = ON");
     migrate(db);
@@ -48,7 +54,7 @@ describe("migrate", () => {
     expect(triggers.map((t) => t.name)).toEqual(["fts_docs_ad", "fts_docs_ai"]);
   });
 
-  it("creates the links table + partial indexes and the repos.link_config column (migration 0005)", () => {
+  it("creates the links table + partial indexes and the repos.link_config column", () => {
     const db = new Database(":memory:");
     db.pragma("foreign_keys = ON");
     migrate(db);
@@ -106,7 +112,7 @@ describe("migrate", () => {
     ]);
   });
 
-  it("creates the norm columns + case-insensitive unique indexes (migration 0004)", () => {
+  it("creates the norm columns + case-insensitive unique indexes", () => {
     const db = new Database(":memory:");
     db.pragma("foreign_keys = ON");
     migrate(db);
@@ -115,14 +121,13 @@ describe("migrate", () => {
     expect(versionCols.map((c) => c.name)).toContain("path_norm");
     const repoCols = db.prepare("pragma table_info(repos)").all() as { name: string }[];
     expect(repoCols.map((c) => c.name)).toContain("slug_norm");
-    const userCols = db.prepare("pragma table_info(users)").all() as { name: string }[];
-    expect(userCols.map((c) => c.name)).toContain("slug_norm");
 
     const slugIndexes = db
       .prepare(
         "select name from sqlite_master where type='index' and name like '%slugnorm%' order by name",
       )
       .all() as { name: string }[];
-    expect(slugIndexes.map((i) => i.name)).toEqual(["repos_slugnorm_uidx", "users_slugnorm_uidx"]);
+    // No-auth: only repos have a slug_norm index now (no users table).
+    expect(slugIndexes.map((i) => i.name)).toEqual(["repos_slugnorm_uidx"]);
   });
 });

@@ -1,15 +1,17 @@
 #!/usr/bin/env node
 /**
- * mrplex CLI (M3 — reads + writes + tokens + bootstrap + config + serve +
- * remote mode).
+ * mrplex CLI — reads + writes + config + serve + remote mode.
  *
  * The CLI is a thin client over the MCP surface (§7.3). When `--server` is
  * set, commands drive `tools/call` against `<server>/mcp`; otherwise the CLI
  * opens the local SQLite file and calls the kernel in-process. The
  * transport seam is `KernelClient` (`src/client/*`).
  *
- * Bootstrap and serve deliberately bypass the seam — bootstrap creates the
- * first token before any auth exists, and serve IS the server.
+ * No-auth (noauth plan): there is no bootstrap / tokens / users. Identity is
+ * one opaque `author` string (--author → MRPLEX_AUTHOR → config → "mrplex");
+ * `--scope <json>` narrows read visibility. In remote mode an optional --token
+ * is forwarded verbatim as a bearer for a shell fronting the server; mrplex
+ * itself ignores it. serve deliberately bypasses the seam — it IS the server.
  */
 
 import { readFileSync } from "node:fs";
@@ -21,21 +23,18 @@ import { backfillRepo } from "../embed/backfill.js";
 import { createHookFromConfig, resolveEmbedConfig } from "../embed/config.js";
 import { createWorker } from "../embed/worker.js";
 import { globToRegexSource } from "../kernel/auth/glob.js";
-import type { ScopeInput } from "../kernel/auth/scope.js";
+import { type CallContext, type ScopeClaim, parseScopeClaims } from "../kernel/context.js";
 import { KernelError } from "../kernel/errors.js";
 import { extractSystemProperties, split as splitFrontmatter } from "../markdown/frontmatter.js";
 import { startMcpStdio } from "../mcp/server.js";
 import { startServer } from "../server/serve.js";
 import { normalizeDatabaseUrl, openStorage } from "../storage/registry.js";
-import { resolveTokenString } from "./auth.js";
-import { type BootstrapError, bootstrap } from "./bootstrap.js";
 import { type CliConfig, loadConfig, saveConfig } from "./config.js";
 import { exitCodeForKernelError } from "./exit-codes.js";
 import {
   renderHistoryTable,
   renderQueryTable,
   renderReposTable,
-  renderUsersTable,
   renderVersionAsMarkdown,
 } from "./format.js";
 
@@ -77,34 +76,17 @@ function parsePositiveInt(value: string, _prev: unknown): number {
 }
 
 /**
- * Parse a --scope value into a ScopeInput. See M1 for the grammar.
+ * Parse a --scope value (JSON ScopeClaim[]) into claims. The whole flag is one
+ * JSON array — the read-scope grammar is just the wire ScopeClaim shape.
  */
-function parseScope(value: string, prev: ScopeInput[] | undefined): ScopeInput[] {
-  const [repoPart, ...capParts] = value.split(":");
-  if (!repoPart) {
-    throw new InvalidArgumentError(`--scope missing repo pattern: "${value}"`);
+function parseScopeArg(value: string): ScopeClaim[] {
+  try {
+    return parseScopeClaims(value);
+  } catch (err) {
+    throw new InvalidArgumentError(
+      `--scope must be a JSON ScopeClaim array: ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
-  const capString = capParts.join(":");
-  const scope: ScopeInput = { repo: repoPart };
-  if (capString) {
-    for (const cap of capString.split(",")) {
-      const [action, globs] = cap.split("=");
-      if (!action || !globs) {
-        throw new InvalidArgumentError(
-          `--scope malformed capability "${cap}" (expected read=<glob> or write=<glob>)`,
-        );
-      }
-      const list = globs.split("|");
-      if (action === "read") scope.read = list;
-      else if (action === "write") scope.write = list;
-      else {
-        throw new InvalidArgumentError(
-          `--scope unknown action "${action}" (expected read or write)`,
-        );
-      }
-    }
-  }
-  return [...(prev ?? []), scope];
 }
 
 type GlobalOpts = {
@@ -113,7 +95,27 @@ type GlobalOpts = {
   token?: string;
   server?: string;
   repo?: string;
+  author?: string;
+  scope?: ScopeClaim[];
 };
+
+/**
+ * Resolve the write author, git-style precedence: --author → MRPLEX_AUTHOR →
+ * config `author` → engine default (undefined = kernel stamps "mrplex").
+ */
+function resolveAuthor(opts: GlobalOpts): string | undefined {
+  const cfg = loadConfig();
+  return opts.author ?? process.env.MRPLEX_AUTHOR ?? cfg.author;
+}
+
+/** Build the CallContext (author + scope) the client forwards on every call. */
+function resolveContext(opts: GlobalOpts): CallContext {
+  const ctx: CallContext = {};
+  const author = resolveAuthor(opts);
+  if (author !== undefined) ctx.author = author;
+  if (opts.scope !== undefined) ctx.scope = opts.scope;
+  return ctx;
+}
 
 function resolveDatabase(opts: GlobalOpts): string {
   const cfg = loadConfig();
@@ -164,24 +166,26 @@ async function openClient(opts: GlobalOpts): Promise<KernelClient> {
     (err as unknown as { code: string }).code = "cli_conflict";
     throw err;
   }
-  const secret = resolveTokenString(opts.token);
-  if (secret === null) {
-    throw makeUnauthorized(
-      "no token — set MRPLEX_TOKEN, use --token, or `mrplex config set-token`",
-    );
-  }
+  const context = resolveContext(opts);
   if (server) {
-    return openRemoteClient({ server, token: secret });
+    // --token is an optional bearer forwarded verbatim for a shell fronting the
+    // remote server (noauth plan §1); mrplex itself ignores it.
+    return openRemoteClient({
+      server,
+      context,
+      token: resolveTokenString(opts.token) ?? undefined,
+    });
   }
   const embedCfg = resolveEmbedConfig({});
   const embed = createHookFromConfig(embedCfg);
-  return openLocalClient({ database: resolveDatabase(opts), token: secret, embed });
+  return openLocalClient({ database: resolveDatabase(opts), context, embed });
 }
 
-function makeUnauthorized(reason: string): Error {
-  const err = new Error(`unauthorized: ${reason}`);
-  (err as unknown as { code: string }).code = "unauthorized";
-  return err;
+/** Optional bearer for remote pass-through: --token → MRPLEX_TOKEN → config. */
+function resolveTokenString(cliFlag: string | undefined): string | null {
+  if (cliFlag) return cliFlag;
+  if (process.env.MRPLEX_TOKEN) return process.env.MRPLEX_TOKEN;
+  return loadConfig().token ?? null;
 }
 
 async function withClient<T>(
@@ -247,7 +251,7 @@ function readDocumentInput(fromFile: string | undefined): {
 }
 
 function emitVersionWrite(
-  result: { version_id: string; repo: string; path: string; author: { user: string } },
+  result: { version_id: string; repo: string; path: string; author: string },
   opts: GlobalOpts,
 ): void {
   if (opts.json) {
@@ -256,7 +260,7 @@ function emitVersionWrite(
   }
   process.stdout.write(`${result.version_id}\n`);
   process.stderr.write(
-    `wrote ${result.repo}/${result.path} @ ${result.version_id} (author: ${result.author.user})\n`,
+    `wrote ${result.repo}/${result.path} @ ${result.version_id} (author: ${result.author})\n`,
   );
 }
 
@@ -272,7 +276,12 @@ function buildProgram(): Command {
     .addOption(
       new Option("--database <url>", "sqlite:./path.db or postgres://…").env("MRPLEX_DATABASE"),
     )
-    .addOption(new Option("--token <token>", "bearer token").env("MRPLEX_TOKEN"))
+    .addOption(
+      new Option(
+        "--token <token>",
+        "optional bearer forwarded verbatim in remote mode (mrplex ignores it; for a fronting shell)",
+      ).env("MRPLEX_TOKEN"),
+    )
     .addOption(
       new Option("--server <url>", "talk to a remote mrplex server (mutex with --database)").env(
         "MRPLEX_SERVER",
@@ -281,37 +290,18 @@ function buildProgram(): Command {
     .addOption(
       new Option("-r, --repo <slug>", "target repo for `docs *` commands").env("MRPLEX_REPO"),
     )
+    .addOption(
+      new Option("--author <s>", "opaque author string stamped on writes").env("MRPLEX_AUTHOR"),
+    )
+    .option(
+      "--scope <json>",
+      "read-visibility claims as a JSON ScopeClaim array (narrows what reads see)",
+      parseScopeArg,
+    )
     .option("--json", "emit raw JSON instead of pretty output", false)
     .exitOverride((err) => {
       if (err.exitCode === 0) process.exit(0);
       process.exit(err.exitCode || 1);
-    });
-
-  // -------- bootstrap --------
-  program
-    .command("bootstrap")
-    .description("mint the root admin token on a FRESH database (design §8.3)")
-    .action(function (this: Command) {
-      const opts = this.optsWithGlobals<GlobalOpts>();
-      (async () => {
-        try {
-          const result = await bootstrap(resolveDatabase(opts));
-          if (opts.json) {
-            process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
-          } else {
-            process.stdout.write(`${result.token}\n`);
-            process.stderr.write(
-              `This is your root admin token. Store it now — it will not be shown again.\n  user:     ${result.user}\n  token_id: ${result.token_id}\n`,
-            );
-          }
-        } catch (err) {
-          if ((err as BootstrapError).name === "BootstrapError") {
-            process.stderr.write(`${(err as Error).message}\n`);
-            process.exit(1);
-          }
-          reportError(err);
-        }
-      })();
     });
 
   // -------- serve --------
@@ -346,21 +336,13 @@ function buildProgram(): Command {
             embed: embedCfg,
           });
 
-          // Optional STDIO — bound to the launch-time token per §6.2.
+          // Optional STDIO — the launch process IS the shell (noauth plan §2),
+          // so --author / --scope pin the session's CallContext.
           if (localOpts.mcpStdio) {
-            const secret = resolveTokenString(gopts.token);
-            if (secret === null) {
-              process.stderr.write(
-                "mrplex: --mcp-stdio requires a token (--token / MRPLEX_TOKEN / config)\n",
-              );
-              await handle.close();
-              process.exit(3);
-            }
             try {
               await startMcpStdio({
                 kernel: handle.kernel,
-                storage: handle.storage,
-                token: secret,
+                context: resolveContext(gopts),
               });
             } catch (err) {
               process.stderr.write(`mrplex: --mcp-stdio failed: ${(err as Error).message}\n`);
@@ -416,6 +398,14 @@ function buildProgram(): Command {
       process.stderr.write("config: repo set\n");
     });
   cfg
+    .command("set-author <author>")
+    .description('write the default --author to the CLI config (e.g. "Full Name <email@addr>")')
+    .action((author: string) => {
+      const c: CliConfig = { ...loadConfig(), author };
+      saveConfig(c);
+      process.stderr.write("config: author set\n");
+    });
+  cfg
     .command("show")
     .description("print the current CLI config")
     .action(function (this: Command) {
@@ -425,7 +415,7 @@ function buildProgram(): Command {
         process.stdout.write(`${JSON.stringify(c, null, 2)}\n`);
       } else {
         process.stdout.write(
-          `database: ${c.database ?? "(unset)"}\nserver:   ${c.server ?? "(unset)"}\nrepo:     ${c.repo ?? "(unset)"}\ntoken:    ${c.token ? "(set)" : "(unset)"}\n`,
+          `database: ${c.database ?? "(unset)"}\nserver:   ${c.server ?? "(unset)"}\nrepo:     ${c.repo ?? "(unset)"}\nauthor:   ${c.author ?? "(unset)"}\ntoken:    ${c.token ? "(set)" : "(unset)"}\n`,
         );
       }
     });
@@ -521,48 +511,6 @@ function buildProgram(): Command {
           opts,
           `updated ${slug}\nreindexed ${result.reindexed.documents} doc(s), ${result.reindexed.edges} edge(s)`,
         );
-      }).catch(reportError);
-    });
-
-  // -------- users --------
-  const users = program.command("users").description("user management");
-  users
-    .command("list")
-    .description("list users")
-    .action(function (this: Command) {
-      withClient(this, async (client, opts) => {
-        const result = await client.users.list();
-        emit(result, opts, renderUsersTable(result));
-      }).catch(reportError);
-    });
-
-  users
-    .command("create <slug>")
-    .description("create a user (admin)")
-    .action(function (this: Command, slug: string) {
-      withClient(this, async (client, opts) => {
-        const result = await client.users.create(slug);
-        emit(result, opts, `created user ${result.user}`);
-      }).catch(reportError);
-    });
-
-  users
-    .command("rename <slug> <new-slug>")
-    .description("rename a user (admin)")
-    .action(function (this: Command, slug: string, newSlug: string) {
-      withClient(this, async (client, opts) => {
-        const result = await client.users.rename(slug, newSlug);
-        emit(result, opts, `renamed ${slug} → ${result.user}`);
-      }).catch(reportError);
-    });
-
-  users
-    .command("delete <slug>")
-    .description("delete a user — system-namespace rename + revoke tokens (admin)")
-    .action(function (this: Command, slug: string) {
-      withClient(this, async (client, opts) => {
-        const result = await client.users.delete(slug);
-        emit(result, opts, `deleted (now ${result.user})`);
       }).catch(reportError);
     });
 
@@ -963,70 +911,6 @@ function buildProgram(): Command {
           reportError(err);
         }
       })();
-    });
-
-  // -------- tokens --------
-  const tokens = program.command("tokens").description("bearer tokens");
-  tokens
-    .command("list")
-    .description("list your tokens")
-    .action(function (this: Command) {
-      withClient(this, async (client, opts) => {
-        const result = await client.tokens.list();
-        const pretty =
-          result.length === 0
-            ? "(no tokens)"
-            : result
-                .map(
-                  (t) =>
-                    `${t.id}  ${t.admin ? "[admin] " : "        "}${t.label ?? ""}${t.expires_at ? `  expires: ${t.expires_at}` : ""}`,
-                )
-                .join("\n");
-        emit(result, opts, pretty);
-      }).catch(reportError);
-    });
-
-  tokens
-    .command("create")
-    .description("mint a new token; plaintext secret printed once on stdout")
-    .requiredOption("--label <label>", "human-readable label (e.g. 'obsidian-plugin')")
-    .option("--scope <spec>", "repo-scoped capability, repeatable — see help", parseScope, [])
-    .option("--admin", "mint an admin token (requires the caller to be admin)", false)
-    .option("--expires <ts>", "ISO 8601 expiry")
-    .option("--for-user <slug>", "mint on behalf of this user (admin only)")
-    .action(function (this: Command) {
-      const localOpts = this.opts<{
-        label: string;
-        scope: ScopeInput[];
-        admin: boolean;
-        expires?: string;
-        forUser?: string;
-      }>();
-      withClient(this, async (client, opts) => {
-        const result = await client.tokens.create(localOpts.label, localOpts.scope, {
-          admin: localOpts.admin,
-          expires_at: localOpts.expires ?? null,
-          for_user: localOpts.forUser ?? null,
-        });
-        if (opts.json) {
-          process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
-        } else {
-          process.stdout.write(`${result.token}\n`);
-          process.stderr.write(
-            `created token ${result.meta.id} (${result.meta.label ?? ""})${result.meta.admin ? " [admin]" : ""}\n`,
-          );
-        }
-      }).catch(reportError);
-    });
-
-  tokens
-    .command("revoke <token-id>")
-    .description("revoke a token (self, or any if admin)")
-    .action(function (this: Command, tokenId: string) {
-      withClient(this, async (client, opts) => {
-        const result = await client.tokens.revoke(tokenId);
-        emit(result, opts, `revoked ${result.id}`);
-      }).catch(reportError);
     });
 
   return program;

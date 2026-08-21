@@ -1,13 +1,14 @@
 /**
- * MCP surface — design §6.2, m3-plan §5 decisions 2 & 3.
+ * MCP surface — design §6.2, noauth plan §4.
  *
  * Protocol-true MCP via `@modelcontextprotocol/sdk`. Streamable HTTP runs
- * **stateless**: no server-side session store; every request authenticates
- * via Bearer and resolves its own actor. That matches §7.1's multi-instance
- * story and §6.2's per-request auth.
+ * **stateless**: no server-side session store. There is no per-request auth —
+ * mrplex trusts its caller (design §8). Each request's CallContext is read from
+ * the `X-Mrplex-*` headers, which a fronting shell injects (a proxy can set
+ * headers but not rewrite tool arguments — so headers are the injection path).
  *
- * STDIO is the deliberate exception: no per-request auth channel, so the
- * whole session is bound to one launch-time token (§6.2, m3-plan WS4).
+ * STDIO binds one launch-time CallContext for the whole session (no per-request
+ * header channel); `--author` / `--scope` launch flags pin it (noauth plan §4).
  *
  * We use the lower-level `Server` class (not `McpServer`) so tool schemas
  * can be plain JSON Schema — no Zod runtime dependency (tools.ts).
@@ -18,10 +19,9 @@ import { Server as McpLowLevelServer } from "@modelcontextprotocol/sdk/server/in
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import type { Actor } from "../kernel/auth/actor.js";
+import { type CallContext, parseScopeClaims } from "../kernel/context.js";
 import { KernelError } from "../kernel/errors.js";
 import type { Kernel } from "../kernel/kernel.js";
-import { actorFromRequest, resolveBearerActor } from "../server/auth.js";
 import type { Storage } from "../storage/types.js";
 import { TOOL_REGISTRY, toolByName } from "./tools.js";
 
@@ -29,6 +29,26 @@ export type McpConfig = {
   kernel: Kernel;
   storage: Storage;
 };
+
+/**
+ * Build a CallContext from the `X-Mrplex-*` request headers. Malformed scope
+ * JSON throws — a bad claim is a loud client error, not a silent full-access
+ * fallback (see [[scope-claim-semantics]]).
+ */
+export function contextFromHeaders(req: IncomingMessage): CallContext {
+  const ctx: CallContext = {};
+  const author = headerValue(req.headers["x-mrplex-author"]);
+  if (author !== undefined) ctx.author = author;
+  const scope = headerValue(req.headers["x-mrplex-scope"]);
+  if (scope !== undefined) ctx.scope = parseScopeClaims(scope);
+  return ctx;
+}
+
+function headerValue(v: string | string[] | undefined): string | undefined {
+  if (v === undefined) return undefined;
+  const s = Array.isArray(v) ? v[0] : v;
+  return s !== undefined && s.length > 0 ? s : undefined;
+}
 
 export type McpMount = {
   handle: (req: IncomingMessage, res: ServerResponse) => Promise<void>;
@@ -44,32 +64,27 @@ export type McpMount = {
  * work without a shared session store.
  */
 export async function mountMcpStreamableHttp(config: McpConfig): Promise<McpMount> {
-  const { kernel, storage } = config;
+  const { kernel } = config;
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    // Resolve actor up front — kernel errors here become in-band MCP
-    // errors on `tools/call` (below), but for anything else the transport
-    // handles routing. We stash the actor per-request via a closure passed
-    // into the low-level Server callbacks.
-    let actor: Actor | null = null;
+    // Read the per-request CallContext from headers. A malformed X-Mrplex-Scope
+    // is a client error — refuse before the SDK parses the frame.
+    let ctx: CallContext;
     try {
-      actor = await actorFromRequest(req, storage);
+      ctx = contextFromHeaders(req);
     } catch (err) {
-      // No token — refuse before the SDK even parses the frame. Streamable
-      // HTTP auth is HTTP-native (§6.2), so returning 401 here is correct.
-      const status = err instanceof KernelError && err.code === "unauthorized" ? 401 : 500;
-      res.statusCode = status;
+      res.statusCode = 400;
       res.setHeader("Content-Type", "application/json");
       res.end(
         JSON.stringify({
-          code: err instanceof KernelError ? err.code : "internal_error",
-          data: err instanceof KernelError ? err.data : {},
+          code: "filter_invalid",
+          data: { reason: err instanceof Error ? err.message : String(err) },
         }),
       );
       return;
     }
 
-    const server = buildMcpServer(kernel, () => actor as Actor);
+    const server = buildMcpServer(kernel, () => ctx);
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined, // stateless per m3-plan decision 3
       enableJsonResponse: true,
@@ -94,9 +109,9 @@ export async function mountMcpStreamableHttp(config: McpConfig): Promise<McpMoun
 
 /**
  * Build a low-level MCP Server with tools/list + tools/call handlers wired
- * up. The `getActor` closure supplies the resolved actor at call time.
+ * up. The `getContext` closure supplies the session's CallContext at call time.
  */
-function buildMcpServer(kernel: Kernel, getActor: () => Actor): McpLowLevelServer {
+function buildMcpServer(kernel: Kernel, getContext: () => CallContext): McpLowLevelServer {
   const server = new McpLowLevelServer(
     { name: "mrplex", version: "0.0.0" },
     { capabilities: { tools: {} } },
@@ -124,7 +139,7 @@ function buildMcpServer(kernel: Kernel, getActor: () => Actor): McpLowLevelServe
       });
     }
     try {
-      const result = await tool.handler(kernel, getActor(), args);
+      const result = await tool.handler(kernel, getContext(), args);
       return {
         content: [{ type: "text" as const, text: result.text }],
         structuredContent: result.structured,
@@ -160,7 +175,9 @@ function toolError(payload: { code: string; data: Record<string, unknown> }) {
 }
 
 // -----------------------------------------------------------------------------
-// STDIO transport (m3-plan WS4 --mcp-stdio) — one actor for the whole session.
+// STDIO transport (--mcp-stdio) — one CallContext for the whole session. In
+// stdio mode the parent process IS the shell (noauth plan §2), so the launch-
+// time --author / --scope flags pin the session context.
 // -----------------------------------------------------------------------------
 
 export type StdioMount = {
@@ -171,11 +188,10 @@ export type StdioMount = {
 
 export async function startMcpStdio(config: {
   kernel: Kernel;
-  storage: Storage;
-  token: string;
+  context?: CallContext;
 }): Promise<StdioMount> {
-  const actor: Actor = await resolveBearerActor(config.token, config.storage);
-  const server = buildMcpServer(config.kernel, () => actor);
+  const ctx = config.context ?? {};
+  const server = buildMcpServer(config.kernel, () => ctx);
   const transport = new StdioServerTransport();
   await server.connect(transport);
   return {

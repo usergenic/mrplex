@@ -14,15 +14,13 @@
 
 import { createHash } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import type { Actor } from "../kernel/auth/actor.js";
-import type { ScopeInput } from "../kernel/auth/scope.js";
+import { type CallContext, parseScopeClaims } from "../kernel/context.js";
 import { KernelError } from "../kernel/errors.js";
 import type { Kernel } from "../kernel/kernel.js";
 import type { PathConfigOverride } from "../kernel/path-config.js";
 import type { QuerySpec } from "../kernel/query/query.js";
 import type { Version } from "../kernel/wire.js";
 import { appendSystemProperty, extractSystemProperties } from "../markdown/frontmatter.js";
-import { actorFromRequest } from "../server/auth.js";
 import { httpErrorForThrowable } from "../server/http-error.js";
 import type { Storage } from "../storage/types.js";
 import { etagOf, parseIfMatch, parseIfNoneMatch } from "./conditional.js";
@@ -232,19 +230,9 @@ async function dispatch(
     return;
   }
 
-  // /me/tokens — actor-scoped self-management.
-  if (segments[0] === "me" && segments[1] === "tokens") {
-    return dispatchMeTokens(req, res, kernel, storage, segments, method);
-  }
-
-  // /users — repo-independent.
-  if (segments[0] === "users") {
-    return dispatchUsers(req, res, kernel, storage, segments, method);
-  }
-
   // /query — GET or POST.
   if (segments[0] === "query" && segments.length === 1) {
-    return dispatchQuery(req, res, kernel, storage, query, method);
+    return dispatchQuery(req, res, kernel, query, method);
   }
 
   // /repos and everything under it (config, docs, versions, history).
@@ -253,6 +241,35 @@ async function dispatch(
   }
 
   notFound(res);
+}
+
+// -----------------------------------------------------------------------------
+// CallContext from X-Mrplex-* headers (noauth plan §4). No auth — the header is
+// the shell-injection path. `X-Mrplex-Author` stamps writes; `X-Mrplex-Scope`
+// (JSON ScopeClaim[]) narrows reads. Malformed scope JSON → filter_invalid.
+// -----------------------------------------------------------------------------
+
+function contextFromHeaders(req: IncomingMessage): CallContext {
+  const ctx: CallContext = {};
+  const author = headerValue(req.headers["x-mrplex-author"]);
+  if (author !== undefined) ctx.author = author;
+  const scope = headerValue(req.headers["x-mrplex-scope"]);
+  if (scope !== undefined) {
+    try {
+      ctx.scope = parseScopeClaims(scope);
+    } catch (err) {
+      throw new KernelError("filter_invalid", {
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  return ctx;
+}
+
+function headerValue(v: string | string[] | undefined): string | undefined {
+  if (v === undefined) return undefined;
+  const s = Array.isArray(v) ? v[0] : v;
+  return s !== undefined && s.length > 0 ? s : undefined;
 }
 
 // -----------------------------------------------------------------------------
@@ -268,13 +285,14 @@ async function dispatchRepos(
   query: URLSearchParams,
   method: string,
 ): Promise<void> {
-  const actor = await actorFromRequest(req, storage);
+  void storage;
+  const ctx = contextFromHeaders(req);
 
   // GET /repos, POST /repos
   if (segments.length === 1) {
     if (method === "GET") {
       const includeSystem = query.get("include_system") === "true";
-      const result = await kernel.repos.list(actor, { include_system: includeSystem });
+      const result = await kernel.repos.list(ctx, { include_system: includeSystem });
       writeJson(res, 200, result);
       return;
     }
@@ -283,7 +301,7 @@ async function dispatchRepos(
       if (typeof body.slug !== "string") {
         throw new KernelError("slug_invalid", { reason: "body.slug required (string)" });
       }
-      const result = await kernel.repos.create(actor, body.slug);
+      const result = await kernel.repos.create(ctx, body.slug);
       writeJson(res, 201, result);
       return;
     }
@@ -296,7 +314,7 @@ async function dispatchRepos(
   // /repos/{repo}
   if (segments.length === 2) {
     if (method === "GET") {
-      writeJson(res, 200, await kernel.repos.get(actor, repoSlug));
+      writeJson(res, 200, await kernel.repos.get(ctx, repoSlug));
       return;
     }
     if (method === "MOVE") {
@@ -304,11 +322,11 @@ async function dispatchRepos(
       if (dest === null) {
         throw new KernelError("slug_invalid", { reason: "Destination header required" });
       }
-      writeJson(res, 200, await kernel.repos.rename(actor, repoSlug, dest));
+      writeJson(res, 200, await kernel.repos.rename(ctx, repoSlug, dest));
       return;
     }
     if (method === "DELETE") {
-      writeJson(res, 200, await kernel.repos.delete(actor, repoSlug));
+      writeJson(res, 200, await kernel.repos.delete(ctx, repoSlug));
       return;
     }
     return methodNotAllowed(res, method, ["GET", "MOVE", "DELETE"]);
@@ -326,7 +344,7 @@ async function dispatchRepos(
       body && Object.prototype.hasOwnProperty.call(body, "path_config")
         ? (body.path_config as PathConfigOverride | null)
         : (body as unknown as PathConfigOverride | null);
-    writeJson(res, 200, await kernel.repos.set_path_config(actor, repoSlug, cfg));
+    writeJson(res, 200, await kernel.repos.set_path_config(ctx, repoSlug, cfg));
     return;
   }
 
@@ -335,7 +353,7 @@ async function dispatchRepos(
     const pathSegs = segments.slice(3);
     if (pathSegs.length === 0) return notFound(res);
     const path = pathSegs.join("/");
-    return dispatchDocs(req, res, kernel, actor, repoSlug, path, method, query);
+    return dispatchDocs(req, res, kernel, ctx, repoSlug, path, method, query);
   }
 
   // /repos/{repo}/versions/{version_id}
@@ -343,7 +361,7 @@ async function dispatchRepos(
     if (segments.length !== 4) return notFound(res);
     if (method !== "GET") return methodNotAllowed(res, method, ["GET"]);
     const versionId = segments[3] as string;
-    const v = await kernel.docs.get_version(actor, repoSlug, versionId);
+    const v = await kernel.docs.get_version(ctx, repoSlug, versionId);
     return writeDocResponse(req, res, v, systemPropsMode(query));
   }
 
@@ -355,7 +373,7 @@ async function dispatchRepos(
     const path = pathSegs.join("/");
     const limit = readOptionalIntQueryParam(query, "limit");
     const before = query.get("before") ?? undefined;
-    const rows = await kernel.docs.history(actor, repoSlug, path, { limit, before });
+    const rows = await kernel.docs.history(ctx, repoSlug, path, { limit, before });
     writeJson(res, 200, rows);
     return;
   }
@@ -376,7 +394,7 @@ async function dispatchRepos(
       });
       return;
     }
-    const d = await kernel.docs.diff(actor, repoSlug, path, from, to);
+    const d = await kernel.docs.diff(ctx, repoSlug, path, from, to);
     // Content negotiation: Accept: text/plain → raw patch, else JSON.
     const accept = (req.headers.accept as string | undefined) ?? "application/json";
     if (accept.includes("text/plain")) {
@@ -396,14 +414,14 @@ async function dispatchDocs(
   req: IncomingMessage,
   res: ServerResponse,
   kernel: Kernel,
-  actor: Actor,
+  ctx: CallContext,
   repoSlug: string,
   path: string,
   method: string,
   query: URLSearchParams,
 ): Promise<void> {
   if (method === "GET") {
-    const v = await kernel.docs.get(actor, repoSlug, path);
+    const v = await kernel.docs.get(ctx, repoSlug, path);
     return writeDocResponse(req, res, v, systemPropsMode(query));
   }
 
@@ -476,7 +494,7 @@ async function dispatchDocs(
         return;
       }
       // Create: an omitted body means "empty document" — no prev to carry from.
-      const v = await kernel.docs.create(actor, repoSlug, path, {
+      const v = await kernel.docs.create(ctx, repoSlug, path, {
         frontmatter: input.frontmatter as never,
         frontmatter_raw: input.frontmatter_raw,
         body: input.body ?? "",
@@ -498,7 +516,7 @@ async function dispatchDocs(
     if (input.frontmatter !== undefined) putInput.frontmatter = input.frontmatter as never;
     if (input.frontmatter_raw !== undefined) putInput.frontmatter_raw = input.frontmatter_raw;
     if (input.body !== undefined) putInput.body = input.body;
-    const v = await kernel.docs.put(actor, repoSlug, ifMatch.version_id, path, putInput);
+    const v = await kernel.docs.put(ctx, repoSlug, ifMatch.version_id, path, putInput);
     writeJson(res, 200, v, { ETag: etagOf(v.version_id) });
     return;
   }
@@ -513,7 +531,7 @@ async function dispatchDocs(
     // currently lives at (repo, path). If the doc has moved or been deleted
     // since If-Match was observed, stale_prev with the actual current pointer.
     // If nothing lives at path at all, kernel.docs.get raises doc_not_found (404).
-    const current = await kernel.docs.get(actor, repoSlug, path);
+    const current = await kernel.docs.get(ctx, repoSlug, path);
     if (current.version_id !== ifMatch.version_id) {
       throw new KernelError("stale_prev", {
         current_version_id: current.version_id,
@@ -521,7 +539,7 @@ async function dispatchDocs(
         submitted_prev_version_id: ifMatch.version_id,
       });
     }
-    const v = await kernel.docs.delete(actor, repoSlug, ifMatch.version_id);
+    const v = await kernel.docs.delete(ctx, repoSlug, ifMatch.version_id);
     writeJson(res, 200, v, { ETag: etagOf(v.version_id) });
     return;
   }
@@ -538,7 +556,7 @@ async function dispatchDocs(
         reason: "Destination header required (same-repo)",
       });
     }
-    const v = await kernel.docs.put(actor, repoSlug, ifMatch.version_id, dest, {});
+    const v = await kernel.docs.put(ctx, repoSlug, ifMatch.version_id, dest, {});
     writeJson(res, 200, v, { ETag: etagOf(v.version_id) });
     return;
   }
@@ -592,137 +610,6 @@ function systemPropsMode(query: URLSearchParams): SystemPropsMode {
 }
 
 // -----------------------------------------------------------------------------
-// /users*
-// -----------------------------------------------------------------------------
-
-async function dispatchUsers(
-  req: IncomingMessage,
-  res: ServerResponse,
-  kernel: Kernel,
-  storage: Storage,
-  segments: string[],
-  method: string,
-): Promise<void> {
-  const actor = await actorFromRequest(req, storage);
-
-  if (segments.length === 1) {
-    if (method === "GET") {
-      writeJson(res, 200, await kernel.users.list(actor));
-      return;
-    }
-    if (method === "POST") {
-      const body = parseJsonBody(await readBody(req)) as { slug?: unknown };
-      if (typeof body.slug !== "string") {
-        throw new KernelError("slug_invalid", { reason: "body.slug required (string)" });
-      }
-      writeJson(res, 201, await kernel.users.create(actor, body.slug));
-      return;
-    }
-    return methodNotAllowed(res, method, ["GET", "POST"]);
-  }
-
-  if (segments.length === 2) {
-    const userSlug = segments[1] as string;
-    if (method === "MOVE") {
-      const dest = parseUserDestination(req.headers.destination);
-      if (dest === null) {
-        throw new KernelError("slug_invalid", { reason: "Destination header required" });
-      }
-      writeJson(res, 200, await kernel.users.rename(actor, userSlug, dest));
-      return;
-    }
-    if (method === "DELETE") {
-      writeJson(res, 200, await kernel.users.delete(actor, userSlug));
-      return;
-    }
-    return methodNotAllowed(res, method, ["MOVE", "DELETE"]);
-  }
-
-  notFound(res);
-}
-
-// -----------------------------------------------------------------------------
-// /me/tokens*
-// -----------------------------------------------------------------------------
-
-async function dispatchMeTokens(
-  req: IncomingMessage,
-  res: ServerResponse,
-  kernel: Kernel,
-  storage: Storage,
-  segments: string[],
-  method: string,
-): Promise<void> {
-  const actor = await actorFromRequest(req, storage);
-
-  if (segments.length === 2) {
-    if (method === "GET") {
-      writeJson(res, 200, await kernel.tokens.list(actor));
-      return;
-    }
-    if (method === "POST") {
-      const body = parseJsonBody(await readBody(req)) as {
-        label?: unknown;
-        scopes?: unknown;
-        admin?: unknown;
-        expires_at?: unknown;
-        for_user?: unknown;
-      };
-      if (typeof body.label !== "string" && body.label !== null) {
-        throw new KernelError("filter_invalid", { reason: "body.label required (string | null)" });
-      }
-      const scopes = normalizeScopesInput(body.scopes);
-      const admin = body.admin === true;
-      const expires_at =
-        body.expires_at === undefined || body.expires_at === null
-          ? null
-          : typeof body.expires_at === "string"
-            ? body.expires_at
-            : null;
-      // for_user: admin-only cross-user mint (design §8.3). Kernel enforces
-      // the admin bit; we only shape-check here.
-      if (
-        body.for_user !== undefined &&
-        body.for_user !== null &&
-        typeof body.for_user !== "string"
-      ) {
-        throw new KernelError("filter_invalid", {
-          reason: "body.for_user must be a string (user slug) or omitted",
-        });
-      }
-      const for_user =
-        typeof body.for_user === "string" && body.for_user.length > 0 ? body.for_user : null;
-      const result = await kernel.tokens.create(
-        actor,
-        (body.label ?? null) as string | null,
-        scopes,
-        { admin, expires_at, for_user },
-      );
-      writeJson(res, 201, result);
-      return;
-    }
-    return methodNotAllowed(res, method, ["GET", "POST"]);
-  }
-
-  if (segments.length === 3) {
-    const tokenId = segments[2] as string;
-    if (method !== "DELETE") return methodNotAllowed(res, method, ["DELETE"]);
-    writeJson(res, 200, await kernel.tokens.revoke(actor, tokenId));
-    return;
-  }
-
-  notFound(res);
-}
-
-function normalizeScopesInput(raw: unknown): ScopeInput[] {
-  if (raw === undefined || raw === null) return [];
-  if (!Array.isArray(raw)) {
-    throw new KernelError("filter_invalid", { reason: "body.scopes must be an array" });
-  }
-  return raw as ScopeInput[];
-}
-
-// -----------------------------------------------------------------------------
 // /query
 // -----------------------------------------------------------------------------
 
@@ -730,23 +617,36 @@ async function dispatchQuery(
   req: IncomingMessage,
   res: ServerResponse,
   kernel: Kernel,
-  storage: Storage,
   query: URLSearchParams,
   method: string,
 ): Promise<void> {
-  const actor = await actorFromRequest(req, storage);
+  const ctx = contextFromHeaders(req);
 
   let spec: QuerySpec;
   if (method === "GET") {
     spec = specFromQueryString(query);
   } else if (method === "POST") {
     const body = parseJsonBody(await readBody(req)) as Record<string, unknown>;
-    spec = coerceQuerySpec(body);
+    // POST /query accepts a `scope` field in the body — but the header wins
+    // when both are present (the shell sits closer to the credential than the
+    // body author does; noauth plan §4, decision 8).
+    if (body.scope !== undefined) {
+      if (ctx.scope === undefined) {
+        if (!Array.isArray(body.scope)) {
+          throw new KernelError("filter_invalid", { reason: "scope must be an array of claims" });
+        }
+        ctx.scope = body.scope as CallContext["scope"];
+      }
+      const { scope: _scope, ...rest } = body;
+      spec = coerceQuerySpec(rest);
+    } else {
+      spec = coerceQuerySpec(body);
+    }
   } else {
     return methodNotAllowed(res, method, ["GET", "POST"]);
   }
 
-  const results = await kernel.query(actor, spec);
+  const results = await kernel.query(ctx, spec);
   const etag = queryEtag(results);
   const inm = parseQueryIfNoneMatch(req.headers["if-none-match"] as string | undefined);
   if (inm !== null && (inm.kind === "any" || inm.hash === etag)) {
@@ -865,14 +765,6 @@ function parseRepoDestination(headerValue: string | string[] | undefined): strin
   if (path === null) return null;
   const decoded = path.replace(/^\//, "").split("/").map(decodeSegment);
   if (decoded.length !== 2 || decoded[0] !== "repos") return null;
-  return decoded[1] as string;
-}
-
-function parseUserDestination(headerValue: string | string[] | undefined): string | null {
-  const path = parseDestinationHeader(headerValue);
-  if (path === null) return null;
-  const decoded = path.replace(/^\//, "").split("/").map(decodeSegment);
-  if (decoded.length !== 2 || decoded[0] !== "users") return null;
   return decoded[1] as string;
 }
 

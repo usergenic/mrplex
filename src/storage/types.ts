@@ -13,12 +13,6 @@
 
 import type { SearchPlan } from "./search-plan.js";
 
-export type UserRow = {
-  id: number;
-  slug: string;
-  created_at: string;
-};
-
 export type RepoRow = {
   id: number;
   slug: string;
@@ -45,7 +39,7 @@ export type VersionRow = {
   frontmatter_raw: string;
   frontmatter: FrontmatterJson;
   body: string;
-  author_id: number;
+  author: string;
   created_at: string;
 };
 
@@ -57,7 +51,7 @@ export type VersionInsertInput = {
   frontmatter_raw: string;
   frontmatter: FrontmatterJson;
   body: string;
-  author_id: number;
+  author: string;
   created_at: string;
 };
 
@@ -158,35 +152,6 @@ export type BacklogStatus = {
   models: readonly { model: string; chunk_count: number }[];
 };
 
-/**
- * Row shape for api_tokens (see design §3.2 and §8). `scopes` is the JSON
- * text as stored; parsing to StoredScope[] happens at the kernel layer.
- * `admin` is a real boolean — the adapter owns the mapping from 0/1
- * (SQLite) or native boolean (Postgres).
- */
-export type TokenRow = {
-  id: number;
-  user_id: number;
-  secret_hash: string;
-  label: string | null;
-  scopes: string; // JSON text — kernel parses to StoredScope[]
-  admin: boolean;
-  expires_at: string | null;
-  revoked_at: string | null;
-  created_at: string;
-  last_used_at: string | null;
-};
-
-export type TokenInsertInput = {
-  user_id: number;
-  secret_hash: string;
-  label: string | null;
-  scopes: string; // pre-serialized JSON
-  admin: boolean;
-  expires_at: string | null;
-  created_at: string;
-};
-
 export type Storage = {
   close(): Promise<void>;
   migrate(): Promise<void>;
@@ -199,12 +164,6 @@ export type Storage = {
    * storage.
    */
   tx<T>(fn: () => Promise<T>): Promise<T>;
-
-  users_list(): Promise<UserRow[]>;
-  users_create(input: { slug: string; created_at: string }): Promise<UserRow>;
-  users_rename(id: number, new_slug: string): Promise<UserRow>;
-  users_by_slug(slug: string): Promise<UserRow | null>;
-  users_by_id(id: number): Promise<UserRow | null>;
 
   repos_list(): Promise<RepoRow[]>;
   repos_create(input: { slug: string; created_at: string }): Promise<RepoRow>;
@@ -365,18 +324,6 @@ export type Storage = {
   }): Promise<void>;
   backlog_delete(version_id: number): Promise<void>;
   backlog_status(now: string): Promise<BacklogStatus>;
-
-  // Tokens (design §3.2, §8). All queries return null / empty for
-  // revoked or expired rows — the adapter does the filter so the kernel
-  // never has to remember.
-  tokens_create(input: TokenInsertInput): Promise<TokenRow>;
-  tokens_by_hash(hash: string): Promise<TokenRow | null>;
-  tokens_by_id(id: number): Promise<TokenRow | null>;
-  tokens_list(user_id: number): Promise<TokenRow[]>;
-  tokens_revoke(id: number, revoked_at: string): Promise<TokenRow | null>;
-  tokens_revoke_by_user(user_id: number, revoked_at: string): Promise<void>;
-  /** Opportunistic, non-transactional per §8.5. */
-  tokens_touch_last_used(id: number, when: string): Promise<void>;
 };
 
 export type OpenConfig = {

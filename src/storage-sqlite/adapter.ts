@@ -16,9 +16,6 @@ import type {
   RepoRow,
   Storage,
   StorageAdapter,
-  TokenInsertInput,
-  TokenRow,
-  UserRow,
   VectorSearchHit,
   VersionInsertInput,
   VersionRow,
@@ -37,7 +34,7 @@ type VersionRawRow = {
   frontmatter_raw: string;
   frontmatter: string; // JSON text
   body: string;
-  author_id: number;
+  author: string;
   created_at: string;
 };
 
@@ -45,9 +42,6 @@ const hydrateVersion = (row: VersionRawRow): VersionRow => ({
   ...row,
   frontmatter: JSON.parse(row.frontmatter) as FrontmatterJson,
 });
-
-type TokenRawRow = Omit<TokenRow, "admin"> & { admin: number };
-const hydrateToken = (row: TokenRawRow): TokenRow => ({ ...row, admin: row.admin === 1 });
 
 /**
  * Compile + cache RE2JS patterns per SqliteStorage instance. Returns null
@@ -153,47 +147,6 @@ class SqliteStorage implements Storage {
     }
   }
 
-  async users_list(): Promise<UserRow[]> {
-    return this.db
-      .prepare("select id, slug, created_at from users order by slug")
-      .all() as UserRow[];
-  }
-
-  async users_create(input: { slug: string; created_at: string }): Promise<UserRow> {
-    return this.db
-      .prepare(
-        "insert into users(slug, slug_norm, created_at) values (?, ?, ?) returning id, slug, created_at",
-      )
-      .get(input.slug, normalizeKey(input.slug), input.created_at) as UserRow;
-  }
-
-  async users_rename(id: number, new_slug: string): Promise<UserRow> {
-    const row = this.db
-      .prepare(
-        "update users set slug = ?, slug_norm = ? where id = ? returning id, slug, created_at",
-      )
-      .get(new_slug, normalizeKey(new_slug), id) as UserRow | undefined;
-    if (!row) throw new Error(`users_rename: user ${id} not found`);
-    return row;
-  }
-
-  async users_by_slug(slug: string): Promise<UserRow | null> {
-    // Case-insensitive identity: fold the query key to slug_norm (§3.5.1).
-    return (
-      (this.db
-        .prepare("select id, slug, created_at from users where slug_norm = ?")
-        .get(normalizeKey(slug)) as UserRow | undefined) ?? null
-    );
-  }
-
-  async users_by_id(id: number): Promise<UserRow | null> {
-    return (
-      (this.db.prepare("select id, slug, created_at from users where id = ?").get(id) as
-        | UserRow
-        | undefined) ?? null
-    );
-  }
-
   async repos_list(): Promise<RepoRow[]> {
     return this.db
       .prepare("select id, slug, path_config, link_config, created_at from repos order by slug")
@@ -282,10 +235,10 @@ class SqliteStorage implements Storage {
         .prepare(
           `insert into versions
             (document_id, repo_id, prev_id, next_id, path, path_norm,
-             frontmatter_raw, frontmatter, body, author_id, created_at)
+             frontmatter_raw, frontmatter, body, author, created_at)
            values (?, ?, ?, null, ?, ?, ?, ?, ?, ?, ?)
            returning id, document_id, repo_id, prev_id, next_id, path,
-                     frontmatter_raw, frontmatter, body, author_id, created_at`,
+                     frontmatter_raw, frontmatter, body, author, created_at`,
         )
         .get(
           input.document_id,
@@ -296,7 +249,7 @@ class SqliteStorage implements Storage {
           input.frontmatter_raw,
           JSON.stringify(input.frontmatter),
           input.body,
-          input.author_id,
+          input.author,
           input.created_at,
         ) as VersionRawRow;
 
@@ -314,7 +267,7 @@ class SqliteStorage implements Storage {
     const row = this.db
       .prepare(
         `select id, document_id, repo_id, prev_id, next_id, path,
-                frontmatter_raw, frontmatter, body, author_id, created_at
+                frontmatter_raw, frontmatter, body, author, created_at
          from versions where id = ?`,
       )
       .get(id) as VersionRawRow | undefined;
@@ -326,7 +279,7 @@ class SqliteStorage implements Storage {
     const row = this.db
       .prepare(
         `select id, document_id, repo_id, prev_id, next_id, path,
-                frontmatter_raw, frontmatter, body, author_id, created_at
+                frontmatter_raw, frontmatter, body, author, created_at
          from versions where repo_id = ? and path_norm = ? and next_id is null`,
       )
       .get(repo_id, normalizeKey(path)) as VersionRawRow | undefined;
@@ -337,7 +290,7 @@ class SqliteStorage implements Storage {
     const rows = this.db
       .prepare(
         `select id, document_id, repo_id, prev_id, next_id, path,
-                frontmatter_raw, frontmatter, body, author_id, created_at
+                frontmatter_raw, frontmatter, body, author, created_at
          from versions
          where repo_id = ? and next_id is null
          order by path`,
@@ -432,21 +385,21 @@ class SqliteStorage implements Storage {
       .prepare(
         `with recursive chain(
            id, document_id, repo_id, prev_id, next_id, path,
-           frontmatter_raw, frontmatter, body, author_id, created_at, depth
+           frontmatter_raw, frontmatter, body, author, created_at, depth
          ) as (
            select id, document_id, repo_id, prev_id, next_id, path,
-                  frontmatter_raw, frontmatter, body, author_id, created_at, 0
+                  frontmatter_raw, frontmatter, body, author, created_at, 0
              from versions
              where document_id = ? and next_id is null
            union all
            select v.id, v.document_id, v.repo_id, v.prev_id, v.next_id, v.path,
-                  v.frontmatter_raw, v.frontmatter, v.body, v.author_id, v.created_at,
+                  v.frontmatter_raw, v.frontmatter, v.body, v.author, v.created_at,
                   c.depth + 1
              from versions v
              join chain c on v.id = c.prev_id
          )
          select id, document_id, repo_id, prev_id, next_id, path,
-                frontmatter_raw, frontmatter, body, author_id, created_at
+                frontmatter_raw, frontmatter, body, author, created_at
          from chain${where}
          order by depth asc${limitClause}`,
       )
@@ -682,88 +635,23 @@ class SqliteStorage implements Storage {
     };
   }
 
-  async tokens_create(input: TokenInsertInput): Promise<TokenRow> {
-    const raw = this.db
-      .prepare(
-        `insert into api_tokens
-           (user_id, secret_hash, label, scopes, admin,
-            expires_at, revoked_at, created_at, last_used_at)
-         values (?, ?, ?, ?, ?, ?, null, ?, null)
-         returning id, user_id, secret_hash, label, scopes,
-                   admin, expires_at, revoked_at, created_at, last_used_at`,
-      )
-      .get(
-        input.user_id,
-        input.secret_hash,
-        input.label,
-        input.scopes,
-        input.admin ? 1 : 0,
-        input.expires_at,
-        input.created_at,
-      ) as TokenRawRow;
-    return hydrateToken(raw);
-  }
-
-  async tokens_by_hash(hash: string): Promise<TokenRow | null> {
-    const raw = this.db
-      .prepare(
-        `select id, user_id, secret_hash, label, scopes,
-                admin, expires_at, revoked_at, created_at, last_used_at
-           from api_tokens
-           where secret_hash = ?
-             and revoked_at is null
-             and (expires_at is null or expires_at > ?)`,
-      )
-      .get(hash, new Date().toISOString()) as TokenRawRow | undefined;
-    return raw ? hydrateToken(raw) : null;
-  }
-
-  async tokens_by_id(id: number): Promise<TokenRow | null> {
-    const raw = this.db
-      .prepare(
-        `select id, user_id, secret_hash, label, scopes,
-                admin, expires_at, revoked_at, created_at, last_used_at
-           from api_tokens where id = ?`,
-      )
-      .get(id) as TokenRawRow | undefined;
-    return raw ? hydrateToken(raw) : null;
-  }
-
-  async tokens_list(user_id: number): Promise<TokenRow[]> {
-    const rows = this.db
-      .prepare(
-        `select id, user_id, secret_hash, label, scopes,
-                admin, expires_at, revoked_at, created_at, last_used_at
-           from api_tokens
-           where user_id = ?
-             and revoked_at is null
-             and (expires_at is null or expires_at > ?)
-           order by created_at desc, id desc`,
-      )
-      .all(user_id, new Date().toISOString()) as TokenRawRow[];
-    return rows.map(hydrateToken);
-  }
-
-  async tokens_revoke(id: number, revoked_at: string): Promise<TokenRow | null> {
-    const raw = this.db
-      .prepare(
-        `update api_tokens set revoked_at = coalesce(revoked_at, ?)
-           where id = ?
-         returning id, user_id, secret_hash, label, scopes,
-                   admin, expires_at, revoked_at, created_at, last_used_at`,
-      )
-      .get(revoked_at, id) as TokenRawRow | undefined;
-    return raw ? hydrateToken(raw) : null;
-  }
-
-  async tokens_revoke_by_user(user_id: number, revoked_at: string): Promise<void> {
-    this.db
-      .prepare("update api_tokens set revoked_at = coalesce(revoked_at, ?) where user_id = ?")
-      .run(revoked_at, user_id);
-  }
-
-  async tokens_touch_last_used(id: number, when: string): Promise<void> {
-    this.db.prepare("update api_tokens set last_used_at = ? where id = ?").run(when, id);
+  /**
+   * Refuse to open a pre-noauth database. Such a file carries an
+   * `api_tokens` table (and `user_version = 5`); the collapsed migration
+   * chain starts at 0001, so it would skip migration and run against a
+   * mismatched schema. Probe for the legacy marker and refuse with a clear
+   * message (noauth plan §1 — no upgrade path; re-ingest into a fresh db).
+   */
+  assertNotLegacy(): void {
+    const row = this.db
+      .prepare("select name from sqlite_master where type = 'table' and name = 'api_tokens'")
+      .get() as { name: string } | undefined;
+    if (row) {
+      throw new Error(
+        "this database predates the no-auth schema (found legacy api_tokens table). " +
+          "Pre-noauth databases are unsupported — re-ingest into a fresh database.",
+      );
+    }
   }
 }
 
@@ -772,6 +660,7 @@ export const sqliteAdapter: StorageAdapter = {
   async open(config: OpenConfig): Promise<Storage> {
     const path = parseSqliteUrl(config.database);
     const storage = new SqliteStorage(path);
+    storage.assertNotLegacy();
     await storage.migrate();
     return storage;
   },

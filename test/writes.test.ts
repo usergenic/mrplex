@@ -9,7 +9,7 @@
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { type Actor, SYSTEM_ACTOR } from "../src/kernel/auth/actor.js";
+import type { CallContext } from "../src/kernel/context.js";
 import type { KernelError } from "../src/kernel/errors.js";
 import { type Kernel, createKernel } from "../src/kernel/kernel.js";
 import { sqliteAdapter } from "../src/storage-sqlite/adapter.js";
@@ -17,7 +17,7 @@ import type { Storage } from "../src/storage/types.js";
 
 let storage: Storage;
 let kernel: Kernel;
-let actor: Actor;
+const actor: CallContext = { author: "alice" };
 
 async function fresh(): Promise<Storage> {
   return sqliteAdapter.open({
@@ -28,11 +28,7 @@ async function fresh(): Promise<Storage> {
 beforeEach(async () => {
   storage = await fresh();
   kernel = createKernel(storage);
-  // Seed a user + a repo; the kernel doesn't have create-user yet (WS7), so
-  // reach into the adapter. WS7 will replace this with kernel calls.
-  const alice = await storage.users_create({ slug: "alice", created_at: "2026-08-14T00:00:00Z" });
   await storage.repos_create({ slug: "notes", created_at: "2026-08-14T00:00:01Z" });
-  actor = { user_id: alice.id, admin: true, scopes: [] };
 });
 
 afterEach(async () => {
@@ -56,7 +52,7 @@ describe("docs.create", () => {
     expect(v.body).toBe("body\n");
     expect(v.prev_version_id).toBeNull();
     expect(v.next_version_id).toBeNull();
-    expect(v.author.user).toBe("alice");
+    expect(v.author).toBe("alice");
   });
 
   it("creates from structured frontmatter, serializing to canonical YAML", async () => {
@@ -333,70 +329,5 @@ describe("docs.delete", () => {
     expect(history[0]?.path).toBe("hello.md");
     expect(history[1]?.path).toMatch(/^:deleted\//);
     expect(history[2]?.path).toBe("hello.md");
-  });
-});
-
-// -----------------------------------------------------------------------------
-// Auth-shaped scenarios — non-admin actor
-// -----------------------------------------------------------------------------
-
-describe("auth-shaped writes (non-admin actor)", () => {
-  let alice: Actor;
-  let repoId: number;
-
-  beforeEach(async () => {
-    const row = await storage.repos_by_slug("notes");
-    if (!row) throw new Error("seed");
-    repoId = row.id;
-    const u = await storage.users_by_slug("alice");
-    if (!u) throw new Error("seed");
-    alice = {
-      user_id: u.id,
-      admin: false,
-      scopes: [{ repos: [repoId], read: ["**"], write: ["inbox/**"] }],
-    };
-  });
-
-  it("write-in-scope: creating under inbox/ succeeds", async () => {
-    const v = await kernel.docs.create(alice, "notes", "inbox/incoming.md", {
-      frontmatter_raw: "",
-      body: "in\n",
-    });
-    expect(v.path).toBe("inbox/incoming.md");
-  });
-
-  it("write-out-of-scope: create at a path the token doesn't cover → forbidden", async () => {
-    try {
-      await kernel.docs.create(alice, "notes", "elsewhere.md", {
-        frontmatter_raw: "",
-        body: "",
-      });
-      throw new Error("expected throw");
-    } catch (err) {
-      expect((err as KernelError).code).toBe("forbidden");
-    }
-  });
-
-  it("delete via carve-out: user can delete a doc they can write, without needing write on :deleted/…", async () => {
-    const v = await kernel.docs.create(alice, "notes", "inbox/x.md", {
-      frontmatter_raw: "",
-      body: "",
-    });
-    await expect(kernel.docs.delete(alice, "notes", v.version_id)).resolves.toBeDefined();
-  });
-
-  it("delete when the source path is out of write scope → forbidden", async () => {
-    // Create as admin, then attempt delete as alice — alice has write only
-    // under inbox/, but the doc is at elsewhere.md.
-    const v = await kernel.docs.create(actor, "notes", "elsewhere.md", {
-      frontmatter_raw: "",
-      body: "",
-    });
-    try {
-      await kernel.docs.delete(alice, "notes", v.version_id);
-      throw new Error("expected throw");
-    } catch (err) {
-      expect((err as KernelError).code).toBe("forbidden");
-    }
   });
 });

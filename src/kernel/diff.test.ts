@@ -5,20 +5,19 @@
 import { describe, expect, it } from "vitest";
 import { sqliteAdapter } from "../storage-sqlite/adapter.js";
 import type { Storage } from "../storage/types.js";
-import type { Actor } from "./auth/actor.js";
+import type { CallContext } from "./context.js";
 import { KernelError } from "./errors.js";
 import { createKernel } from "./kernel.js";
 
 async function bootstrap(): Promise<{
   storage: Storage;
   kernel: ReturnType<typeof createKernel>;
-  actor: Actor;
+  actor: CallContext;
 }> {
   const storage = await sqliteAdapter.open({ database: "sqlite::memory:" });
   const kernel = createKernel(storage);
-  const u = await storage.users_create({ slug: "alice", created_at: "2026-08-14T00:00:00Z" });
   await storage.repos_create({ slug: "notes", created_at: "2026-08-14T00:00:00Z" });
-  const actor: Actor = { user_id: u.id, admin: true, scopes: [] };
+  const actor: CallContext = {};
   return { storage, kernel, actor };
 }
 

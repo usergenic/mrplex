@@ -90,7 +90,7 @@ export function compileSearchPlan(plan: SearchPlan): CompiledSql {
   const cols = `versions.id, versions.document_id, versions.repo_id,
                 versions.prev_id, versions.next_id, versions.path,
                 versions.frontmatter_raw, versions.frontmatter,
-                versions.body, versions.author_id, versions.created_at`;
+                versions.body, versions.author, versions.created_at`;
 
   let sql: string;
   if (plan.text !== undefined) {

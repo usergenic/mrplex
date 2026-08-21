@@ -46,27 +46,22 @@ function fakeHook(dim = 4): { hook: EmbedHook; calls: string[][]; setFail: (b: b
 
 async function bootstrap(storage: Storage) {
   const now = new Date().toISOString();
-  const u = await storage.users_create({ slug: "alice", created_at: now });
   const r = await storage.repos_create({ slug: "notes", created_at: now });
-  const actor = { user_id: u.id, admin: true, scopes: [] } as {
-    user_id: number;
-    admin: true;
-    scopes: never[];
-  };
-  return { user: u, repo: r, actor };
+  const ctx = {};
+  return { repo: r, ctx };
 }
 
 describe("worker: end-to-end", () => {
   it("drains the backlog and writes chunks with vectors", async () => {
     const s = await sqliteAdapter.open({ database: "sqlite::memory:" });
-    const { repo, actor } = await bootstrap(s);
+    const { repo, ctx } = await bootstrap(s);
     const { hook, calls } = fakeHook();
     const worker = createWorker({ storage: s, hook, batchSize: 4 });
     const kernel = createKernel({
       storage: s,
       onVersionCommitted: (id) => s.backlog_enqueue(id),
     });
-    const v = await kernel.docs.create(actor, repo.slug, "a.md", {
+    const v = await kernel.docs.create(ctx, repo.slug, "a.md", {
       body: "hello world\n\n# section\n\nmore text",
       frontmatter_raw: "",
     });
@@ -86,7 +81,7 @@ describe("worker: end-to-end", () => {
 
   it("dedup: editing one chunk only re-embeds the touched chunk", async () => {
     const s = await sqliteAdapter.open({ database: "sqlite::memory:" });
-    const { repo, actor } = await bootstrap(s);
+    const { repo, ctx } = await bootstrap(s);
     const { hook, calls } = fakeHook();
     const worker = createWorker({ storage: s, hook });
     const kernel = createKernel({
@@ -94,7 +89,7 @@ describe("worker: end-to-end", () => {
       onVersionCommitted: (id) => s.backlog_enqueue(id),
     });
     const body1 = "block one\n\nblock two\n\nblock three";
-    const v1 = await kernel.docs.create(actor, repo.slug, "a.md", {
+    const v1 = await kernel.docs.create(ctx, repo.slug, "a.md", {
       body: body1,
       frontmatter_raw: "",
     });
@@ -104,7 +99,7 @@ describe("worker: end-to-end", () => {
 
     // Rewrite touching only "block two".
     const body2 = "block one\n\nblock CHANGED\n\nblock three";
-    await kernel.docs.put(actor, repo.slug, v1.version_id, "a.md", {
+    await kernel.docs.put(ctx, repo.slug, v1.version_id, "a.md", {
       body: body2,
       frontmatter_raw: "",
     });
@@ -121,7 +116,7 @@ describe("worker: end-to-end", () => {
 
   it("dedup: rewriting the body with same content = zero hook calls", async () => {
     const s = await sqliteAdapter.open({ database: "sqlite::memory:" });
-    const { repo, actor } = await bootstrap(s);
+    const { repo, ctx } = await bootstrap(s);
     const { hook, calls } = fakeHook();
     const worker = createWorker({ storage: s, hook });
     const kernel = createKernel({
@@ -129,11 +124,11 @@ describe("worker: end-to-end", () => {
       onVersionCommitted: (id) => s.backlog_enqueue(id),
     });
     const body = "hello\n\nworld";
-    const v1 = await kernel.docs.create(actor, repo.slug, "a.md", { body, frontmatter_raw: "" });
+    const v1 = await kernel.docs.create(ctx, repo.slug, "a.md", { body, frontmatter_raw: "" });
     await worker.drainOnce();
     expect(calls.length).toBe(1);
     // Same body, different frontmatter — chunk text unchanged.
-    await kernel.docs.put(actor, repo.slug, v1.version_id, "a.md", {
+    await kernel.docs.put(ctx, repo.slug, v1.version_id, "a.md", {
       body,
       frontmatter_raw: "status: draft\n",
     });
@@ -143,19 +138,19 @@ describe("worker: end-to-end", () => {
 
   it("burst dedup: N rapid writes collapse to one embed (current-only)", async () => {
     const s = await sqliteAdapter.open({ database: "sqlite::memory:" });
-    const { repo, actor } = await bootstrap(s);
+    const { repo, ctx } = await bootstrap(s);
     const { hook, calls } = fakeHook();
     const worker = createWorker({ storage: s, hook });
     const kernel = createKernel({
       storage: s,
       onVersionCommitted: (id) => s.backlog_enqueue(id),
     });
-    let prev = await kernel.docs.create(actor, repo.slug, "a.md", {
+    let prev = await kernel.docs.create(ctx, repo.slug, "a.md", {
       body: "v0",
       frontmatter_raw: "",
     });
     for (let i = 1; i < 5; i++) {
-      prev = await kernel.docs.put(actor, repo.slug, prev.version_id, "a.md", {
+      prev = await kernel.docs.put(ctx, repo.slug, prev.version_id, "a.md", {
         body: `v${i}`,
         frontmatter_raw: "",
       });
@@ -185,7 +180,7 @@ describe("worker: end-to-end", () => {
     const bodyV2 = `${A}\n\n${C}`;
 
     const s = await sqliteAdapter.open({ database: "sqlite::memory:" });
-    const { repo, actor } = await bootstrap(s);
+    const { repo, ctx } = await bootstrap(s);
     let model = "model-a";
     const calls: { model: string; count: number }[] = [];
     const hook: EmbedHook = {
@@ -204,7 +199,7 @@ describe("worker: end-to-end", () => {
       storage: s,
       onVersionCommitted: (id) => s.backlog_enqueue(id),
     });
-    const v1 = await kernel.docs.create(actor, repo.slug, "a.md", {
+    const v1 = await kernel.docs.create(ctx, repo.slug, "a.md", {
       body: bodyV1,
       frontmatter_raw: "",
     });
@@ -216,7 +211,7 @@ describe("worker: end-to-end", () => {
     // Swap the model behind the hook. v2 keeps chunk A (reuse-eligible
     // under model-a) but changes B → C (forces a hook call).
     model = "model-b";
-    await kernel.docs.put(actor, repo.slug, v1.version_id, "a.md", {
+    await kernel.docs.put(ctx, repo.slug, v1.version_id, "a.md", {
       body: bodyV2,
       frontmatter_raw: "",
     });
@@ -228,7 +223,7 @@ describe("worker: end-to-end", () => {
 
     expect((await s.backlog_dequeue(new Date().toISOString(), 10)).length).toBe(0);
     const numericId = Number.parseInt(
-      (await kernel.docs.get(actor, repo.slug, "a.md")).version_id.replace(/^v/, ""),
+      (await kernel.docs.get(ctx, repo.slug, "a.md")).version_id.replace(/^v/, ""),
       10,
     );
     const finalChunks = await s.chunks_by_version(numericId);
@@ -246,14 +241,14 @@ describe("worker: end-to-end", () => {
     // vectors — otherwise it stays rankable despite having no
     // chunkable content.
     const s = await sqliteAdapter.open({ database: "sqlite::memory:" });
-    const { repo, actor } = await bootstrap(s);
+    const { repo, ctx } = await bootstrap(s);
     const { hook } = fakeHook();
     const worker = createWorker({ storage: s, hook });
     const kernel = createKernel({
       storage: s,
       onVersionCommitted: (id) => s.backlog_enqueue(id),
     });
-    const v1 = await kernel.docs.create(actor, repo.slug, "a.md", {
+    const v1 = await kernel.docs.create(ctx, repo.slug, "a.md", {
       body: "hello world",
       frontmatter_raw: "",
     });
@@ -261,7 +256,7 @@ describe("worker: end-to-end", () => {
     const idBefore = Number.parseInt(v1.version_id.replace(/^v/, ""), 10);
     expect((await s.chunks_by_version(idBefore)).length).toBeGreaterThan(0);
 
-    const v2 = await kernel.docs.put(actor, repo.slug, v1.version_id, "a.md", {
+    const v2 = await kernel.docs.put(ctx, repo.slug, v1.version_id, "a.md", {
       body: "",
       frontmatter_raw: "",
     });
@@ -274,7 +269,7 @@ describe("worker: end-to-end", () => {
 
   it("hook failure retains the entry with exponential backoff", async () => {
     const s = await sqliteAdapter.open({ database: "sqlite::memory:" });
-    const { repo, actor } = await bootstrap(s);
+    const { repo, ctx } = await bootstrap(s);
     const { hook, calls, setFail } = fakeHook();
     const worker = createWorker({
       storage: s,
@@ -286,7 +281,7 @@ describe("worker: end-to-end", () => {
       storage: s,
       onVersionCommitted: (id) => s.backlog_enqueue(id),
     });
-    await kernel.docs.create(actor, repo.slug, "a.md", {
+    await kernel.docs.create(ctx, repo.slug, "a.md", {
       body: "hello",
       frontmatter_raw: "",
     });
