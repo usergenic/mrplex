@@ -11,12 +11,11 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { KernelError } from "../kernel/errors.js";
 import { parseCel } from "../kernel/query/cel-parse.js";
-import type { Storage, UserRow } from "../storage/types.js";
+import type { Storage } from "../storage/types.js";
 import { sqliteAdapter } from "./adapter.js";
 import { compileFilter } from "./compile-filter.js";
 
 let storage: Storage;
-let user: UserRow;
 let repoId: number;
 
 async function seed(
@@ -34,7 +33,7 @@ async function seed(
       frontmatter_raw: "",
       frontmatter: e.frontmatter,
       body: e.body ?? "",
-      author_id: user.id,
+      author: "alice",
       created_at: new Date(Date.UTC(2026, 7, 14, 0, 0, clock++)).toISOString(),
     });
     ids.push(v.id);
@@ -80,7 +79,6 @@ beforeEach(async () => {
   storage = await sqliteAdapter.open({
     database: `sqlite:${join(tmpdir(), `mrplex-compile-${Date.now()}-${Math.random()}.db`)}`,
   });
-  user = await storage.users_create({ slug: "alice", created_at: "2026-08-14T00:00:00Z" });
   repoId = (await storage.repos_create({ slug: "notes", created_at: "2026-08-14T00:00:01Z" })).id;
 });
 

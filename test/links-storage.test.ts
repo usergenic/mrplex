@@ -33,7 +33,6 @@ const edge = (over: Partial<LinkEdgeInput> & { ord: number }): LinkEdgeInput => 
 
 beforeEach(async () => {
   storage = await fresh();
-  await storage.users_create({ slug: "u", created_at: "2026-08-14T00:00:00Z" });
   const repo = await storage.repos_create({ slug: "r", created_at: "2026-08-14T00:00:01Z" });
   repoId = repo.id;
   docA = (await storage.documents_create(repoId)).id;

@@ -11,7 +11,6 @@ import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { bootstrap } from "../src/cli/bootstrap.js";
 import { startServer } from "../src/server/serve.js";
 import { sqliteAdapter } from "../src/storage-sqlite/adapter.js";
 
@@ -56,7 +55,6 @@ describe("serve + embed worker (end-to-end)", () => {
 
   it("writes queued by kernel are embedded by the running worker", async () => {
     // Bootstrap a fresh db.
-    const { token } = await bootstrap(`sqlite:${tmpDb}`);
 
     // Start stub embedder.
     const stubPort = await ephemeralPort();
@@ -82,7 +80,7 @@ describe("serve + embed worker (end-to-end)", () => {
     expect(handle.embed).not.toBeNull();
 
     const base = `http://127.0.0.1:${handle.port}`;
-    const auth = { Authorization: `Bearer ${token}` };
+    const auth: Record<string, string> = {};
 
     // Create a repo + write a doc.
     await fetch(`${base}/repos`, {
@@ -124,7 +122,6 @@ describe("serve + embed worker (end-to-end)", () => {
     // with the stub embedder in --stdio mode, verify a REST-driven
     // write drains through it, then close serve and check the child
     // process is no longer running.
-    const { token } = await bootstrap(`sqlite:${tmpDb}`);
     const port = await ephemeralPort();
     const handle = await startServer({
       database: `sqlite:${tmpDb}`,
@@ -139,7 +136,7 @@ describe("serve + embed worker (end-to-end)", () => {
     expect(handle.embed).not.toBeNull();
 
     const base = `http://127.0.0.1:${handle.port}`;
-    const auth = { Authorization: `Bearer ${token}` };
+    const auth: Record<string, string> = {};
     await fetch(`${base}/repos`, {
       method: "POST",
       headers: { ...auth, "Content-Type": "application/json" },
@@ -192,7 +189,6 @@ describe("serve + embed worker (end-to-end)", () => {
   }, 20000);
 
   it("hookless serve idles worker, still enqueues backlog", async () => {
-    const { token } = await bootstrap(`sqlite:${tmpDb}`);
     const port = await ephemeralPort();
     const handle = await startServer({
       database: `sqlite:${tmpDb}`,
@@ -204,7 +200,7 @@ describe("serve + embed worker (end-to-end)", () => {
     expect(handle.embed).toBeNull();
 
     const base = `http://127.0.0.1:${handle.port}`;
-    const auth = { Authorization: `Bearer ${token}` };
+    const auth: Record<string, string> = {};
     await fetch(`${base}/repos`, {
       method: "POST",
       headers: { ...auth, "Content-Type": "application/json" },

@@ -43,8 +43,8 @@ export type SeedRepoOptions = {
   fixtureDir: string;
   /** Repo slug to create and seed into. */
   repoSlug: string;
-  /** Slug of the author user to attribute versions to. Created if absent. */
-  authorSlug?: string;
+  /** Opaque author string stamped on seeded versions. Defaults to "alice". */
+  author?: string;
   /** Per-repo link-config override; sets link_config before backfill. */
   linkConfig?: LinkConfigOverride | null;
   /** Deterministic clock — returns an ISO timestamp per call. */
@@ -53,7 +53,6 @@ export type SeedRepoOptions = {
 
 export type SeedRepoResult = {
   repoId: number;
-  authorId: number;
   documents: number;
   edges: number;
 };
@@ -85,16 +84,13 @@ function defaultClock(): () => string {
  * than silent duplication.
  */
 export async function seedRepo(storage: Storage, opts: SeedRepoOptions): Promise<SeedRepoResult> {
-  const authorSlug = opts.authorSlug ?? "alice";
+  const author = opts.author ?? "alice";
   const clock = opts.clock ?? defaultClock();
 
   if (await storage.repos_by_slug(opts.repoSlug)) {
     throw new Error(`seed: repo "${opts.repoSlug}" already exists — refusing to seed over it.`);
   }
 
-  const author =
-    (await storage.users_by_slug(authorSlug)) ??
-    (await storage.users_create({ slug: authorSlug, created_at: clock() }));
   const repo = await storage.repos_create({ slug: opts.repoSlug, created_at: clock() });
 
   if (opts.linkConfig != null) {
@@ -117,7 +113,7 @@ export async function seedRepo(storage: Storage, opts: SeedRepoOptions): Promise
       frontmatter_raw,
       frontmatter,
       body,
-      author_id: author.id,
+      author,
       created_at: clock(),
     });
   }
@@ -125,7 +121,7 @@ export async function seedRepo(storage: Storage, opts: SeedRepoOptions): Promise
   const config = effectiveLinkConfig(LINK_DEFAULTS, opts.linkConfig ?? null);
   const { edges } = await backfillRepoLinks(storage, repo.id, config);
 
-  return { repoId: repo.id, authorId: author.id, documents: files.length, edges };
+  return { repoId: repo.id, documents: files.length, edges };
 }
 
 function parseArgs(argv: string[]): { database: string } {
@@ -136,10 +132,9 @@ function parseArgs(argv: string[]): { database: string } {
 }
 
 async function assertSeedable(storage: Storage): Promise<void> {
-  const users = (await storage.users_list()).filter((u) => u.slug !== "system");
   const repos = await storage.repos_list();
-  if (users.length > 0 || repos.length > 0) {
-    throw new Error("seed: database already has non-system users or any repos — refusing to run.");
+  if (repos.length > 0) {
+    throw new Error("seed: database already has repos — refusing to run.");
   }
 }
 

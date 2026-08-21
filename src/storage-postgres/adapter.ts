@@ -32,9 +32,6 @@ import type {
   RepoRow,
   Storage,
   StorageAdapter,
-  TokenInsertInput,
-  TokenRow,
-  UserRow,
   VectorSearchHit,
   VersionInsertInput,
   VersionRow,
@@ -106,7 +103,7 @@ type VersionRawRow = {
   frontmatter_raw: string;
   frontmatter: Record<string, unknown>; // jsonb — arrives parsed
   body: string;
-  author_id: number;
+  author: string;
   created_at: string;
 };
 
@@ -203,54 +200,6 @@ class PostgresStorage implements Storage {
     }
     // Unreachable: the loop either returns or throws on every attempt.
     throw new Error("tx: retry loop exited without decision (unreachable)");
-  }
-
-  async users_list(): Promise<UserRow[]> {
-    return this.withClient(async (c) => {
-      const res = await c.query<UserRow>("select id, slug, created_at from users order by slug");
-      return res.rows;
-    });
-  }
-
-  async users_create(input: { slug: string; created_at: string }): Promise<UserRow> {
-    return this.withClient(async (c) => {
-      const res = await c.query<UserRow>(
-        "insert into users(slug, slug_norm, created_at) values ($1, $2, $3) returning id, slug, created_at",
-        [input.slug, normalizeKey(input.slug), input.created_at],
-      );
-      return res.rows[0] as UserRow;
-    });
-  }
-
-  async users_rename(id: number, new_slug: string): Promise<UserRow> {
-    return this.withClient(async (c) => {
-      const res = await c.query<UserRow>(
-        "update users set slug = $1, slug_norm = $2 where id = $3 returning id, slug, created_at",
-        [new_slug, normalizeKey(new_slug), id],
-      );
-      if (res.rows.length === 0) throw new Error(`users_rename: user ${id} not found`);
-      return res.rows[0] as UserRow;
-    });
-  }
-
-  async users_by_slug(slug: string): Promise<UserRow | null> {
-    return this.withClient(async (c) => {
-      // Case-insensitive identity: fold the query key to slug_norm (§3.5.1).
-      const res = await c.query<UserRow>(
-        "select id, slug, created_at from users where slug_norm = $1",
-        [normalizeKey(slug)],
-      );
-      return res.rows[0] ?? null;
-    });
-  }
-
-  async users_by_id(id: number): Promise<UserRow | null> {
-    return this.withClient(async (c) => {
-      const res = await c.query<UserRow>("select id, slug, created_at from users where id = $1", [
-        id,
-      ]);
-      return res.rows[0] ?? null;
-    });
   }
 
   async repos_list(): Promise<RepoRow[]> {
@@ -357,10 +306,10 @@ class PostgresStorage implements Storage {
         const ins = await c.query<VersionRawRow>(
           `insert into versions
              (document_id, repo_id, prev_id, next_id, path, path_norm,
-              frontmatter_raw, frontmatter, body, author_id, created_at)
+              frontmatter_raw, frontmatter, body, author, created_at)
            values ($1, $2, $3, null, $4, $5, $6, $7::jsonb, $8, $9, $10)
            returning id, document_id, repo_id, prev_id, next_id, path,
-                     frontmatter_raw, frontmatter, body, author_id, created_at`,
+                     frontmatter_raw, frontmatter, body, author, created_at`,
           [
             input.document_id,
             input.repo_id,
@@ -370,7 +319,7 @@ class PostgresStorage implements Storage {
             input.frontmatter_raw,
             JSON.stringify(input.frontmatter),
             input.body,
-            input.author_id,
+            input.author,
             input.created_at,
           ],
         );
@@ -390,7 +339,7 @@ class PostgresStorage implements Storage {
     return this.withClient(async (c) => {
       const res = await c.query<VersionRawRow>(
         `select id, document_id, repo_id, prev_id, next_id, path,
-                frontmatter_raw, frontmatter, body, author_id, created_at
+                frontmatter_raw, frontmatter, body, author, created_at
          from versions where id = $1`,
         [id],
       );
@@ -403,7 +352,7 @@ class PostgresStorage implements Storage {
       // Case-insensitive identity: fold the query key to path_norm (§3.5.1).
       const res = await c.query<VersionRawRow>(
         `select id, document_id, repo_id, prev_id, next_id, path,
-                frontmatter_raw, frontmatter, body, author_id, created_at
+                frontmatter_raw, frontmatter, body, author, created_at
          from versions where repo_id = $1 and path_norm = $2 and next_id is null`,
         [repo_id, normalizeKey(path)],
       );
@@ -415,7 +364,7 @@ class PostgresStorage implements Storage {
     return this.withClient(async (c) => {
       const res = await c.query<VersionRawRow>(
         `select id, document_id, repo_id, prev_id, next_id, path,
-                frontmatter_raw, frontmatter, body, author_id, created_at
+                frontmatter_raw, frontmatter, body, author, created_at
          from versions
          where repo_id = $1 and next_id is null
          order by path`,
@@ -536,18 +485,18 @@ class PostgresStorage implements Storage {
       const res = await c.query<VersionRawRow>(
         `with recursive chain as (
            select id, document_id, repo_id, prev_id, next_id, path,
-                  frontmatter_raw, frontmatter, body, author_id, created_at, 0 as depth
+                  frontmatter_raw, frontmatter, body, author, created_at, 0 as depth
              from versions
              where document_id = $1 and next_id is null
            union all
            select v.id, v.document_id, v.repo_id, v.prev_id, v.next_id, v.path,
-                  v.frontmatter_raw, v.frontmatter, v.body, v.author_id, v.created_at,
+                  v.frontmatter_raw, v.frontmatter, v.body, v.author, v.created_at,
                   c.depth + 1
              from versions v
              join chain c on v.id = c.prev_id
          )
          select id, document_id, repo_id, prev_id, next_id, path,
-                frontmatter_raw, frontmatter, body, author_id, created_at
+                frontmatter_raw, frontmatter, body, author, created_at
          from chain${where}
          order by depth asc${limitClause}`,
         params,
@@ -807,97 +756,22 @@ class PostgresStorage implements Storage {
     });
   }
 
-  async tokens_create(input: TokenInsertInput): Promise<TokenRow> {
-    return this.withClient(async (c) => {
-      const res = await c.query<TokenRow>(
-        `insert into api_tokens
-           (user_id, secret_hash, label, scopes, admin, expires_at, revoked_at, created_at, last_used_at)
-         values ($1, $2, $3, $4::jsonb, $5, $6, null, $7, null)
-         returning id, user_id, secret_hash, label, scopes::text as scopes,
-                   admin, expires_at, revoked_at, created_at, last_used_at`,
-        [
-          input.user_id,
-          input.secret_hash,
-          input.label,
-          input.scopes,
-          input.admin,
-          input.expires_at,
-          input.created_at,
-        ],
-      );
-      return res.rows[0] as TokenRow;
-    });
-  }
-
-  async tokens_by_hash(hash: string): Promise<TokenRow | null> {
-    return this.withClient(async (c) => {
-      const res = await c.query<TokenRow>(
-        `select id, user_id, secret_hash, label, scopes::text as scopes,
-                admin, expires_at, revoked_at, created_at, last_used_at
-           from api_tokens
-           where secret_hash = $1
-             and revoked_at is null
-             and (expires_at is null or expires_at > $2)`,
-        [hash, new Date().toISOString()],
-      );
-      return res.rows[0] ?? null;
-    });
-  }
-
-  async tokens_by_id(id: number): Promise<TokenRow | null> {
-    return this.withClient(async (c) => {
-      const res = await c.query<TokenRow>(
-        `select id, user_id, secret_hash, label, scopes::text as scopes,
-                admin, expires_at, revoked_at, created_at, last_used_at
-           from api_tokens where id = $1`,
-        [id],
-      );
-      return res.rows[0] ?? null;
-    });
-  }
-
-  async tokens_list(user_id: number): Promise<TokenRow[]> {
-    return this.withClient(async (c) => {
-      const res = await c.query<TokenRow>(
-        `select id, user_id, secret_hash, label, scopes::text as scopes,
-                admin, expires_at, revoked_at, created_at, last_used_at
-           from api_tokens
-           where user_id = $1
-             and revoked_at is null
-             and (expires_at is null or expires_at > $2)
-           order by created_at desc, id desc`,
-        [user_id, new Date().toISOString()],
-      );
-      return res.rows;
-    });
-  }
-
-  async tokens_revoke(id: number, revoked_at: string): Promise<TokenRow | null> {
-    return this.withClient(async (c) => {
-      const res = await c.query<TokenRow>(
-        `update api_tokens set revoked_at = coalesce(revoked_at, $1)
-           where id = $2
-         returning id, user_id, secret_hash, label, scopes::text as scopes,
-                   admin, expires_at, revoked_at, created_at, last_used_at`,
-        [revoked_at, id],
-      );
-      return res.rows[0] ?? null;
-    });
-  }
-
-  async tokens_revoke_by_user(user_id: number, revoked_at: string): Promise<void> {
-    await this.withClient((c) =>
-      c.query("update api_tokens set revoked_at = coalesce(revoked_at, $1) where user_id = $2", [
-        revoked_at,
-        user_id,
-      ]),
+  /**
+   * Refuse to open a pre-noauth database. Such a database carries an
+   * `api_tokens` table; the collapsed migration chain starts at 0001 and
+   * would run against a mismatched schema. Probe for the legacy marker and
+   * refuse with a clear message (noauth plan §1 — no upgrade path).
+   */
+  async assertNotLegacy(): Promise<void> {
+    const res = await this.withClient((c) =>
+      c.query<{ exists: boolean }>("select to_regclass('public.api_tokens') is not null as exists"),
     );
-  }
-
-  async tokens_touch_last_used(id: number, when: string): Promise<void> {
-    await this.withClient((c) =>
-      c.query("update api_tokens set last_used_at = $1 where id = $2", [when, id]),
-    );
+    if (res.rows[0]?.exists) {
+      throw new Error(
+        "this database predates the no-auth schema (found legacy api_tokens table). " +
+          "Pre-noauth databases are unsupported — re-ingest into a fresh database.",
+      );
+    }
   }
 }
 
@@ -930,6 +804,7 @@ export const postgresAdapter: StorageAdapter = {
   async open(config: OpenConfig): Promise<Storage> {
     const url = parsePostgresUrl(config.database);
     const storage = new PostgresStorage(url);
+    await storage.assertNotLegacy();
     await storage.migrate();
     return storage;
   },

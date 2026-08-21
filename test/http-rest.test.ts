@@ -9,15 +9,15 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { bootstrap } from "../src/cli/bootstrap.js";
 import { type ServeHandle, startServer } from "../src/server/serve.js";
 
 let workDir: string;
-let token: string;
 let handle: ServeHandle;
 let base: string;
 
-const authHeaders = () => ({ Authorization: `Bearer ${token}` });
+// No-auth: requests carry no credentials. Kept as a helper so the many call
+// sites stay readable; it just returns an empty header bag.
+const authHeaders = (): Record<string, string> => ({});
 
 /**
  * Node's undici types response.json() as Promise<unknown>. Tests just want a
@@ -31,8 +31,6 @@ async function readJson<T = Record<string, unknown>>(r: Response): Promise<T> {
 beforeEach(async () => {
   workDir = mkdtempSync(join(tmpdir(), "mrplex-rest-"));
   const dbUrl = `sqlite:${join(workDir, "test.db")}`;
-  const b = await bootstrap(dbUrl);
-  token = b.token;
   handle = await startServer({ database: dbUrl, port: 0, log: () => {} });
   base = handle.baseUrl;
 });
@@ -42,23 +40,17 @@ afterEach(async () => {
   rmSync(workDir, { recursive: true, force: true });
 });
 
-describe("REST auth", () => {
-  it("no token → 401 unauthorized", async () => {
+describe("REST no-auth", () => {
+  it("no credentials needed → 200 empty list", async () => {
     const r = await fetch(`${base}/repos`);
-    expect(r.status).toBe(401);
-    const body = await readJson<{ code: string }>(r);
-    expect(body.code).toBe("unauthorized");
+    expect(r.status).toBe(200);
+    expect(await r.json()).toEqual([]);
   });
 
-  it("bogus token → 401", async () => {
+  it("a stray Authorization header is ignored, not rejected", async () => {
     const r = await fetch(`${base}/repos`, {
-      headers: { Authorization: "Bearer mrplex_notreal" },
+      headers: { Authorization: "Bearer anything-at-all" },
     });
-    expect(r.status).toBe(401);
-  });
-
-  it("with token → 200 empty list", async () => {
-    const r = await fetch(`${base}/repos`, { headers: authHeaders() });
     expect(r.status).toBe(200);
     expect(await r.json()).toEqual([]);
   });
@@ -440,70 +432,87 @@ describe("REST query", () => {
   });
 });
 
-describe("REST /me/tokens POST", () => {
-  it("mints a token for the caller (no for_user)", async () => {
-    const r = await fetch(`${base}/me/tokens`, {
+describe("REST scope header", () => {
+  beforeEach(async () => {
+    await fetch(`${base}/repos`, {
       method: "POST",
       headers: { ...authHeaders(), "Content-Type": "application/json" },
-      body: JSON.stringify({ label: "self", scopes: [{ repo: "*", read: "**" }] }),
+      body: JSON.stringify({ slug: "notes" }),
+    });
+    for (const path of ["public.md", "secret/hidden.md"]) {
+      await fetch(`${base}/repos/notes/docs/${path}`, {
+        method: "PUT",
+        headers: { ...authHeaders(), "Content-Type": "text/markdown", "If-None-Match": "*" },
+        body: "x\n",
+      });
+    }
+  });
+
+  it("X-Mrplex-Scope narrows query visibility", async () => {
+    const scope = JSON.stringify([{ repo: "notes", read: ["public.md"] }]);
+    const r = await fetch(`${base}/query?repo=notes`, {
+      headers: { "X-Mrplex-Scope": scope },
+    });
+    expect(r.status).toBe(200);
+    const rows = await readJson<{ path: string }[]>(r);
+    expect(rows.map((x) => x.path)).toEqual(["public.md"]);
+  });
+
+  it("a malformed X-Mrplex-Scope → 400 filter_invalid", async () => {
+    const r = await fetch(`${base}/repos`, {
+      headers: { "X-Mrplex-Scope": "{not json" },
+    });
+    expect(r.status).toBe(400);
+    expect((await readJson<{ code: string }>(r)).code).toBe("filter_invalid");
+  });
+
+  it("a structurally-invalid claim (missing repo) → 400 filter_invalid, not silent deny", async () => {
+    const r = await fetch(`${base}/repos`, {
+      headers: { "X-Mrplex-Scope": JSON.stringify([{ read: ["**"] }]) },
+    });
+    expect(r.status).toBe(400);
+    expect((await readJson<{ code: string }>(r)).code).toBe("filter_invalid");
+  });
+
+  it("POST /query body scope: a repo-less claim → 400 filter_invalid, not empty results", async () => {
+    const r = await fetch(`${base}/query`, {
+      method: "POST",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ repo: "notes", scope: [{ read: ["public.md"] }] }),
+    });
+    expect(r.status).toBe(400);
+    expect((await readJson<{ code: string }>(r)).code).toBe("filter_invalid");
+  });
+
+  it("X-Mrplex-Author stamps the author on a write", async () => {
+    const r = await fetch(`${base}/repos/notes/docs/authored.md`, {
+      method: "PUT",
+      headers: {
+        ...authHeaders(),
+        "Content-Type": "text/markdown",
+        "If-None-Match": "*",
+        "X-Mrplex-Author": "Ripley <ripley@nostromo>",
+      },
+      body: "log\n",
     });
     expect(r.status).toBe(201);
-    const created = await readJson<{ token: string; meta: { id: string; label: string } }>(r);
-    expect(created.token).toMatch(/^mrplex_/);
-    expect(created.meta.label).toBe("self");
+    const v = await readJson<{ author: string }>(r);
+    expect(v.author).toBe("Ripley <ripley@nostromo>");
   });
 
-  it("for_user: admin mints on behalf of another user", async () => {
-    await fetch(`${base}/users`, {
-      method: "POST",
-      headers: { ...authHeaders(), "Content-Type": "application/json" },
-      body: JSON.stringify({ slug: "alice" }),
-    });
-    const r = await fetch(`${base}/me/tokens`, {
-      method: "POST",
-      headers: { ...authHeaders(), "Content-Type": "application/json" },
-      body: JSON.stringify({
-        label: "alice-primary",
-        scopes: [{ repo: "*", read: "**" }],
-        for_user: "alice",
-      }),
-    });
-    expect(r.status).toBe(201);
-    const created = await readJson<{ token: string; meta: { id: string; label: string } }>(r);
-    expect(created.meta.label).toBe("alice-primary");
-    // The minted token authenticates as alice — /me/tokens list must show
-    // exactly the one token we just created for her.
-    const list = await fetch(`${base}/me/tokens`, {
-      headers: { Authorization: `Bearer ${created.token}` },
-    });
-    expect(list.status).toBe(200);
-    const rows = await readJson<{ id: string }[]>(list);
-    expect(rows.map((r) => r.id)).toEqual([created.meta.id]);
-  });
-
-  it("for_user: unknown user → 404 user_not_found", async () => {
-    const r = await fetch(`${base}/me/tokens`, {
-      method: "POST",
-      headers: { ...authHeaders(), "Content-Type": "application/json" },
-      body: JSON.stringify({
-        label: "ghost",
-        scopes: [{ repo: "*", read: "**" }],
-        for_user: "ghost",
-      }),
-    });
-    expect(r.status).toBe(404);
-    expect((await readJson<{ code: string }>(r)).code).toBe("user_not_found");
-  });
-
-  it("for_user: wrong-type → 400 filter_invalid (not silently ignored)", async () => {
-    const r = await fetch(`${base}/me/tokens`, {
-      method: "POST",
-      headers: { ...authHeaders(), "Content-Type": "application/json" },
-      body: JSON.stringify({
-        label: "bad",
-        scopes: [{ repo: "*", read: "**" }],
-        for_user: 42,
-      }),
+  it("an over-length X-Mrplex-Author → 400 filter_invalid (not a 500)", async () => {
+    // A raw control char can't ride an HTTP header (undici rejects it
+    // client-side), so exercise the same resolveAuthor rejection path via the
+    // length cap — the point is that bad author input stays 4xx, not 500.
+    const r = await fetch(`${base}/repos/notes/docs/bad-author.md`, {
+      method: "PUT",
+      headers: {
+        ...authHeaders(),
+        "Content-Type": "text/markdown",
+        "If-None-Match": "*",
+        "X-Mrplex-Author": "a".repeat(513),
+      },
+      body: "log\n",
     });
     expect(r.status).toBe(400);
     expect((await readJson<{ code: string }>(r)).code).toBe("filter_invalid");
@@ -522,13 +531,13 @@ describe("REST error mapping", () => {
     expect((await readJson<{ code: string }>(r)).code).toBe("doc_not_found");
   });
 
-  it("token_not_found → 404 (§5 decision 4)", async () => {
+  it("removed routes (/me/tokens, /users) → 404 no_route", async () => {
     const r = await fetch(`${base}/me/tokens/tbogus`, {
       method: "DELETE",
       headers: authHeaders(),
     });
     expect(r.status).toBe(404);
-    expect((await readJson<{ code: string }>(r)).code).toBe("token_not_found");
+    expect((await readJson<{ code: string }>(r)).code).toBe("no_route");
   });
 
   it("version_not_in_document → 422", async () => {

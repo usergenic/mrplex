@@ -37,12 +37,6 @@ External-source bridging (git repos, GitHub) is deliberately post-v1, as are Web
 ### 3.2 Schema
 
 ```sql
-users (
-  id          integer primary key,
-  slug        text unique not null,     -- API-facing; renameable
-  created_at  timestamp not null
-)
-
 repos (
   id          integer primary key,
   slug        text unique not null,     -- API-facing; renameable
@@ -65,7 +59,7 @@ versions (
   frontmatter_raw text not null,                         -- verbatim YAML source (may be empty); round-trips byte-exact
   frontmatter     json not null,                         -- parsed form; a derived query index of frontmatter_raw
   body            text not null,
-  author_id   integer not null references users(id),
+  author      text not null,                             -- opaque caller-supplied string (§4.4); default "mrplex"
   created_at  timestamp not null
 )
 
@@ -86,18 +80,6 @@ chunks (
   primary key (version_id, ix)
 )
 
-api_tokens (
-  id           integer primary key,
-  user_id      integer not null references users(id),
-  secret_hash  text    not null,                            -- sha-256 of the token secret (§8.1); indexed for lookup
-  label        text,                                        -- human-readable, e.g. "obsidian plugin"
-  scopes       json    not null,                            -- see §8
-  expires_at   timestamp,                                   -- null = no expiry
-  revoked_at   timestamp,                                   -- null = active
-  created_at   timestamp not null,
-  last_used_at timestamp
-)
-
 embedding_backlog (
   version_id    integer primary key references versions(id),  -- pending/failed embedding work (§5.3)
   attempts      integer not null,
@@ -106,7 +88,10 @@ embedding_backlog (
 )
 
 -- FTS index on versions.body
+-- users, api_tokens: gone — mrplex is a full-trust kernel (§8); identity is the opaque `author` string.
 ```
+
+Both engines ship a single collapsed `0001_init.sql` — SQLite folds the former `0001`–`0005`, Postgres folds `0001`–`0003` — that bakes in everything (init + casefold + FTS + links) with `author` as a plain text column. There is no upgrade path: on open the adapter probes for the legacy marker (an `api_tokens` table) and **refuses** a pre-noauth database with a clear error (re-ingest into a fresh database). Future migrations resume at `0002`.
 
 `prev_id` and `next_id` are inverse links on the fast-forward version chain: writing a new version `Y` with `prev_id = X` also sets `X.next_id = Y` in the same transaction. The two partial indexes are the schema-level guarantees behind §4 — no application code can bypass them.
 
@@ -116,7 +101,7 @@ embedding_backlog (
 
 Integer primary keys are internal — **they never cross the wire**. FKs use them so renames don't rewrite rows. The API exposes:
 
-- **Slugs** — for users and repos. Globally unique. Renameable via `.rename` methods.
+- **Slugs** — for repos. Globally unique. Renameable via `.rename` methods.
 - **Opaque `version_id` strings** — clients echo them back to reference a version; they don't parse or construct them. Server chooses the representation.
 
 Multitenancy would partition slug uniqueness later without changing the model.
@@ -133,7 +118,9 @@ Renames stay on the same `document_id` with a new `path` (§4.1). **Deletion** a
 
 This eliminates the tombstone concept entirely: every version has real content at a real path; "deletedness" is just "currently lives under a system sigil."
 
-**Repos and users delete the same way.** `repos.delete` is a kernel rename of the slug into the system namespace — `<system-sigil>deleted-{slug}-{suffix}`, where `{suffix}` is a short server-chosen uniquifier — the document-deletion primitive applied one level up. The old slug is freed, the documents inside are untouched, and `repos.list` hides system-namespaced repos by default (`include_system: true` opts in). Restore is `repos.rename` back to a user-territory slug. While deleted, a repo rejects document writes and answers `repo_not_found` to non-admin callers. `users.delete` is the same rename and additionally revokes all of the user's tokens; historical attribution via `author_id` is untouched — the user row never goes away. Deleting an already-deleted repo, user, or document is a **no-op**: all deletes are idempotent.
+**Repos delete the same way.** `repos.delete` is a kernel rename of the slug into the system namespace — `<system-sigil>deleted-{slug}-{suffix}`, where `{suffix}` is a short server-chosen uniquifier — the document-deletion primitive applied one level up. The old slug is freed, the documents inside are untouched, and `repos.list` hides system-namespaced repos by default (`include_system: true` opts in). Restore is `repos.rename` back to a user-territory slug. There is no admin concept and no per-caller gating in the engine (§8): a deleted repo's slug is simply freed, and what a caller can see is governed by its read scope claim, not by any admin bit. Deleting an already-deleted repo or document is a **no-op**: all deletes are idempotent.
+
+Authorship is an opaque string carried on each version (§4.4); it is never disturbed by any operation. There are no users or tokens to revoke — those left the engine with authn (§8).
 
 ### 3.5 Paths: structure, validation, and sigils
 
@@ -152,7 +139,7 @@ EMPTY_SEGMENT    = ""     // no leading/trailing '/', no '//'
 
 A segment equal to `CURRENT_SEGMENT`, `PARENT_SEGMENT`, or `EMPTY_SEGMENT` is invalid on any write. These meanings are too canonical to override — an operator who wants `.` to mean something else than "current" would break every mental model callers bring with them.
 
-Also structural: paths and slugs have **case-insensitive, Unicode-normalized identity** but **case- and form-preserving storage**. Storage keeps the author's exact bytes (`versions.path`, `repos.slug`, `users.slug` are verbatim, so the §3.2 byte-exact round-trip holds); identity — uniqueness and by-key lookup — runs off a derived normalized key (`normalizeKey` = NFC + locale-invariant lowercase, `src/kernel/casefold.ts`) held in a shadow column (`path_norm`/`slug_norm`) with its own unique partial index. So `Alice.md` and `alice.md` cannot both be live in a repo, `docs.get NOTES/ALICE.md` resolves the document authored at `notes/Alice.md` (returning the stored case), and NFC/NFD spellings of the same text address the same document. Normalization is computed **in the kernel**, never via SQL `lower()`/`COLLATE`/`citext` — SQLite's `lower()` is ASCII-only while Postgres's is locale-aware, so a functional index would silently diverge and break §7.2 parity; folding in one JS function keeps the adapters identical. The chosen fold strength (NFC + `toLowerCase`) covers accented Latin/Greek/Cyrillic but not ß→ss, ligatures, or Greek final-sigma; strengthening to full Unicode case-folding later is additive (recompute the key via backfill). The normalized key is an internal index artifact (§3.3-style) — never surfaced on the wire, and CEL `$path` reads the stored path, not the key.
+Also structural: paths and slugs have **case-insensitive, Unicode-normalized identity** but **case- and form-preserving storage**. Storage keeps the author's exact bytes (`versions.path`, `repos.slug` are verbatim, so the §3.2 byte-exact round-trip holds); identity — uniqueness and by-key lookup — runs off a derived normalized key (`normalizeKey` = NFC + locale-invariant lowercase, `src/kernel/casefold.ts`) held in a shadow column (`path_norm`/`slug_norm`) with its own unique partial index. So `Alice.md` and `alice.md` cannot both be live in a repo, `docs.get NOTES/ALICE.md` resolves the document written at `notes/Alice.md` (returning the stored case), and NFC/NFD spellings of the same text address the same document. Normalization is computed **in the kernel**, never via SQL `lower()`/`COLLATE`/`citext` — SQLite's `lower()` is ASCII-only while Postgres's is locale-aware, so a functional index would silently diverge and break §7.2 parity; folding in one JS function keeps the adapters identical. The chosen fold strength (NFC + `toLowerCase`) covers accented Latin/Greek/Cyrillic but not ß→ss, ligatures, or Greek final-sigma; strengthening to full Unicode case-folding later is additive (recompute the key via backfill). The normalized key is an internal index artifact (§3.3-style) — never surfaced on the wire, and CEL `$path` reads the stored path, not the key.
 
 #### 3.5.2 Configurable policy
 
@@ -276,7 +263,7 @@ Auth/access-control errors are omitted here — see §8.
 
 - `stale_prev` — provided `prev_version_id` is no longer the current version of its document.
   Emitted by: `docs.put`, `docs.delete`.
-  Data: `{ current_version_id, current_path, submitted_prev_version_id }` — `current_path` lets clients see whether the document has since been moved (including moved into `:deleted/…` by another actor). If the caller's read scope does not cover `current_path`, it is redacted (`null`) — the error still proves staleness without revealing where the document went.
+  Data: `{ current_version_id, current_path, submitted_prev_version_id }` — `current_path` lets clients see whether the document has since been moved (including moved into `:deleted/…` by another caller). If the caller's read scope claim does not cover `current_path`, it is redacted (`null`) — the error still proves staleness without revealing where the document went.
 
 **Slot conflicts** — the target slot is already occupied.
 
@@ -285,8 +272,8 @@ Auth/access-control errors are omitted here — see §8.
 - `path_taken` — `docs.put` destination path already holds a *different* live document (i.e., not the one identified by `prev_version_id`).
   Emitted by: `docs.put`.
   Data: `{ repo, path, current_version_id }`.
-- `slug_taken` — repo or user slug already in use.
-  Emitted by: `repos.create`, `repos.rename`, `users.create`, `users.rename`.
+- `slug_taken` — repo slug already in use.
+  Emitted by: `repos.create`, `repos.rename`.
   Data: `{ slug }`.
 
 **Reference errors** — identifiers resolve but don't fit the call.
@@ -297,7 +284,6 @@ Auth/access-control errors are omitted here — see §8.
 **Not found.**
 
 - `repo_not_found` — no repo with that slug.
-- `user_not_found` — no user with that slug.
 - `doc_not_found` — no live document at `(repo, path)`.
   Emitted by: `docs.get`, `docs.diff`.
 - `version_not_found` — `version_id` (or `prev_version_id`) doesn't exist.
@@ -313,7 +299,11 @@ Note: `docs.put` never emits `doc_not_found` — the document is identified by `
 
 ### 4.4 Authorship
 
-Derived from the authenticated caller's token → user mapping. Never trusted from the request body.
+Authorship is one caller-supplied **opaque string** — `ctx.author` (§6.1), defaulting to `"mrplex"`. The engine attaches no semantics to it: it is sanity-validated only (non-empty, no control characters, length-capped) and never parsed. The expected convention is git's `Full Name <email@address>`, but that is a caller-side norm, not an engine rule. There is no `committer` field — git's author/committer split solves a distributed-patch-flow problem mrplex doesn't have.
+
+This **inverts** the earlier stance: identity used to be resolved server-side from a token and never trusted from the request; now that mrplex is a full-trust kernel (§8), identity is *always* trusted from the request, because the whole caller is trusted. A shell that fronts mrplex (§7.1) is what maps an authenticated principal to this string.
+
+Direct writes (`docs.create` / `docs.put` / `docs.delete`) take the caller's `ctx.author` — deletion is an authored act by the deleter. `links.repair` carries the previous version's `author` **forward**: the kernel rewriting stale link text on someone's behalf doesn't reassign their document.
 
 ## 5. Query
 
@@ -333,7 +323,7 @@ Three composable modes: **filter** (CEL over frontmatter fields and `$`-intrinsi
 }
 ```
 
-`repo` follows the scalar-or-list convention (§5.2): a slug, a glob, or a list thereof, matched against the caller's bound repos; omitted = every repo the caller's scopes cover (§8.2). Cross-repo queries evaluate each repo's effective path config independently (§3.5.5).
+`repo` follows the scalar-or-list convention (§5.2): a slug, a glob, or a list thereof, matched against the repos the caller's read scope claim covers; omitted = every repo the claim covers (all repos when scope is absent) (§8.2). Cross-repo queries evaluate each repo's effective path config independently (§3.5.5).
 
 CEL scope: frontmatter fields are top-level (`status`, `tags`). **Intrinsic document properties are `$`-prefixed** — `$path`, `$updated_at`, `$body` — mirroring the sigil idea from §3.5: a marker character separates kernel-owned names from user territory, so intrinsics can never collide with user-defined frontmatter keys (a document with a frontmatter field literally named `path` stays queryable as bare `path`). `$updated_at` names the current version's timestamp — filters only ever see current versions, so this reads as "the doc's last update time" rather than the more literal but less useful "when this version row was written." Two differences from path sigils: the `$` marker is a **fixed grammar constant** in the §3.5.1 sense (grammar, not policy — a configurable marker would make the same filter string parse differently per repo), and it's `$` rather than `:` because `:` collides with CEL's ternary operator (`a ? b :path` is ambiguous) while `$` is unused by standard CEL — implemented via a small string-aware preprocessor that mangles `$foo` before the parser sees it (§7.1). A side benefit: the intrinsic namespace is forever open — new intrinsics (`$author`, `$repo`, …) can be added later without breaking any existing filter.
 
@@ -461,38 +451,31 @@ Two HTTP surfaces (`/mcp` for MCP, resource routes for REST), both thin translat
 
 The kernel is the only place the write model, concurrency rules, and error catalog exist. Surfaces validate their envelope, resolve slugs to internal ids, delegate, and translate the result.
 
+Every op takes a uniform first parameter `ctx: CallContext` (§8), defaulting to `{}`.
+
 ```types
-kernel.repos.list(include_system?)                        → Repo[]
-kernel.repos.get(slug)                                    → Repo
-kernel.repos.create(slug)                                 → Repo
-kernel.repos.rename(slug, new_slug)                       → Repo
-kernel.repos.delete(slug, actor)                          → Repo   -- renames slug into the system namespace (§3.4); admin
-kernel.repos.set_path_config(slug, config | null, actor)  → { repo: Repo, warnings: PathWarning[] }   -- see §3.5; null clears the override
+kernel.repos.list(ctx, include_system?)                        → Repo[]
+kernel.repos.get(ctx, slug)                                    → Repo
+kernel.repos.create(ctx, slug)                                 → Repo
+kernel.repos.rename(ctx, slug, new_slug)                       → Repo
+kernel.repos.delete(ctx, slug)                                 → Repo   -- renames slug into the system namespace (§3.4)
+kernel.repos.set_path_config(ctx, slug, config | null)         → { repo: Repo, warnings: PathWarning[] }   -- see §3.5; null clears the override
 
-kernel.users.list()                                       → User[]
-kernel.users.create(slug)                                 → User
-kernel.users.rename(slug, new_slug)                       → User
-kernel.users.delete(slug, actor)                          → User   -- system-namespace rename + revokes the user's tokens (§3.4); admin
+kernel.docs.get(ctx, repo, path)                               → Version   -- current version at path
+kernel.docs.get_version(ctx, repo, version_id)                 → Version   -- any version, by id
+kernel.docs.history(ctx, repo, path, limit?, before?)          → Version[]
+kernel.docs.diff(ctx, repo, path, from, to)                    → UnifiedDiff
 
-kernel.docs.get(repo, path)                               → Version   -- current version at path
-kernel.docs.get_version(repo, version_id)                 → Version   -- any version, by id
-kernel.docs.history(repo, path, limit?, before?)          → Version[]
-kernel.docs.diff(repo, path, from, to)                    → UnifiedDiff
+kernel.docs.create(ctx, repo, path, frontmatter?, body?)               → Version
+kernel.docs.put(ctx, repo, path, prev_version_id, frontmatter?, body?) → Version   -- path may differ from prev (= move); prev under a system sigil + destination in user territory (= restore)
+kernel.docs.delete(ctx, repo, path, prev_version_id)                   → Version   -- sugar for docs.put to the §3.4 deletion path, e.g. :deleted/path/to/doc-v45129.md
 
-kernel.docs.create(repo, path, frontmatter?, body?, actor)               → Version
-kernel.docs.put(repo, path, prev_version_id, frontmatter?, body?, actor) → Version   -- path may differ from prev (= move); prev under a system sigil + destination in user territory (= restore)
-kernel.docs.delete(repo, path, prev_version_id, actor)                   → Version   -- sugar for docs.put to the §3.4 deletion path, e.g. :deleted/path/to/doc-v45129.md
-
-kernel.tokens.list(actor)                                 → Token[]
-kernel.tokens.create(label, scopes, expires_at?, actor)   → { token, meta }
-kernel.tokens.revoke(token_id, actor)                     → Token
-
-kernel.query(spec, actor)                                 → Version[]
+kernel.query(ctx, spec)                                        → Version[]
 ```
 
 Write calls accept frontmatter as either the structured form (`frontmatter`) or verbatim YAML source (`frontmatter_raw`) — exactly one per call (§3.2).
 
-`actor` is a resolved `{ user_id, scopes }`, populated by the surface after it authenticates the caller — never taken from a request body. The kernel calls `authorize(actor, action, target)` before every operation (§8).
+`ctx` is a plain `CallContext = { author?, scope? }` (§8) supplied by the caller — **not** a resolved identity. An empty `{}` is full access with the default author `"mrplex"` (the zero-config path for system processes). There is no `authorize()` step: writes are unconditional; reads that carry `ctx.scope` filter through the claim (silent for `query`, `forbidden` for point reads out of claim). `users.*` and `tokens.*` are gone — authn left the kernel (§8).
 
 ### 6.2 MCP surface (`/mcp`)
 
@@ -500,8 +483,8 @@ A protocol-true **Model Context Protocol** server — not a bespoke JSON-RPC API
 
 **Transports:**
 
-- **Streamable HTTP** at `/mcp` — the standard remote transport. Auth is the same `Authorization: Bearer` header as the REST surface (§8).
-- **STDIO** — off by default; enabled at startup via server config or `--mcp-stdio`. There is no per-request auth channel on stdio, so the transport binds the whole session to one token supplied at launch (`--token` / `MRPLEX_TOKEN`); every call runs as that token's actor.
+- **Streamable HTTP** at `/mcp` — the standard remote transport. No bearer resolution: the `X-Mrplex-*` request headers (§6.3, §8) are honored per request and become that request's session `CallContext`. This is the shell-injection path — a fronting proxy can set headers but cannot rewrite tool arguments.
+- **STDIO** — off by default; enabled at startup via server config or `--mcp-stdio`. No launch token. Optional launch flags `--author <s>` / `--scope <json>` pin the whole stdio session's default `CallContext`; whoever can launch the binary is trusted (§8).
 
 **Tools** mirror the kernel one-to-one. Names use underscores (many MCP clients restrict tool names to `[a-zA-Z0-9_-]`):
 
@@ -513,30 +496,23 @@ repos_rename(repo, new_repo)                             → Repo
 repos_delete(repo)                                       → Repo   // renames slug into the system namespace (§3.4)
 repos_set_path_config(repo, config | null)               → { repo: Repo, warnings: PathWarning[] }
 
-users_list()                                             → User[]
-users_create(user)                                       → User
-users_rename(user, new_user)                             → User
-users_delete(user)                                       → User   // system-namespace rename + token revocation (§3.4)
-
 docs_get(repo, path)                                     → Version
 docs_get_version(repo, version_id)                       → Version
 docs_history(repo, path, limit?, before?)                → Version[]
 docs_diff(repo, path, from, to)                          → UnifiedDiff
 
-docs_create(repo, path, frontmatter?, body?)               → Version
-docs_put(repo, path, prev_version_id, frontmatter?, body?) → Version   // path may differ from prev (= move); prev under system sigil + dest in user territory (= restore)
-docs_delete(repo, path, prev_version_id)                   → Version   // sugar; kernel moves to the §3.4 deletion path, e.g. :deleted/path/to/doc-v45129.md
+docs_create(repo, path, frontmatter?, body?, author?)               → Version
+docs_put(repo, path, prev_version_id, frontmatter?, body?, author?) → Version   // path may differ from prev (= move); prev under system sigil + dest in user territory (= restore)
+docs_delete(repo, path, prev_version_id, author?)                   → Version   // sugar; kernel moves to the §3.4 deletion path, e.g. :deleted/path/to/doc-v45129.md
 
-tokens_list()                                            → Token[]
-tokens_create(label, scopes, expires_at?)                → { token, meta }
-tokens_revoke(token_id)                                  → Token
-
-query(spec)                                              → Version[]
+query(spec, scope?)                                      → Version[]
 ```
+
+**18 tools total** — the `users_*` and `tokens_*` tools are gone (§8). Write tools gain an optional `author`; the query tool gains an optional `scope` (JSON `ScopeClaim[]`). When present, the `X-Mrplex-*` headers **override** these tool arguments — the shell sits closer to the credential than the payload does (§8).
 
 As at the kernel, `docs_create` / `docs_put` accept frontmatter as either `frontmatter` (structured) or `frontmatter_raw` (verbatim YAML) — exactly one (§3.2).
 
-**Results and errors.** Tool results carry `structuredContent` (the wire types of §6.4) plus a text rendering. Kernel errors (§4.3, §8.4) are returned **in-band** as tool errors — `isError: true` with `{ code, data }` in the content — so an agent can read `stale_prev` and retry with the attached current version. JSON-RPC protocol errors are reserved for transport/envelope problems (malformed request, unknown tool).
+**Results and errors.** Tool results carry `structuredContent` (the wire types of §6.4) plus a text rendering. Kernel errors (§4.3, §8) are returned **in-band** as tool errors — `isError: true` with `{ code, data }` in the content — so an agent can read `stale_prev` and retry with the attached current version. JSON-RPC protocol errors are reserved for transport/envelope problems (malformed request, unknown tool).
 
 `[OPEN]` Whether to also expose documents as MCP **resources** (`mrplex://{repo}/{path}`) for read-side ergonomics. Tools are sufficient for v1; resources are additive.
 
@@ -551,11 +527,6 @@ GET     /repos/{repo}                                   → Repo
 MOVE    /repos/{repo}              Destination: /repos/{new_repo}   → Repo
 DELETE  /repos/{repo}                                   → Repo (kernel renames slug into the system namespace; §3.4)
 PUT     /repos/{repo}/config       { path_config | null }         → { repo: Repo, warnings: PathWarning[] }  -- see §3.5; null clears
-
-GET     /users                                          → User[]
-POST    /users                     { slug }             → User
-MOVE    /users/{user}              Destination: /users/{new_user}   → User
-DELETE  /users/{user}                                   → User (system-namespace rename + token revocation; §3.4)
 
 GET     /repos/{repo}/docs/{path}                       → Version (current)
                                    Accept: application/json  → Version envelope
@@ -577,12 +548,12 @@ MOVE    /repos/{repo}/docs/{path}  Destination: /repos/{repo}/docs/{new_path}
                                    -- Destination must be within the same repo; cross-repo moves are rejected
 
 GET     /query?repo=&filter=&text=&rank=&limit=&include_hidden=&include_system=      → Version[]
-POST    /query                     { QuerySpec }             → Version[]
-
-GET     /me/tokens                                           → Token[]
-POST    /me/tokens                 { label, scopes, expires_at? } → { token, meta }
-DELETE  /me/tokens/{id}                                      → Token
+POST    /query                     { QuerySpec, scope? }        → Version[]
 ```
+
+**No `Authorization` handling; no `/users*` or `/me/tokens*` routes** — authn left the engine (§8). Context rides on request headers:
+- `X-Mrplex-Author` — the opaque author string (§4.4) stamped on writes.
+- `X-Mrplex-Scope` — JSON `ScopeClaim[]` (§8) narrowing reads. `POST /query` also accepts a `scope` body field; the header wins when both are present (the shell sits closer to the credential than the body does).
 
 `/versions`, `/history`, and `/diff` are sibling roots rather than suffixes under `/docs/{path}` because document paths are multi-segment: `/docs/notes/history` must always mean the document at `notes/history`, never the history of `notes`. Sibling roots keep the route grammar unambiguous.
 
@@ -594,13 +565,12 @@ DELETE  /me/tokens/{id}                                      → Token
 
 **Error mapping** (kernel error → HTTP). All error responses carry the kernel error `code` and `data` in the JSON body; the HTTP status just picks the closest match.
 
-- `unauthorized` → **401 Unauthorized**.
-- `forbidden` → **403 Forbidden**.
+- `forbidden` → **403 Forbidden**. The supplied read scope claim excludes the target (§8).
 - `stale_prev`, `create_conflict` → **412 Precondition Failed**, with the current `version_id` in the `ETag` response header.
 - `precondition_required` → **428 Precondition Required**. Surface-emitted (never by the kernel). Returned when a mutating request omits the `If-Match` / `If-None-Match` header that the strict surface requires — `If-Match: *` is deliberately not accepted for `docs.put` / `docs.delete`; last-writer-wins is reserved for the WebDAV gateway (§11.1).
 - `payload_too_large` → **413 Content Too Large**. Surface-emitted (never by the kernel). Returned when a request body exceeds the server's configured cap.
 - `path_taken`, `slug_taken` → **409 Conflict**.
-- `repo_not_found`, `user_not_found`, `doc_not_found`, `version_not_found`, `token_not_found` → **404 Not Found**.
+- `repo_not_found`, `doc_not_found`, `version_not_found` → **404 Not Found**.
 - `version_not_in_document` → **422 Unprocessable Entity**.
 - `slug_invalid`, `path_invalid`, `frontmatter_invalid`, `filter_invalid` → **400 Bad Request**.
 
@@ -609,7 +579,6 @@ DELETE  /me/tokens/{id}                                      → Token
 Shared across both surfaces.
 
 ```types
-User    = { user: string }
 Repo    = {
   repo:        string,                           -- slug
   path_config: PathConfig | null                 -- per-repo overrides; null = inherit server (§3.5)
@@ -628,31 +597,22 @@ Version = {
   version_id, prev_version_id, next_version_id,  -- opaque; next_version_id = null means current
   repo, path,                                    -- slug + string
   frontmatter, frontmatter_raw, body,            -- parsed JSON + verbatim YAML source (§3.2)
-  author,                                        -- User
+  author,                                        -- string — opaque, caller-supplied (§4.4)
   created_at
   -- No tombstone field. A "deleted" version is one whose path lives under a system sigil (§3.5).
 }
-ScopeInput = {                                   -- accepted by tokens.create; repo patterns resolved to ids at creation (§8.2)
-  repo:   string | string[],                     -- slug, glob, "*", or list thereof
-  read?:  string | string[],                     -- path glob or list thereof
-  write?: string | string[]
+ScopeClaim = {                                    -- per-call read claim; resolved at call time by slug/glob (§8)
+  repo:   string | string[],                     -- repo slug, glob, or "*"; matched against current repos
+  read?:  string | string[]                      -- gitignore-style path glob(s), §8.2 semantics
+  -- no `write` field — write scoping is the shell's job (§8); shaped so `write` could be added later
 }
-Scope   = {                                      -- stored / returned form
-  repos:  "*" | string[],                        -- "*" = all repos (dynamic); else the bound repos' current slugs (ids internally)
-  read?:  string[],
-  write?: string[]
-}
-Token   = {
-  id: string,                                    -- opaque
-  label: string,
-  admin: boolean,                                -- server-level power (see §8.2)
-  scopes: Scope[],
-  expires_at, created_at, last_used_at
-  -- plaintext secret only present on the response to tokens.create
+CallContext = {                                   -- the uniform first parameter to every kernel op (§6.1, §8)
+  author?: string,                                -- writes; default "mrplex"
+  scope?:  ScopeClaim[]                           -- reads; absent = everything visible
 }
 ```
 
-All timestamps on the wire (`created_at`, `expires_at`, `last_used_at`, `before`) are ISO 8601 UTC strings.
+All timestamps on the wire (`created_at`, `before`) are ISO 8601 UTC strings. The `User`, `Token`, and `Scope` wire types are gone — authn left the engine (§8).
 
 ## 7. Deployment & clients
 
@@ -662,11 +622,18 @@ A deployment shape is an answer to three questions: **where the database lives**
 
 - **Local, embedded** — single binary, SQLite file, no daemon. The CLI talks to the kernel in-process; `mrplex serve` starts the HTTP surfaces on localhost when an editor or agent needs them. Ideal for personal notebooks and CLI-only workflows.
 - **Local, containerized** — binary + `docker compose up` for Postgres + pgvector. First-class path, not "production only" — a user who wants to run the server flavor on their laptop should have no more friction than the SQLite path.
-- **Typical cloud** — the same container on any long-lived container host (a VPS, Fly.io, Cloud Run, Railway, …) pointed at managed Postgres + pgvector; TLS terminates at the platform edge (§8.5). Everything runs in the one process, worker included. Multiple instances are safe for the surfaces — concurrency is enforced at the storage layer (§3.2, §4), not in process memory — but run a single embedding worker, or make backlog dequeue atomic (`SELECT … FOR UPDATE SKIP LOCKED`), before scaling out.
+- **Typical cloud** — the same container on any long-lived container host (a VPS, Fly.io, Cloud Run, Railway, …) pointed at managed Postgres + pgvector; TLS terminates at the auth shell / platform edge (§7.1, §8.4). Everything runs in the one process, worker included. Multiple instances are safe for the surfaces — concurrency is enforced at the storage layer (§3.2, §4), not in process memory — but run a single embedding worker, or make backlog dequeue atomic (`SELECT … FOR UPDATE SKIP LOCKED`), before scaling out.
 - **Supabase** — Postgres + pgvector is the platform's native database, so the Postgres adapter (M5) maps on directly. The surfaces deploy as Edge Functions (Deno; the TS kernel runs as-is). The one structural difference: edge functions are request-scoped, so there is no home for a resident embedding worker — the backlog is drained by scheduled invocations instead (`pg_cron` + `pg_net`, or Supabase scheduled functions). The SQLite flavor is not applicable (no persistent local filesystem), and platform limits (memory, per-request CPU, bundle size) should be checked at implementation time — the kernel's thin-CRUD profile fits comfortably.
 - **zo.computer (personal server)** — a persistent single-user server with a real filesystem and long-lived processes: exactly the environment the embedded flavor was designed for. `mrplex serve --database sqlite:~/mrplex/mrplex.db` as a Zo service, database on the persistent disk, HTTP surfaces exposed at the service's public URL so remote MCP agents and the CLI can reach it from anywhere. The embedding hook (§5.3) points wherever is convenient — a sidecar process on the same box or a hosted embedding API. This is the reference "personal notebook with agents" deployment.
 
 The binary takes `--database sqlite:./mrplex.db` or `--database postgres://…` (also via `MRPLEX_DATABASE` env). No other config surgery to switch shapes.
+
+**Trust model and the shell contract.** mrplex is a **full-trust kernel** (§8): anyone who can reach it can do anything. Authentication lives in a **shell** around it, and deployments fall into two shapes:
+
+- **Process-boundary deployments** (stdio MCP, in-process CLI, a sidecar bound to loopback): the **OS is the shell**. Whoever can exec the binary or reach the loopback port is root on the store. This is the **primary mode** and needs **zero configuration** — an empty `CallContext` is full access.
+- **Networked deployments**: a **fronting proxy or wrapper service** terminates authn (OAuth for MCP clients is the suggested convention), maps each credential to a `ScopeClaim[]` + author string, and injects them via the `X-Mrplex-*` request headers (§6.3). **mrplex must never be directly reachable from an untrusted network.** `serve` binds `127.0.0.1` unless `--host` overrides it, which stays the safe default.
+
+The shell owns: credential storage and rotation, revocation, token lifecycle and UI, per-principal **write** policy, gating of destructive repo ops (`repos.create`/`rename`/`delete`/`set_path_config`/`set_link_config` — addressable by route or tool name, no body parsing needed), audit of *who authenticated*, TLS, and rate limits. mrplex records only *who authored* — as a claim, not a verified identity (§4.4).
 
 **Implementation language: TypeScript (Node).** mrplex is a thin wrapper around a storage engine plus a CEL-to-SQL compiler and a couple of HTTP surfaces — none of it CPU-bound. TypeScript is chosen for portability (Node runs everywhere the SQLite/PG drivers do), ergonomic distribution (single `npm` install for the CLI, containerized for the server), and a mature ecosystem for the pieces we need (`better-sqlite3` / `pg`, JSON-RPC / HTTP libs).
 
@@ -696,7 +663,7 @@ Adapters are contracted to be **semantically identical** on the wire. Every lega
 | FTS query syntax | **Adapter-owned.** | SQLite FTS5 MATCH vs. PG `websearch_to_tsquery`. Portable subset that clients can rely on across engines: bare terms and quoted phrases. Boolean operators and per-column filters are engine-specific. |
 | Vector search recall | **Identical at small scale.** | Both engines return the same top-k for small corpora. |
 | Vector search at scale | **May differ.** | pgvector offers HNSW / IVFFlat with tuning knobs; sqlite-vec is brute-force in v1. Recall converges; latency does not. |
-| Auth, scopes, error catalog | **Identical.** | Backend-independent. |
+| Read-scope filtering, error catalog | **Identical.** | Backend-independent. Read `ScopeClaim` (§8) compiles to the same `SearchPlan.scope` groups on both engines. |
 | Concurrent throughput | **May differ.** | SQLite is single-writer per file; PG is multi-writer. §4 already floors both at "single-writer per repo," which SQLite satisfies. |
 
 The mechanism that keeps these guarantees honest is a shared **kernel test suite** that runs against every registered adapter in CI. An adapter that fails a semantic-parity test is not a supported adapter.
@@ -713,6 +680,8 @@ StorageAdapter = {
 
   // Lifecycle
   open(config)                                              → Promise<Storage>
+  // On open, probe for the legacy marker (an `api_tokens` table) and
+  // refuse a pre-noauth database with a clear error (§3.2) — no upgrade path.
   close()                                                   → Promise<void>
   migrate()                                                 → Promise<void>  // idempotent; brings schema to current version
 
@@ -722,8 +691,7 @@ StorageAdapter = {
   // await foreign I/O inside `fn` — the tx body may replay on retry
   // (PG REPEATABLE READ), so only storage calls are safe.
 
-  // Slug-space (users, repos)
-  users_list() / users_create(slug) / users_rename(id, slug) / users_by_slug(slug) / users_by_id(id)
+  // Slug-space (repos)
   repos_list() / repos_create(slug) / repos_rename(id, slug) /
   repos_set_path_config(id, cfg) / repos_by_slug(slug) / repos_by_id(id)
 
@@ -733,7 +701,7 @@ StorageAdapter = {
   // Version chain (the hot path — must be atomic per §4)
   version_insert({
     document_id, repo_id, prev_id, path, frontmatter_raw, frontmatter, body,
-    author_id, created_at
+    author, created_at   // author is the opaque string of §4.4
   })                                                        → Promise<VersionRow>
   // Contract: inside one tx, insert the new version AND set prev.next_id = new.id.
   // Must enforce the two partial indexes from §3.2 at the storage layer, not application code.
@@ -771,13 +739,7 @@ StorageAdapter = {
   backlog_retain(input) / backlog_delete(version_id) /
   backlog_status(now)
 
-  // Tokens
-  tokens_list(user_id) / tokens_by_hash(hash) / tokens_by_id(id) /
-  tokens_create({ user_id, secret_hash, label, admin: boolean, scopes, expires_at }) /
-  tokens_revoke(id, revoked_at) / tokens_revoke_by_user(user_id, revoked_at) /
-  tokens_touch_last_used(id, when)
-  // admin is a native boolean; adapters translate to their engine's
-  // representation (SQLite 0/1, PG native).
+  // No users_* / tokens_* methods — authn left the engine (§8).
 }
 ```
 
@@ -789,7 +751,7 @@ StorageAdapter = {
 4. **CEL filter semantics.** The adapter translates the CEL AST such that a given filter over a given corpus returns the same rows on every adapter. Missing keys, null, scalar-or-list coercion (§5.2), and type-mismatch handling all follow the semantics defined in §5.
 5. **Scope-glob enforcement in `query`.** The adapter receives `path_globs` and returns only rows matching them — silently dropped, not errored (§8.2). Enforcing this in the adapter (not the kernel) lets the engine push the filter into indexes.
 6. **Result-set portability.** For FTS and vector search, the *set* of returned documents is identical across adapters for the same corpus and query; only ranking scores may differ.
-7. **Migrations.** `migrate()` is idempotent and forward-only. Adapters own their migration files; the kernel invokes `migrate()` on startup unless `--no-migrate` is set.
+7. **Migrations.** `migrate()` is idempotent and forward-only. Adapters own their migration files; the kernel invokes `migrate()` on startup unless `--no-migrate` is set. Both engines ship a single collapsed `0001_init.sql` baseline (§3.2); an old pre-noauth database is refused at `open` (legacy-marker probe), not migrated. Future migrations resume at `0002`.
 
 **What an adapter is *not* required to provide:**
 
@@ -818,11 +780,6 @@ mrplex repos set-path-config <slug> [--from-file FILE | -] | --clear
                                                                   # FILE is JSON with any subset of { disallowed_chars, system_sigils, hidden_sigils }
                                                                   # --clear removes the override, reverts to server config
 
-mrplex users list
-mrplex users create <slug>
-mrplex users rename <slug> <new-slug>
-mrplex users delete <slug>                                        # system-namespace rename + revokes their tokens (§3.4)
-
                                                                   # `docs *` reads the target repo from -r/--repo, MRPLEX_REPO,
                                                                   # or `config set-repo`; no positional <repo> argument.
 mrplex docs get <path>
@@ -837,21 +794,21 @@ mrplex docs put <path> --prev <version-id> [--from-file FILE | -]
 mrplex docs delete --prev <version-id>                            # target is fully addressed by --prev
 mrplex docs mv <to-path> --prev <version-id>                      # sugar: put to <to-path> with unchanged content
 
-mrplex query [--repo <slug-or-glob>] [--filter EXPR] [--text Q] [--rank Q] [--limit N]
-                                                                  # --repo omitted = every repo in the token's scope (§5.1)
+mrplex query [--repo <slug-or-glob>] [--filter EXPR] [--text Q] [--rank Q] [--limit N] [--scope <json>]
+                                                                  # --repo omitted = every readable repo (§5.1); --scope narrows read visibility (§8)
 
 mrplex embed backfill --repo <slug>                               # re-chunk + re-embed current versions missing chunks (§5.3)
 mrplex embed status                                               # inspect the embedding backlog
-
-mrplex tokens list
-mrplex tokens create --label LABEL --scope <slug>:read=<glob>,write=<glob> [--admin] [--expires TS]
-mrplex tokens revoke <token-id>
 ```
+
+There is **no** `bootstrap`, `tokens`, or `users` command — authn left the engine (§8).
 
 **Global flags:**
 
 - `--server <url>` (default from config) — the mrplex endpoint. When absent and a local SQLite file exists, run against it directly.
-- `--token <token>` (default from config or `MRPLEX_TOKEN` env) — bearer token.
+- `--author <string>` — the opaque author stamped on writes (§4.4). Precedence: `--author` → `MRPLEX_AUTHOR` env → `author` in the config file → engine default `"mrplex"`. Set persistently with `mrplex config set-author "Full Name <email@address>"`.
+- `--scope <json>` — a JSON `ScopeClaim[]` (§8) narrowing read visibility; on `query` and the read commands (for parity/testing).
+- `--token <token>` / `MRPLEX_TOKEN` — **remote-mode bearer pass-through only**. Forwarded verbatim as `Authorization: Bearer` to a `--server` endpoint so a shell fronting that server can consume it; mrplex itself ignores the header, and local (in-process) mode ignores it entirely.
 - `-r, --repo <slug>` (default from `MRPLEX_REPO` env or config `repo`) — target repo for `docs *` commands. `query` and `embed backfill` keep their own `--repo` because their semantics differ (multi-repo glob and required, respectively).
 - `--json` — emit raw JSON instead of pretty output. Enables piping into `jq`.
 
@@ -864,58 +821,48 @@ mrplex tokens revoke <token-id>
 
 - Reads default to pretty-printed Markdown (frontmatter as YAML block, body underneath) on stdout — same shape a user would edit.
 - Writes print the new `version_id` on stdout (for scripting: `NEW=$(mrplex docs put ... --prev "$PREV")`) with human context on stderr.
-- Errors print the kernel error `code` and `data` to stderr, exit non-zero. The exit code encodes the error family: 1 for validation, 2 for concurrency/conflict, 3 for auth, 4 for not-found, 10 for network/transport.
+- Errors print the kernel error `code` and `data` to stderr, exit non-zero. The exit code encodes the error family: 1 for validation, 2 for concurrency/conflict, 3 for forbidden (out-of-scope read), 4 for not-found, 10 for network/transport.
 
-**Config file:** `~/.config/mrplex/config.toml` holds server URL and default token. `mrplex config set-server URL` / `mrplex config set-token TOK` manage it; `mrplex login` is sugar that prompts for a token and stores it.
+**Config file:** `~/.config/mrplex/config.json` (`$XDG_CONFIG_HOME/mrplex/config.json`) holds server URL, default repo, and default `author`. `mrplex config set-server URL` / `mrplex config set-author "Full Name <email>"` / `mrplex config set-repo SLUG` manage it; `mrplex config show` prints a summary.
 
 Everything the CLI does is achievable with `curl` against the MCP or REST surfaces; the CLI just makes it pleasant.
 
-## 8. Auth & security
+## 8. Trust model & security
 
-### 8.1 Model
+### 8.1 Full-trust kernel + the shell
 
-Opaque bearer tokens with per-token capability scopes. Each token belongs to one user; a user may hold many tokens (one per client — CLI, Obsidian plugin, agent — each revocable individually). Tokens are stored hashed with plain **SHA-256**; only the hash is persisted, the plaintext is shown once at issuance.
+mrplex is a **full-trust kernel**: it performs **no authentication and no authorization**. Any caller that can reach the engine can do anything — every write is unconditional, every destructive repo op (`repos.create`/`rename`/`delete`/`set_path_config`/`set_link_config`) is ungated (reachable = allowed). There are no bearer tokens, no `Authorization` parsing, no secret hashing, no `users`/`api_tokens` tables, no admin bit, and no `unauthorized` error. Authentication, credential storage, and token issuance live in a **shell** around mrplex (§7.1): a fronting proxy, a wrapping service, or simply the OS process boundary for stdio/local use. The shell owns everything permission-shaped — credential lifecycle, revocation, per-principal **write** policy, gating destructive ops by route/tool-name, TLS, and rate limits — and injects context into mrplex via the request headers of §6.3. **mrplex must never be directly reachable from an untrusted network.**
 
-Why SHA-256 and not a slow salted KDF (argon2/bcrypt): the secret is a high-entropy random value the server generates, not a human-chosen password, so brute-force hardening adds nothing — and salted hashes are non-deterministic, which would make lookup-by-hash impossible (no stable value to index; every auth would have to scan and verify all tokens). `sha256(secret)` is deterministic: auth is a single indexed equality against `api_tokens.secret_hash`.
+An **optional-auth mode was rejected**: half-measures (a pluggable auth hook, "trusted header" verification, a `--read-only` flag) carry the surface area of auth with the guarantees of none, and are a foot-in-the-door for permission controls creeping back into the kernel. Anything permission-shaped belongs in the shell.
 
-Every request presents `Authorization: Bearer <token>`. The auth middleware:
+What survives inside the engine is the one thing a proxy *cannot* do from outside: **scoped read visibility**. A proxy can gate routes, but it cannot post-filter search results without breaking ranking and pagination, and it cannot scope link-graph traversal at all. So credentials move out; the read-scope machinery stays in — exposed as a plain per-call input.
 
-1. Computes `sha256(secret)` and looks up the token by that hash. If missing / revoked / expired → **`unauthorized`**.
-2. Loads `{ user_id, scopes }` and attaches them as the resolved `actor` (§6.1).
-3. Delegates to the kernel operation, which runs an `authorize(actor, action, target)` check. On insufficient scope → **`forbidden`**.
+### 8.2 Read scope claims (`ScopeClaim`)
 
-### 8.2 Scope grammar
-
-Two independent axes: **server-level power** (a single boolean) and **data access** (per-repo, per-action path globs). Actions do not nest; each is granted explicitly.
+Every kernel op takes a uniform first parameter `ctx: CallContext = { author?, scope? }` (§6.1, §6.4). `ctx.scope` is an optional list of **read claims** evaluated **at call time**:
 
 ```types
 StringOrList = string | string[]
 
-ScopeInput = {                // accepted by tokens.create
-  repo:   StringOrList,       // repo slug, glob, or "*"; resolved to repo ids at creation (below)
-  read?:  StringOrList,       // path literal, glob, or list thereof
-  write?: StringOrList
-}
-
-Token = {
-  admin:  boolean,            // server-level: repos.create/rename, users.*, others' tokens
-  scopes: Scope[]             // stored form: bound repo ids + path globs (§6.4)
+ScopeClaim = {
+  repo:  StringOrList,        // repo slug, glob, or "*"; matched against the repos that exist right now
+  read?: StringOrList         // path literal, glob, or list thereof
+  // no `write` — write scoping is the shell's job; the grammar is shaped so `write` could be added later, additively.
 }
 ```
 
-Every field is polymorphic scalar-or-list, matching the §5.2 convention. At the auth boundary each field is normalized to a list (scalar → `[scalar]`, missing → `[]`) before matching.
+Every field is polymorphic scalar-or-list, matching the §5.2 convention. Each is normalized to a list (scalar → `[scalar]`, missing → `[]`) before matching. An **absent** `ctx.scope` = everything visible; a **present** claim narrows visibility. A caller who can supply a claim can supply a wider one — narrowing across trust levels is the shell's concern, not the engine's (there is no subset/attenuation checking).
 
-**Repo binding is by id, resolved at token creation.** `tokens.create` evaluates each `repo` pattern against the repos that exist at that moment and stores the matched **internal repo ids**, not the slugs. The literal `"*"` is the one exception — it is stored as a dynamic all-repos wildcard and covers repos created later. Consequences:
+**Repo patterns resolve by slug at call time.** Each `repo` pattern is matched against the repos existing *at the moment of the call* — no issuance snapshot, no repo-id binding. A claim names what it names right now: rename a repo and a claim on the old slug simply stops matching; the same slug reused later matches again. Since slugs contain no `/`, `*` is the canonical wildcard at the repo level; reserve `**` for paths.
 
-- **Renames don't break tokens.** A token granted on `notes` keeps working when the repo is renamed to `notes-archive` — and a new repo that later claims the freed slug `notes` does *not* inherit the old token's access.
-- **Non-`*` patterns are snapshots.** A `team-*` grant covers the team repos that existed at issuance; a repo created afterwards requires re-issuing the token (or using `"*"`).
-- `tokens.list` renders bound repos by their **current slugs**.
+**How claims apply per op:**
 
-**Actions:**
+- `query` compiles the claims into the `SearchPlan` scope groups — results outside the claim are **silently dropped**, not 403'd (queries return what the caller is allowed to see, not what exists).
+- `docs.get` / `docs.get_version` / `docs.history` / `docs.diff` throw **`forbidden`** when the target path falls outside the claim.
+- `repos.list` returns only claimed repos (all repos, for a `"*"` claim, or when scope is absent).
+- The links read surface (`links.stale`, `$in`/`$has`/`$backlinks()`/`$links()` graph subqueries) filters through the same groups — the visible graph equals the readable graph.
 
-- **`read`** — `docs.get`, `docs.get_version`, `docs.history`, `docs.diff`, `query`, `repos.get`, and the corresponding REST GET routes. Path must match a `read` glob for the target repo.
-- **`write`** — `docs.create`, `docs.put`, `docs.delete`. Path must match a `write` glob. **Does not imply `read`** — a token that wants both lists both.
-- **`admin: true`** — `repos.create` / `repos.rename` / `repos.delete` / `repos.set_path_config`, all `users.*` (including `users.delete`), and management of tokens other than the caller's own. Not scoped to a repo (there is no repo yet for `repos.create`, and `users.*` isn't repo-shaped). Repo config and deletion are admin-gated rather than write-scoped because they affect every writer of the repo, not just the caller's paths. `[OPEN]` A per-repo `manage` action for delegating repo administration (config, delete) without full server admin, if the need emerges.
+Path globs match against **the path at the version being accessed** — so `read: "drafts/**"` still reads historical states of a doc since renamed out of `drafts/`. Multiple claim entries stack — union semantics.
 
 **Glob semantics:** gitignore-style, faithful to `gitignore(5)`.
 
@@ -925,108 +872,62 @@ Every field is polymorphic scalar-or-list, matching the §5.2 convention. At the
 - `!pattern` negates. Order matters: last matching entry in a list wins.
 - Literals with no metacharacters are just anchored strings — including `.`, which is a literal dot, not "any char."
 
-- Repo patterns are evaluated once, at token creation (above), against repo slugs. Since slugs contain no `/`, `*` is the canonical wildcard at the repo level; reserve `**` for paths.
-- Path globs match against **the path at the version being accessed** — so `read: "drafts/**"` still reads historical states of a doc that has since been renamed out of `drafts/`.
-- A `docs.put` whose `path` differs from `prev`'s path (a move) requires **both** paths to match `write` — moving into or out of scope is a write on both endpoints.
-- **System-namespace carve-out.** No user scope can grant `write` at a system-sigil path (§3.5), so the "both endpoints" rule would forbid every deletion (destination is `:deleted/…`) and every restore (source is `:deleted/…`). Instead: for any move where **one** endpoint is under a system sigil, scope is checked only on the **user-territory** endpoint. Users get scope-checked on what they can see and reason about; the system-namespace endpoint is kernel-controlled.
-- `query` appends the token's `read` globs as an implicit path filter. Results outside scope are silently dropped, not 403'd — queries return what the caller is allowed to see, not what exists.
-- `repos.list` returns only repos bound by at least one of the token's scopes (all repos, for a `"*"` scope).
+**System-namespace carve-out** (not auth). Independent of any claim, no *write* may target a system-sigil path: `validatePath` rejects caller-supplied paths in a system namespace (§3.5), and on kernel-driven moves that touch a system-sigil endpoint (delete → `:deleted/…`, restore ← `:deleted/…`) the system-territory endpoint is kernel-controlled. This is a structural invariant, not an authorization decision, and stands untouched by the trust model.
 
-**Examples:**
+**Examples** (read claims):
 
 ```json
 // Read-only search agent, one repo
-{ "admin": false, "scopes": [{ "repo": "notes", "read": "**" }] }
+[{ "repo": "notes", "read": "**" }]
 
-// Ingest agent: write-only to inbox, no read
-{ "admin": false, "scopes": [{ "repo": "notes", "write": "inbox/**" }] }
+// Broad reader, but a subtree hidden via negation
+[{ "repo": "notes", "read": ["**", "!secret/**"] }]
 
-// Broad reader, narrow writer with a negated subtree
-{ "admin": false, "scopes": [{
-    "repo":  "notes",
-    "read":  "**",
-    "write": ["drafts/**", "!drafts/pinned/**"]
-}]}
-
-// Read across a repo family, write to inbox in any of them
-// (resolved at issuance: covers the team-* repos existing at that moment)
-{ "admin": false, "scopes": [{ "repo": "team-*", "read": "**", "write": "inbox/**" }] }
+// Read across a repo family (resolved against repos existing at call time)
+[{ "repo": "team-*", "read": "**" }]
 ```
 
-The `repo` values above are creation-time inputs (`ScopeInput`); each resolves to concrete repo ids on issuance, except the dynamic `"*"`.
+### 8.3 Read scope error and information hiding
 
-Multiple scope entries stack — union semantics. A token can be broadly `read` on one repo family and narrowly `write` on a single repo by listing two entries.
+- **`forbidden`** (HTTP **403**) — the read scope claim supplied with this call excludes the target. This is the sole remapped meaning; the old "insufficient token scope" reading is gone along with `unauthorized`.
 
-**Self-token management** is a property of the token model, not a scope grant: any authenticated user can `list` and `revoke` their own tokens and `create` new ones whose `admin` bit and `scopes` are a subset of the parent token's. "Subset" is deliberately conservative and **decidable**: the child's bound repo ids must be a subset of the parent's, and every child path glob must appear **verbatim** in the parent's corresponding list. Semantic glob subsumption (is `drafts/a*` ⊆ `drafts/**`? — undecidable in general once negation enters) is not attempted; `[OPEN]` relax to structural subsumption later if verbatim proves too strict. Managing *other* users' tokens requires `admin: true`.
+`forbidden` exposes only the code and does not leak whether a resource exists — an out-of-claim target and a nonexistent one look identical. Not because the caller is untrusted (it is fully trusted), but so a shell can hand mrplex's errors to *its* untrusted callers unfiltered.
 
-Bootstrap root token: `{ admin: true, scopes: [{ repo: "*", read: "**", write: "**" }] }`.
+### 8.4 Other security notes
 
-### 8.3 Token management
-
-```rpc
-mrplex.tokens.list()                                        → Token[]         -- current user's tokens
-mrplex.tokens.create(label, scopes, expires_at?, for_user?) → { token, meta } -- token shown once, in plaintext
-mrplex.tokens.revoke(token_id)                              → Token
-```
-
-Corresponding REST routes:
-
-```rest
-GET    /me/tokens                                           → Token[]
-POST   /me/tokens          { label, scopes, expires_at? }   → { token, meta }
-DELETE /me/tokens/{id}                                      → Token
-```
-
-Server-side, `api_tokens` (§3.2) holds `secret_hash` (never the plaintext), `label`, `scopes`, `expires_at`, `revoked_at`, `last_used_at`.
-
-**Self-management is identity-based, not scope-gated.** Every authenticated user can `tokens.list`, `tokens.revoke`, and `tokens.create` against their own token set regardless of what their scopes cover; the kernel keys these ops off `actor.user_id`, and `tokens.create` mints under `actor.user_id` by default. Sub-tokens minted by a non-admin must be a subset of the caller's own scopes and cannot set the admin bit (§8.2 subset rule) — the safety property that lets self-mint be unconditional. This axis is deliberately outside the scope grammar: scopes govern *what data you can touch*, identity governs *what identity you can speak for*.
-
-**Cross-user token minting** (bootstrapping a new user's first bearer) is admin-only. The optional `for_user` argument on `tokens.create` names a target user slug; if it differs from `actor.user_id`, the caller must carry the admin bit. This is the only supported path from "user exists" to "user has a working token" — hand the plaintext to the user out-of-band (encrypted email, secret manager, in-person) and they self-serve from there.
-
-Bootstrap: server creation seeds a `system` user and issues one root token (`{ admin: true, scopes: [{ repo: "*", read: "**", write: "**" }] }`, per §8.2) printed to the operator once at first launch. Everything else can be created from there.
-
-### 8.4 Auth error codes
-
-- **`unauthorized`** — no token, malformed token, or token unknown/revoked/expired. HTTP **401**.
-- **`forbidden`** — valid token, insufficient scope for the requested action. HTTP **403**.
-
-Both errors expose only the code; they do not leak whether a resource exists (i.e., a `forbidden` on a nonexistent repo returns the same error as on a real one the caller lacks scope for).
-
-### 8.5 Other security notes
-
-- Authorship is server-derived from `actor.user_id` (§4.4). Clients can't impersonate.
+- Authorship is a caller-supplied opaque string (§4.4), trusted from the request. The engine makes no impersonation guarantee — that is the shell's to enforce (it maps an authenticated principal to the `author` claim).
 - Frontmatter and body are stored verbatim — treat as untrusted when surfaced to agents.
-- Bearer tokens require TLS in production. `[ASSUMPTION]` HTTPS enforced by the deployment; optional mTLS layers on top for high-trust environments.
-- `last_used_at` on `api_tokens` updates opportunistically — best-effort, not transactional, to keep the hot path fast.
+- TLS, rate limiting, and network exposure are the shell's (§7.1). `serve` binds `127.0.0.1` by default; mrplex must never be exposed directly to an untrusted network.
 
 ## 9. Resolved decisions
 
 Log of shape-defining decisions and their rationale. Newer decisions supersede older ones; the current shape is what's in the body of this doc.
 
+- **No-auth pivot: mrplex is a full-trust kernel; auth moves to a shell (§8, §7.1).** Authentication, users, tokens, and identity management are deleted from the engine — any caller that can reach it can do anything. Pinned: (1) **full trust, no optional-auth mode** — in-engine auth is deleted, not made configurable; (2) a **uniform `CallContext` first parameter** on every op rather than per-op option bags; (3) **read claims apply to all read-shaped ops**, not just `query` (a scope that filtered search but not `docs.get` would be a lie); (4) **claims resolve at call time by slug/glob** — no issuance snapshot, no id binding; (5) **`forbidden` survives** (remapped to "the claim excludes the target"); `unauthorized` does not survive in any form; (6) **identity is one opaque string** (`author`, default `"mrplex"`; no `committer`; sanity-checked, never parsed; `Full Name <email>` is convention); (7) **`links.repair` preserves the prior author**, records nothing else; (8) **header beats body/tool-arg** for context on networked surfaces; (9) **one fresh `0001_init.sql` per engine + legacy-DB guard**, no upgrade path (future migrations resume at `0002`); (10) **write scoping stays out** (grammar shaped so `write` is a purely additive future field); (11) **destructive repo ops are ungated** — reachable = allowed, the shell gates them by route/tool-name; (12) **no permission toggles in the engine** (a `--read-only` flag was considered and rejected). Supersedes the "Multi-token auth", "Token secrets hashed with SHA-256", and "Scopes bind repo ids" decisions below, and inverts §4.4's identity stance.
 - **Deletion is a move to a system-namespace path, not a tombstone (§3.4, §3.5).** The kernel moves the doc to `<system-sigil>deleted/…` with the superseded version id inserted before the file extension: `path/to/document.md` → `:deleted/path/to/document-v45129.md`. Restore is a plain `docs.put` back to user territory. No `tombstone` column, no `resurrect` flag, no `already_tombstoned` / `resurrect_not_opted_in` errors.
-- **Configurable path policy in three tiers (§3.5).** Hardcoded defaults → server config → per-repo override (replace-not-merge). `disallowed_chars`, `system_sigils`, `hidden_sigils` — lists for input, first entry canonical on emission. Server-level policy also gates slug validation for repos and users.
+- **Configurable path policy in three tiers (§3.5).** Hardcoded defaults → server config → per-repo override (replace-not-merge). `disallowed_chars`, `system_sigils`, `hidden_sigils` — lists for input, first entry canonical on emission. Server-level policy also gates repo slug validation.
 - **Structural path elements (`/`, `.`, `..`, empty segment) are non-configurable code constants (§3.5.1).**
 - **Query defaults exclude hidden and system paths (§5.1).** `include_hidden` and `include_system` flags opt back in. Applies to `filter`, `text`, and `rank`.
 - **Server never merges.** Merge policy is a client concern. Kernel enforces `prev_version_id` == current; conflicts return `stale_prev` with the current version attached (§4).
-- **Multi-token auth with capability scopes (§8).** Per-user tokens, SHA-256-hashed secrets, `admin: true` boolean for server-level power, per-repo `read` / `write` path globs (scalar-or-list, gitignore semantics). System-namespace endpoints on kernel-driven moves (delete/restore) are exempt from the "both endpoints match write" rule — scope is checked only on the user-territory endpoint.
-- **`author_id` non-nullable.** Every version has an actor. A reserved `system` user can be introduced later if automated writes need attribution, but the schema doesn't allow author-less versions.
+- **~~Multi-token auth with capability scopes~~ — superseded by the no-auth pivot (§8).** Formerly: per-user SHA-256-hashed tokens, `admin` bit, per-repo `read`/`write` globs. Now: no tokens, no admin bit, no write scoping; only per-call read claims (`ScopeClaim`) survive, reframed away from tokens. The system-namespace carve-out survives as a structural invariant (not auth).
+- **`author` is an opaque non-nullable string (§4.4).** Every version records `author text not null`, defaulting to `"mrplex"`; caller-supplied, sanity-checked, never parsed. Supersedes the earlier `author_id` FK → `users` (users are gone with auth).
 - **Rename folded into `docs.put`.** `prev_version_id` already identifies the source location; the `path` argument is the destination. Same path = update, different path = move (§4.2). A rename-only verb can be added later if the ergonomics warrant it.
 - **Concurrent create on a freed path: `create_conflict`.** The second caller sees the first caller's live document at the path and must retry as `put` (or a distinct create at a different path). No special-case for deletion races.
 - **FTS is required, backend is adapter-owned (§5.1, §7.2).** SQLite → FTS5, Postgres → tsvector. Result set portable, ranking is not.
 - **Embedding via user-defined hook (§5.3).** Server does not embed. Operator wires in an HTTP endpoint, subprocess, or in-process plugin implementing the batch `embed(chunks)` contract.
 - **Implementation language: TypeScript (Node).** Portability and ecosystem fit for a thin storage wrapper + CEL-to-SQL compiler (§7.1).
 - **Git/GitHub bridging deferred to post-v1 (§11).** mrplex stands alone in v1; adapters and sync policy come later.
-- **Token secrets hashed with plain SHA-256 (§8.1).** The secret is high-entropy and server-generated; a slow salted KDF adds nothing and would break indexed lookup-by-hash. Supersedes the earlier argon2/bcrypt choice.
-- **Scopes bind repo ids, resolved at token creation (§8.2).** Renaming a repo no longer breaks its tokens, and a freed slug can't leak old grants to a new repo. Non-`*` patterns are creation-time snapshots; `"*"` stays dynamic.
-- **MCP surface is protocol-true MCP (§6.2).** Streamable HTTP at `/mcp`; kernel ops exposed as tools with JSON Schema; kernel errors returned in-band as tool errors. STDIO transport is opt-in at startup and bound to a single launch-time token. Supersedes the earlier bespoke `POST /rpc` JSON-RPC shape.
+- **~~Token secrets hashed with plain SHA-256~~ — moot after the no-auth pivot (§8).** There are no token secrets in the engine anymore; credential storage is the shell's concern.
+- **~~Scopes bind repo ids, resolved at token creation~~ — reversed by the no-auth pivot (§8.2).** Read claims now resolve **by slug at call time**, with no issuance snapshot and no id binding: a claim names what it names right now. A rename simply changes what a slug-pattern matches.
+- **MCP surface is protocol-true MCP (§6.2).** Streamable HTTP at `/mcp`; kernel ops exposed as tools with JSON Schema; kernel errors returned in-band as tool errors. Per-request `X-Mrplex-*` headers become the session `CallContext`; STDIO transport is opt-in at startup, needs no credential, and takes optional `--author`/`--scope` launch flags. Supersedes the earlier bespoke `POST /rpc` JSON-RPC shape (and the earlier launch-token binding, removed by the no-auth pivot).
 - **History, diff, and version reads use sibling REST roots (§6.3).** `/versions/{version_id}`, `/history/{path}`, `/diff/{path}` — suffix routes under a multi-segment `{path}` would be ambiguous with real document paths.
 - **Point-in-time (`as_of`) reads deferred to post-v1 (§11).** Correct answers are expensive (path→document resolution at T, historical FTS/rank semantics); better shaped as an explicit time-machine/export feature than a casual query parameter.
 - **WebDAV deferred to post-v1, gateway fully specified (§11.1).** Naive mount clients can't carry `prev_version_id`; the answer is a gateway that is a stateful *client* of the kernel — lock-table / read-map / fetch-and-retry tiers resolve `prev`, and no relaxed semantic touches the kernel.
 - **Embedding load is damped server-side; write cadence is not (§5.3).** Debounce/sync policy is a client concern. The server dedups chunks by content hash, embeds only still-current versions, and rate-limits in the worker.
 - **Frontmatter stored twice: raw source + parsed JSON (§3.2).** `frontmatter_raw` is byte-verbatim source of truth and round-trips exactly; `frontmatter` is a derived query index. Writes supply exactly one form; the other is derived.
 - **Intrinsic CEL properties are `$`-prefixed (§5.1).** `$path`, `$updated_at`, `$body` — a fixed grammar constant, immune to frontmatter key collisions; `$` chosen over `:` to avoid the ternary operator, and fixed rather than configurable so a filter string parses identically everywhere.
-- **All deletes are idempotent (§3.4, §4.1).** Deleting an already-deleted document, repo, or user is a no-op.
-- **Repo and user deletion are system-namespace slug renames (§3.4).** The document-deletion primitive applied to slugs; admin-gated; frees the slug; user deletion also revokes tokens; `author_id` attribution is never disturbed.
+- **All deletes are idempotent (§3.4, §4.1).** Deleting an already-deleted document or repo is a no-op.
+- **Repo deletion is a system-namespace slug rename (§3.4).** The document-deletion primitive applied to slugs; ungated (§8); frees the slug; the documents inside are untouched. `author` attribution is never disturbed. (User deletion is gone with the user model.)
 - **Paths and slugs have case-insensitive, Unicode-normalized *identity* but case-preserving *storage* (§3.5.1).** Global default (not a per-repo toggle). Identity runs off a kernel-computed normalized key (NFC + locale-invariant lowercase) in a `path_norm`/`slug_norm` shadow column with a unique partial index; storage keeps the author's bytes, so the §3.2 round-trip is untouched. Normalization is kernel-side (never SQL `lower()`/`COLLATE`/`citext`) to preserve §7.2 adapter parity — SQLite `lower()` is ASCII-only while Postgres's is locale-aware. Fold strength: NFC + `toLowerCase` (covers accented Latin/Greek/Cyrillic; ß/ligatures/final-sigma deferred to a later full-fold upgrade, additive via backfill). The key is internal — never on the wire; CEL `$path` reads the stored path.
 - **`stale_prev` redacts `current_path` when it's outside the caller's read scope (§4.3).**
 - **Path config is setup-time configuration (§3.5.2).** Advisory warnings on `set_path_config` are the only guard rail; sigil changes over a live corpus are deliberately not further protected.
@@ -1038,7 +939,7 @@ Log of shape-defining decisions and their rationale. Newer decisions supersede o
 - **FTS query syntax is adapter-owned; parity is a portable subset (M5, §5.1, §7.2).** SQLite → FTS5 MATCH; Postgres → `websearch_to_tsquery` (never throws on user input). Cross-adapter clients get bare terms and quoted phrases. Boolean operators / column-scoped queries are engine-specific.
 - **Vector column is dimensionless; brute-force in v1 (M5, §7.2).** Both adapters run brute-force top-k (SQLite `vec_distance_cosine`, PG `<=>`). Indexed ANN (pgvector HNSW / IVFFlat) is a fast-follow.
 - **Embeddings cross the interface as `Float32Array` (M5, §7.2).** The engine-specific byte layout stays private to each adapter (SQLite LE float32 BLOB; PG pgvector literal). Fresh callers may pass `readonly number[]`; reuse callers pass the `Float32Array` they got back.
-- **Postgres schema (M5, §3.2).** `bigserial` ids, `text` timestamps (byte-exact parity with SQLite), `jsonb` + a single GIN over `frontmatter` (§5.2 — `= '"v"'::jsonb OR @> '["v"]'::jsonb`), native `boolean admin`, two partial unique indexes verbatim, `tsvector` generated column + GIN maintained automatically. Vector column via `create extension if not exists vector`.
+- **Postgres schema (M5, §3.2).** `bigserial` ids, `text` timestamps (byte-exact parity with SQLite), `jsonb` + a single GIN over `frontmatter` (§5.2 — `= '"v"'::jsonb OR @> '["v"]'::jsonb`), two partial unique indexes verbatim, `tsvector` generated column + GIN maintained automatically. Vector column via `create extension if not exists vector`.
 - **PG isolation: REPEATABLE READ + retry×3 (M5, §7.2).** `tx()` runs at `REPEATABLE READ`, retries with jitter on SQLSTATE `40001` / `40P01` (design's stated qualifying recipe). Nested tx via savepoints. Same-connection routing via `AsyncLocalStorage<PoolClient>`.
 - **`pg` driver (M5).** Chosen over `postgres.js`: plain parameterized-query API matches the compiled SQL, pure JS, ubiquitous. int8 is parsed to JS `number` with a `Number.isSafeInteger` guard so id drift is loud.
 - **PG migrations: `schema_migrations` + `pg_advisory_xact_lock` (M5).** Forward-only, idempotent, lock-safe under parallel invocation.
@@ -1048,13 +949,14 @@ Remaining `[OPEN]` markers throughout the doc are narrower questions (query cach
 
 ## 10. Milestones
 
-- **M0 — Kernel + skeleton.** Schema, SQLite storage, kernel reads (`repos.list`, `users.list`, `docs.get`, `docs.history`), `mrplex` CLI reading directly from the kernel (§7.3). Slug/id split enforced.
-- **M1 — Writes + auth.** Full kernel write surface (`docs.create` / `docs.put` / `docs.delete`, plus `repos.create` / `users.create` and the `.rename` / `.delete` methods) with `prev_version_id` enforcement. `docs.put` handles both in-place update and move. Bearer-token auth (§8): `api_tokens` table, capability scopes, `authorize()` on every kernel op, `tokens.*` RPCs, bootstrap root token. CLI gains write commands and `tokens.*`.
+- **M0 — Kernel + skeleton.** Schema, SQLite storage, kernel reads (`repos.list`, `docs.get`, `docs.history`), `mrplex` CLI reading directly from the kernel (§7.3). Slug/id split enforced.
+- **M1 — Writes + auth.** Full kernel write surface (`docs.create` / `docs.put` / `docs.delete`, plus `repos.create` and the `.rename` / `.delete` methods) with `prev_version_id` enforcement. `docs.put` handles both in-place update and move. *(The bearer-token auth originally landed here — `api_tokens`, capability scopes, `authorize()`, `tokens.*` RPCs, bootstrap root token — was subsequently removed by the no-auth pivot; see the amendment below.)*
 - **M2 — Query.** CEL filter (`@bufbuild/cel`, §7.1) + FTS; `kernel.query` end-to-end; CLI `query` command.
 - **M3 — HTTP surfaces.** MCP server at `/mcp` (Streamable HTTP; optional STDIO transport, startup-gated); REST surface (`GET` / `PUT` / `DELETE` / `MOVE`, `If-Match` / `If-None-Match`, content negotiation, `/versions` / `/history` routes). CLI gains `--server` flag to target a remote instance over MCP. `docs.diff` deferred to M4.
 - **M4 — Semantic.** Chunking + embeddings + vector search. Also picks up `docs.diff`, deferred from M3: the kernel op (§6.1), `/diff` route (§6.3), `docs_diff` tool (§6.2), CLI `docs diff` (§7.3).
 - **M5 — Postgres backend.** Ships the second v1 storage adapter and (as a one-time break) three seam refactors the parity contract required: async `Storage` and kernel (SQLite `tx()` keeps `begin immediate`; PG uses `REPEATABLE READ` + retry on 40001/40P01); structured `SearchPlan` handed to `versions_search` (kernel emits no SQL; adapters compile the plan into their dialect); `Float32Array` embeddings in the shared type (SQLite's byte-order BLOB is private to `storage-sqlite/vec.ts`). `pg` driver, `pgvector` for vectors (brute-force in M5; indexed ANN is a fast-follow), `websearch_to_tsquery` for the portable FTS subset (bare terms + quoted phrases), `jsonb` + a single GIN for the frontmatter compile path.
 - **M6 — Links (graph index), Phase 1.** The derived `links` index (§11.2) — outbound static edges extracted in the write transaction (pure CPU, no worker), bound to target `document_id` (identity, not path), with dangling rows re-bound as documents appear. CEL graph predicates ship as the **bare names** `$in` / `$has` / `$backlinks()` / `$links()` (resolving to the static index today; defined as the future static∪dynamic union so they widen transparently in Phase 2) plus `_static` forms that pin to the index forever (incl. optional field restriction). They compile to scope-respecting `EXISTS`/`COUNT` joins on both adapters; only the `_dyn` forms are reserved until Phase 2. `links.stale` + `mrplex links repair` rewrite stale link text as ordinary optimistic writes. Per-repo `link_config` cascade (`docs/links-plan.md`). Shipped alongside case-insensitive identity (the case-folding branch), which wikilink resolution rides for free. Deferred to Phase 2: embedded queries, the `--in` operator, the `_dyn` half of the union, and multi-hop `$reachable_from`.
+- **Amendment — No-auth pivot.** After M6, authentication, users, and tokens were removed from the engine entirely (§8, §9 decision log). mrplex became a full-trust kernel; identity collapsed to an opaque `author` string and token scopes collapsed to per-call read claims. Both storage engines re-baselined to a single collapsed `0001_init.sql` with a legacy-DB guard (§3.2); no upgrade path. This retroactively voids M1's auth deliverables but leaves the write model, query surface, and links intact.
 
 ## 11. Future work (post-v1)
 
@@ -1078,7 +980,7 @@ Remaining `[OPEN]` markers throughout the doc are narrower questions (query cach
 - **Stable pagination cursors.** Snapshot the query's read-point (`max(version_id)` bound at query time) into the cursor alongside the ordering key. Second-page reads apply the same `version_id ≤ snapshot` predicate, so writes concurrent with a paging session never shuffle rows across page boundaries and the caller sees the coherent state they started paging from. The `versions(next_id is null)` current-version filter becomes a range check bounded by the snapshot; the versioned schema already contains everything needed.
 - **Per-repo frontmatter schema** `[OPEN]`. Declared shape stored per repo (types, required fields, enums, string patterns), validated at write time. Turns the "YAML soup" reality into typed records without giving up prose, and is load-bearing for three downstream features: MCP tools shaped like the domain (`notes.create_task(title, due, tags)` derived from the schema, not just generic `docs.put`), LSP completion (below), and aggregations (above) that can trust field types. Open: schema language (JSON Schema for reach, or a small mrplex-native dialect that maps directly to CEL types?); enforcement mode (strict / warn / advisory, per repo *and* per field?); evolution when a required field is added to a repo with existing docs (reject writes, allow with defaults, or trigger a bulk-update pass via the future bulk-update op?); scope (schema lives in repo config, or as a system-namespace doc so it versions like anything else?).
 - **Computed frontmatter as `$`-intrinsics.** `$word_count`, `$reading_time`, `$outgoing_links` (once §11.2 lands), `$last_body_edit` (most recent version whose body hash actually differed — distinguishes real edits from frontmatter-only touches). All derivable from data mrplex already stores; queryable via the same CEL surface as `$path`/`$updated_at`. Read-only — writes rejected with `computed_field`. Kills the "stash derived value in frontmatter and forget to update it" antipattern that otherwise grows in every corpus.
-- **Change feed — webhooks and SSE.** Every write (create/update/move/delete) emits `{ repo, path, document_id, version_id, prev_version_id, actor, kind }`. Two subscribers: outbound webhooks (per-repo config, HMAC-signed, at-least-once with a small retry queue) and a `GET /repos/{repo}/events` SSE stream filtered by the caller's read scope (§8.2) — same scope filter as `query`, so no subscriber ever sees an event it couldn't have read. MCP notifications already exist; this is the plain-HTTP twin so a static-site builder, Meilisearch indexer, or an agent doesn't have to poll. Ordering guarantee is per-document, not global (matches the write model). Resume via `?from_version_id=…`.
+- **Change feed — webhooks and SSE.** Every write (create/update/move/delete) emits `{ repo, path, document_id, version_id, prev_version_id, author, kind }`. Two subscribers: outbound webhooks (per-repo config, HMAC-signed, at-least-once with a small retry queue) and a `GET /repos/{repo}/events` SSE stream filtered by the caller's read scope claim (§8.2) — same scope filter as `query`, so no subscriber ever sees an event it couldn't have read. MCP notifications already exist; this is the plain-HTTP twin so a static-site builder, Meilisearch indexer, or an agent doesn't have to poll. Ordering guarantee is per-document, not global (matches the write model). Resume via `?from_version_id=…`.
 - **`mrplex verify`.** Integrity scrub over the version chain: walk each document oldest-to-newest, recompute body/frontmatter hashes, confirm `frontmatter_raw` ↔ `frontmatter` round-trips byte-exact (§3.2), check `prev_id`/`next_id` symmetry, verify FTS/chunk/link derived tables against their source versions, report orphans. No writes. CLI + kernel op + optional CI mode that exits non-zero on any inconsistency. Cheap insurance for an append-only store where the chain *is* the guarantee.
 - **Retention: rollup of autosave storms.** Per-repo policy that collapses contiguous same-author versions within N seconds into a single displayed step in `docs.history` — underlying versions retained, a `rollup_of` link identifies the group. Complements the embedding damper (§5.3): history stays readable when a WebDAV/Obsidian client sprays 40 saves per minute during an edit session. This is a view-time policy over an untouched underlying chain, not a delete — `docs.get --version` still resolves every intermediate step and `docs.diff` still spans them.
 - **`mrplex-lsp`.** LSP over stdio for Markdown+YAML: frontmatter completion and diagnostics from the per-repo schema (above), go-to-definition and hover on links once §11.2 lands, code-actions surfacing `mrplex links repair`. Editors get the mrplex surface (VS Code, Neovim, Helix, Zed) through their existing LSP clients, without a per-editor plugin. Runs against `--database` or `--server` the same way the CLI does.
@@ -1128,14 +1030,14 @@ The client half ships with every OS — that is the point of choosing WebDAV ove
 
 #### Policies
 
-- **Auth.** DAV clients speak Basic, not Bearer: the password field carries the mrplex token; the gateway resolves it to an actor exactly as the other surfaces do (§8). The username is ignored.
+- **Auth.** The gateway is a shell (§7.1, §8): it terminates whatever authn it likes (DAV Basic is the natural fit) and maps the credential to a `CallContext` — an `author` string plus any read `ScopeClaim[]` — which it passes to the kernel via `X-Mrplex-*` headers. mrplex itself authenticates nothing.
 - **Sigil visibility.** The DAV view sets `include_hidden: true` unconditionally — a filesystem shows dotfiles to programs (`.obsidian/` must be visible). System namespace stays hidden, or is exposed read-only as a `:deleted/` folder — OS-style trash for free.
 - **Junk writes.** Configurable ignore-list (`.DS_Store`, `._*`, `Thumbs.db`): accept and discard with a success status so clients don't retry. Autosave storms become ordinary versions; the embedding damper (§5.3) absorbs the cost.
 - **Lenient frontmatter.** A filesystem must accept any bytes, and a malformed leading `---` block is exactly what a half-typed edit looks like mid-save. The gateway pre-parses: if the block is unparseable, it submits the whole file as body with empty frontmatter, re-splitting on the next valid save. No kernel change — the leniency is a gateway submission policy; API/REST clients keep strict validation.
 
 #### Reference save flow
 
-⌘S on the mounted volume → `LOCK` (gateway records current `version_id`, issues token) → `PUT` with token + raw file bytes (Basic → actor; pre-parse the `---` block; `kernel.docs.put(repo, path, prev_version_id, frontmatter_raw, body, actor)`) → gateway advances the lock record, answers 204 with the new ETag → `UNLOCK`. The kernel saw a completely ordinary optimistic write.
+⌘S on the mounted volume → `LOCK` (gateway records current `version_id`, issues token) → `PUT` with token + raw file bytes (gateway maps the credential to a `ctx`; pre-parse the `---` block; `kernel.docs.put(ctx, repo, path, prev_version_id, frontmatter_raw, body)`) → gateway advances the lock record, answers 204 with the new ETag → `UNLOCK`. The kernel saw a completely ordinary optimistic write.
 
 ### 11.2 Links, backlinks, and graph queries — design sketch
 
@@ -1195,7 +1097,7 @@ At extraction, the normalized target path is resolved against the live path set;
 Because the graph is identity-bound, moving a page breaks nothing structurally; rewriting repairs stale *text*. The kernel never rewrites other documents implicitly — one move producing N surprise writes to other docs would violate both least-surprise and the single-write model. Instead:
 
 - A staleness query (`links.stale`) lists live docs whose written link text no longer matches the resolved target's current path.
-- `mrplex links repair` walks that list and rewrites each doc as an ordinary optimistic `docs.put` under the caller's token — `prev` checks apply, conflicts are reported and skipped, and every repair is a normal authored version in the chain.
+- `mrplex links repair` walks that list and rewrites each doc as an ordinary optimistic `docs.put` under the caller's `ctx` — `prev` checks apply, conflicts are reported and skipped, and every repair carries the prior version's `author` forward (§4.4), a normal version in the chain.
 - `[OPEN]` an opt-in per-repo `auto_repair` policy driving the same loop from the server-side worker after each move. Either way the mechanism is identical; the question is only who pulls the trigger.
 
 #### CEL surface: `$in`, `$has`, `$backlinks()`, `$links()`

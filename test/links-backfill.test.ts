@@ -9,7 +9,6 @@
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { Actor } from "../src/kernel/auth/actor.js";
 import { type Kernel, createKernel } from "../src/kernel/kernel.js";
 import { backfillRepoLinks } from "../src/links/backfill.js";
 import {
@@ -22,7 +21,6 @@ import type { Storage } from "../src/storage/types.js";
 
 let storage: Storage;
 let kernel: Kernel;
-let actor: Actor;
 let repoId: number;
 
 async function fresh(): Promise<Storage> {
@@ -33,7 +31,7 @@ async function fresh(): Promise<Storage> {
 
 function create(path: string, input: { body: string; frontmatter?: Record<string, unknown> }) {
   const fm = input.frontmatter ? { frontmatter: input.frontmatter } : { frontmatter_raw: "" };
-  return kernel.docs.create(actor, "notes", path, { ...fm, body: input.body });
+  return kernel.docs.create({}, "notes", path, { ...fm, body: input.body });
 }
 
 async function effectiveConfig() {
@@ -58,10 +56,8 @@ async function docIdAt(path: string): Promise<number> {
 beforeEach(async () => {
   storage = await fresh();
   kernel = createKernel(storage);
-  const alice = await storage.users_create({ slug: "alice", created_at: "2026-08-14T00:00:00Z" });
   const notes = await storage.repos_create({ slug: "notes", created_at: "2026-08-14T00:00:01Z" });
   repoId = notes.id;
-  actor = { user_id: alice.id, admin: true, scopes: [] };
 });
 
 afterEach(async () => {

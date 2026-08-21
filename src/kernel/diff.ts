@@ -14,7 +14,6 @@
 import { createTwoFilesPatch } from "diff";
 import { join as joinFrontmatter } from "../markdown/frontmatter.js";
 import type { Storage, VersionRow } from "../storage/types.js";
-import type { Actor } from "./auth/actor.js";
 import { KernelError, docNotFound, versionNotFound, versionNotInDocument } from "./errors.js";
 import { decodeVersionId } from "./version-id.js";
 
@@ -28,12 +27,11 @@ export type UnifiedDiff = {
 
 export type DiffDeps = {
   storage: Storage;
-  resolveReadRepo: (actor: Actor, slug: string) => Promise<{ id: number }>;
-  authorizeReadPath: (actor: Actor, repo_id: number, path: string) => void;
+  resolveReadRepo: (slug: string) => Promise<{ id: number; slug: string }>;
+  authorizeReadPath: (repoSlug: string, path: string) => void;
 };
 
 export async function runDiff(
-  actor: Actor,
   input: {
     repo: string;
     path: string;
@@ -42,8 +40,8 @@ export async function runDiff(
   },
   deps: DiffDeps,
 ): Promise<UnifiedDiff> {
-  const repo = await deps.resolveReadRepo(actor, input.repo);
-  deps.authorizeReadPath(actor, repo.id, input.path);
+  const repo = await deps.resolveReadRepo(input.repo);
+  deps.authorizeReadPath(repo.slug, input.path);
 
   const current = await deps.storage.version_current(repo.id, input.path);
   if (!current) throw docNotFound(input.repo, input.path);
@@ -62,8 +60,8 @@ export async function runDiff(
     throw versionNotInDocument(input.from_version_id, input.repo, input.path);
   }
 
-  deps.authorizeReadPath(actor, repo.id, from.path);
-  deps.authorizeReadPath(actor, repo.id, to.path);
+  deps.authorizeReadPath(repo.slug, from.path);
+  deps.authorizeReadPath(repo.slug, to.path);
 
   const fromText = serializeVersion(from);
   const toText = serializeVersion(to);

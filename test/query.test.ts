@@ -7,7 +7,7 @@
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { type Actor, SYSTEM_ACTOR } from "../src/kernel/auth/actor.js";
+import type { CallContext } from "../src/kernel/context.js";
 import type { KernelError } from "../src/kernel/errors.js";
 import { type Kernel, createKernel } from "../src/kernel/kernel.js";
 import { sqliteAdapter } from "../src/storage-sqlite/adapter.js";
@@ -15,7 +15,7 @@ import type { Storage } from "../src/storage/types.js";
 
 let storage: Storage;
 let kernel: Kernel;
-let admin: Actor;
+const admin: CallContext = {};
 
 async function seedDoc(
   repoSlug: string,
@@ -35,8 +35,6 @@ beforeEach(async () => {
     database: `sqlite:${join(tmpdir(), `mrplex-query-${Date.now()}-${Math.random()}.db`)}`,
   });
   kernel = createKernel(storage);
-  const alice = await storage.users_create({ slug: "alice", created_at: "2026-08-14T00:00:00Z" });
-  admin = { user_id: alice.id, admin: true, scopes: [] };
   await storage.repos_create({ slug: "notes", created_at: "2026-08-14T00:00:00Z" });
 });
 
@@ -157,18 +155,14 @@ describe("query — scope filter (§8.2)", () => {
   it("silently drops rows outside a non-admin's read globs", async () => {
     await seedDoc("notes", "public.md", {}, "");
     await seedDoc("notes", "secret/hidden.md", {}, "");
-    const repoRow = await storage.repos_by_slug("notes");
-    if (!repoRow) throw new Error("seed");
-    const scoped: Actor = {
-      user_id: admin.user_id,
-      admin: false,
-      scopes: [{ repos: [repoRow.id], read: ["public.md"] }],
+    const scoped: CallContext = {
+      scope: [{ repo: "notes", read: ["public.md"] }],
     };
     const results = await kernel.query(scoped, { repo: "notes" });
     expect(results.map((v) => v.path)).toEqual(["public.md"]);
   });
 
-  it("admins bypass scope", async () => {
+  it("absent scope sees everything", async () => {
     await seedDoc("notes", "a.md", {}, "");
     await seedDoc("notes", "b.md", {}, "");
     const results = await kernel.query(admin, { repo: "notes" });
@@ -179,12 +173,8 @@ describe("query — scope filter (§8.2)", () => {
     await seedDoc("notes", "drafts/one.md", {}, "");
     await seedDoc("notes", "drafts/pinned/two.md", {}, "");
     await seedDoc("notes", "drafts/three.md", {}, "");
-    const repoRow = await storage.repos_by_slug("notes");
-    if (!repoRow) throw new Error("seed");
-    const scoped: Actor = {
-      user_id: admin.user_id,
-      admin: false,
-      scopes: [{ repos: [repoRow.id], read: ["drafts/**", "!drafts/pinned/**"] }],
+    const scoped: CallContext = {
+      scope: [{ repo: "notes", read: ["drafts/**", "!drafts/pinned/**"] }],
     };
     const results = await kernel.query(scoped, { repo: "notes" });
     expect(results.map((v) => v.path).sort()).toEqual(["drafts/one.md", "drafts/three.md"]);
@@ -197,12 +187,8 @@ describe("query — scope filter (§8.2)", () => {
     // dominated the top of the created_at ordering.
     for (let i = 0; i < 10; i++) await seedDoc("notes", `out/${i}.md`, {}, "");
     for (let i = 0; i < 10; i++) await seedDoc("notes", `in/${i}.md`, {}, "");
-    const repoRow = await storage.repos_by_slug("notes");
-    if (!repoRow) throw new Error("seed");
-    const scoped: Actor = {
-      user_id: admin.user_id,
-      admin: false,
-      scopes: [{ repos: [repoRow.id], read: ["in/**"] }],
+    const scoped: CallContext = {
+      scope: [{ repo: "notes", read: ["in/**"] }],
     };
     const results = await kernel.query(scoped, { repo: "notes", limit: 5 });
     expect(results).toHaveLength(5);
@@ -374,9 +360,9 @@ describe("query — validation", () => {
     }
   });
 
-  it("SYSTEM_ACTOR is trusted end-to-end", async () => {
+  it("empty context is trusted end-to-end", async () => {
     await seedDoc("notes", "a.md", {}, "");
-    const results = await kernel.query(SYSTEM_ACTOR, { repo: "notes" });
+    const results = await kernel.query({}, { repo: "notes" });
     expect(results.map((v) => v.path)).toEqual(["a.md"]);
   });
 });

@@ -15,7 +15,6 @@
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { Actor } from "../src/kernel/auth/actor.js";
 import { type Kernel, createKernel } from "../src/kernel/kernel.js";
 import { BODY_FIELD } from "../src/links/extract.js";
 import { sqliteAdapter } from "../src/storage-sqlite/adapter.js";
@@ -23,7 +22,6 @@ import type { LinkRow, Storage } from "../src/storage/types.js";
 
 let storage: Storage;
 let kernel: Kernel;
-let actor: Actor;
 let repoId: number;
 
 async function fresh(): Promise<Storage> {
@@ -45,10 +43,8 @@ async function withFields(...fields: string[]): Promise<void> {
 beforeEach(async () => {
   storage = await fresh();
   kernel = createKernel(storage);
-  const alice = await storage.users_create({ slug: "alice", created_at: "2026-08-14T00:00:00Z" });
   const notes = await storage.repos_create({ slug: "notes", created_at: "2026-08-14T00:00:01Z" });
   repoId = notes.id;
-  actor = { user_id: alice.id, admin: true, scopes: [] };
 });
 
 afterEach(async () => {
@@ -61,7 +57,7 @@ afterEach(async () => {
  */
 function create(path: string, input: { body: string; frontmatter?: Record<string, unknown> }) {
   const fm = input.frontmatter ? { frontmatter: input.frontmatter } : { frontmatter_raw: "" };
-  return kernel.docs.create(actor, "notes", path, { ...fm, body: input.body });
+  return kernel.docs.create({}, "notes", path, { ...fm, body: input.body });
 }
 
 /** Document id of the live doc at `path`. */
@@ -252,7 +248,7 @@ describe("self-links are never indexed (noise suppression)", () => {
     // targets the doc itself and must NOT bind as a self-link.
     const b = await create("b.md", { body: "[future](c.md)" });
     expect((await edgesFrom("b.md"))[0]?.target_id).toBeNull();
-    await kernel.docs.put(actor, "notes", b.version_id, "c.md", {});
+    await kernel.docs.put({}, "notes", b.version_id, "c.md", {});
     // After the move the doc lives at c.md; its own edge to c.md is dropped.
     expect(await edgesFrom("c.md")).toEqual([]);
   });
@@ -265,7 +261,7 @@ describe("re-extraction on put (in-place update)", () => {
     const v1 = await create("note.md", { body: "[a](a.md)" });
     expect((await edgesFrom("note.md")).map((e) => e.target_raw)).toEqual(["a.md"]);
 
-    await kernel.docs.put(actor, "notes", v1.version_id, "note.md", { body: "[b](b.md)" });
+    await kernel.docs.put({}, "notes", v1.version_id, "note.md", { body: "[b](b.md)" });
     expect((await edgesFrom("note.md")).map((e) => e.target_raw)).toEqual(["b.md"]);
   });
 
@@ -273,7 +269,7 @@ describe("re-extraction on put (in-place update)", () => {
     await create("a.md", { body: "a" });
     const v1 = await create("note.md", { body: "[a](a.md)" });
     expect(await edgesFrom("note.md")).toHaveLength(1);
-    await kernel.docs.put(actor, "notes", v1.version_id, "note.md", { body: "no more links" });
+    await kernel.docs.put({}, "notes", v1.version_id, "note.md", { body: "no more links" });
     expect(await edgesFrom("note.md")).toEqual([]);
   });
 
@@ -287,7 +283,7 @@ describe("re-extraction on put (in-place update)", () => {
     });
     expect((await edgesFrom("child.md"))[0]?.target_id).toBe(await docIdAt("p1.md"));
 
-    await kernel.docs.put(actor, "notes", v1.version_id, "child.md", {
+    await kernel.docs.put({}, "notes", v1.version_id, "child.md", {
       frontmatter: { parent: "p2.md" },
     });
     const edges = await edgesFrom("child.md");
@@ -305,7 +301,7 @@ describe("moves are identity-bound (no inbound churn)", () => {
     expect((await edgesFrom("note.md"))[0]?.target_id).toBe(targetDocId);
 
     // Move the target; the inbound edge must still resolve to the same doc id.
-    await kernel.docs.put(actor, "notes", target.version_id, "animals/horses.md", {});
+    await kernel.docs.put({}, "notes", target.version_id, "animals/horses.md", {});
     const edges = await edgesFrom("note.md");
     expect(edges[0]?.target_id).toBe(targetDocId); // unchanged — identity-bound
     // The written link text is now stale (still says horses.md) — that's a
@@ -317,7 +313,7 @@ describe("moves are identity-bound (no inbound churn)", () => {
     await create("a.md", { body: "a" });
     const v1 = await create("note.md", { body: "[a](a.md)" });
     const docId = await docIdAt("note.md");
-    await kernel.docs.put(actor, "notes", v1.version_id, "Note.md", {});
+    await kernel.docs.put({}, "notes", v1.version_id, "Note.md", {});
     // Same document, edges preserved.
     expect(await docIdAt("Note.md")).toBe(docId);
     expect((await storage.links_by_source(docId)).map((e) => e.target_raw)).toEqual(["a.md"]);
@@ -339,7 +335,7 @@ describe("dangling re-resolution", () => {
     const other = await create("elsewhere.md", { body: "x" });
     expect((await edgesFrom("note.md"))[0]?.target_id).toBeNull();
 
-    await kernel.docs.put(actor, "notes", other.version_id, "target.md", {});
+    await kernel.docs.put({}, "notes", other.version_id, "target.md", {});
     expect((await edgesFrom("note.md"))[0]?.target_id).toBe(await docIdAt("target.md"));
   });
 
@@ -371,7 +367,7 @@ describe("delete clears outbound, preserves inbound", () => {
     const docId = await docIdAt("note.md");
     expect(await storage.links_by_source(docId)).toHaveLength(1);
 
-    await kernel.docs.delete(actor, "notes", v.version_id);
+    await kernel.docs.delete({}, "notes", v.version_id);
     expect(await storage.links_by_source(docId)).toEqual([]);
   });
 
@@ -381,7 +377,7 @@ describe("delete clears outbound, preserves inbound", () => {
     const targetDocId = await docIdAt("horses.md");
     expect((await edgesFrom("note.md"))[0]?.target_id).toBe(targetDocId);
 
-    await kernel.docs.delete(actor, "notes", target.version_id);
+    await kernel.docs.delete({}, "notes", target.version_id);
     // Inbound edge is still bound to the (now-deleted) document id.
     expect((await edgesFrom("note.md"))[0]?.target_id).toBe(targetDocId);
   });
@@ -389,9 +385,9 @@ describe("delete clears outbound, preserves inbound", () => {
   it("re-binds inbound danglers when a document is restored to its path", async () => {
     const target = await create("horses.md", { body: "neigh" });
     await create("note.md", { body: "[h](horses.md)" });
-    const deleted = await kernel.docs.delete(actor, "notes", target.version_id);
+    const deleted = await kernel.docs.delete({}, "notes", target.version_id);
     // Restore: put the deleted version back to a user-territory path.
-    await kernel.docs.put(actor, "notes", deleted.version_id, "horses.md", {});
+    await kernel.docs.put({}, "notes", deleted.version_id, "horses.md", {});
     // The (kept-bound) inbound edge still resolves; the restored doc keeps
     // its identity, so nothing needed rebinding — assert it resolves live.
     const restoredDocId = await docIdAt("horses.md");
@@ -415,7 +411,7 @@ describe("index stays consistent with the live corpus (redundant end-to-end)", (
     expect(edges.map((e) => e.target_id !== null)).toEqual([true, true]);
 
     // update note to drop the a.md link
-    await kernel.docs.put(actor, "notes", note.version_id, "note.md", { body: "only [b](b.md)" });
+    await kernel.docs.put({}, "notes", note.version_id, "note.md", { body: "only [b](b.md)" });
     edges = await edgesFrom("note.md");
     expect(edges.map((e) => e.target_raw)).toEqual(["b.md"]);
     expect(edges[0]?.target_id).toBe(await docIdAt("b.md"));

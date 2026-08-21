@@ -12,6 +12,7 @@
 
 import { describe, expect, it } from "vitest";
 import { chunkBody } from "../src/embed/chunker.js";
+import type { CallContext } from "../src/kernel/context.js";
 import { KernelError } from "../src/kernel/errors.js";
 import { createKernel } from "../src/kernel/kernel.js";
 import { sqliteAdapter } from "../src/storage-sqlite/adapter.js";
@@ -29,9 +30,8 @@ async function seedWithVectors(
     model?: string;
   }[],
 ) {
-  const admin = { user_id: 1, admin: true as const, scopes: [] };
+  const admin: CallContext = {};
   const kernel = createKernel(storage);
-  await storage.users_create({ slug: "alice", created_at: "2026-08-14T00:00:00Z" });
   await storage.repos_create({ slug: "notes", created_at: "2026-08-14T00:00:00Z" });
   const ids: { path: string; version_id: number }[] = [];
   for (const c of cases) {
@@ -136,9 +136,8 @@ describe("query — rank", () => {
       storage,
       queryEmbed: async () => ({ vector: [1, 0, 0], model: "test-3d", dim: 3 }),
     });
-    await storage.users_create({ slug: "alice", created_at: "2026-08-14T00:00:00Z" });
     await storage.repos_create({ slug: "notes", created_at: "2026-08-14T00:00:00Z" });
-    const admin = { user_id: 1, admin: true as const, scopes: [] };
+    const admin: CallContext = {};
     const v = await kernel.docs.create(admin, "notes", "hello.md", {
       body: "hello world",
       frontmatter_raw: "",

@@ -9,20 +9,16 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { bootstrap } from "../src/cli/bootstrap.js";
 import { type ServeHandle, startServer } from "../src/server/serve.js";
 
 let workDir: string;
-let token: string;
 let handle: ServeHandle;
 let client: Client;
 
 async function connectClient(): Promise<Client> {
   const url = new URL(`${handle.baseUrl}/mcp`);
   const c = new Client({ name: "test-client", version: "0.0.0" });
-  const transport = new StreamableHTTPClientTransport(url, {
-    requestInit: { headers: { Authorization: `Bearer ${token}` } },
-  });
+  const transport = new StreamableHTTPClientTransport(url);
   await c.connect(transport);
   return c;
 }
@@ -30,8 +26,6 @@ async function connectClient(): Promise<Client> {
 beforeEach(async () => {
   workDir = mkdtempSync(join(tmpdir(), "mrplex-mcp-"));
   const dbUrl = `sqlite:${join(workDir, "test.db")}`;
-  const b = await bootstrap(dbUrl);
-  token = b.token;
   handle = await startServer({ database: dbUrl, port: 0, log: () => {} });
   client = await connectClient();
 });
@@ -43,9 +37,9 @@ afterEach(async () => {
 });
 
 describe("MCP lifecycle + tools/list", () => {
-  it("lists 25 tools (docs_diff — M4; links_* + repos_set_link_config — §11.2)", async () => {
+  it("lists 18 tools (no user/token tools after noauth; links_* + set_link_config)", async () => {
     const r = await client.listTools();
-    expect(r.tools.length).toBe(25);
+    expect(r.tools.length).toBe(18);
     // Sample the important names.
     const names = new Set(r.tools.map((t) => t.name));
     for (const name of [
@@ -57,13 +51,16 @@ describe("MCP lifecycle + tools/list", () => {
       "docs_delete",
       "docs_diff",
       "query",
-      "tokens_create",
       "links_backfill",
       "links_stale",
       "links_repair",
       "repos_set_link_config",
     ]) {
       expect(names.has(name)).toBe(true);
+    }
+    // The user/token tools are gone (no-auth).
+    for (const gone of ["users_list", "tokens_create", "tokens_revoke"]) {
+      expect(names.has(gone)).toBe(false);
     }
   });
 

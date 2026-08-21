@@ -15,7 +15,6 @@ import { decodeVectorBlob, encodeVectorBlob } from "./vec.js";
 async function seed() {
   const s = await sqliteAdapter.open({ database: "sqlite::memory:" });
   const now = new Date().toISOString();
-  const u = await s.users_create({ slug: "alice", created_at: now });
   const r = await s.repos_create({ slug: "notes", created_at: now });
   const d = await s.documents_create(r.id);
   const v = await s.version_insert({
@@ -26,10 +25,10 @@ async function seed() {
     frontmatter_raw: "",
     frontmatter: {},
     body: "hello",
-    author_id: u.id,
+    author: "alice",
     created_at: now,
   });
-  return { s, u, r, d, v };
+  return { s, r, d, v };
 }
 
 describe("vec: encode/decode", () => {
@@ -86,7 +85,7 @@ describe("adapter: chunks + vector_search", () => {
   });
 
   it("filters vector_search to current-version chunks only", async () => {
-    const { s, r, u, v } = await seed();
+    const { s, r, v } = await seed();
     const now = new Date().toISOString();
     const vec: readonly number[] = [1, 0, 0];
     await s.chunks_upsert(v.id, "m", [
@@ -101,7 +100,7 @@ describe("adapter: chunks + vector_search", () => {
       frontmatter_raw: "",
       frontmatter: {},
       body: "new",
-      author_id: u.id,
+      author: "alice",
       created_at: now,
     });
     // v is no longer current — its chunks must not appear.

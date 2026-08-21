@@ -1,11 +1,11 @@
 /**
  * MCP tool registry — design §6.2.
  *
- * 25 tools mirroring the kernel one-to-one. Each entry names the tool,
- * describes it, carries a JSON Schema for the input, and delegates to a
- * kernel call with the resolved actor. M4 added `docs_diff` (the tool
- * m3 deferred); §11.2 added `links_backfill` / `links_stale` /
- * `links_repair` and `repos_set_link_config`.
+ * Tools mirror the kernel one-to-one. Each entry names the tool, describes it,
+ * carries a JSON Schema for the input, and delegates to a kernel call with the
+ * session's CallContext. No-auth (noauth plan): the user and token tools are
+ * gone; write tools gain an optional `author` and the query tool an optional
+ * `scope` — both overridden by the X-Mrplex-* request headers when present.
  *
  * Results shape:
  *   • On success: { structured, text } — structured is the wire type,
@@ -14,23 +14,14 @@
  *     in-band tool error ({ code, data }) per §6.2.
  */
 
-import type { Actor } from "../kernel/auth/actor.js";
-import type { ScopeInput } from "../kernel/auth/scope.js";
+import { type CallContext, validateScopeClaims } from "../kernel/context.js";
 import type { Kernel } from "../kernel/kernel.js";
 import type { PathConfigOverride } from "../kernel/path-config.js";
 import type { QuerySpec } from "../kernel/query/query.js";
 import type { Version } from "../kernel/wire.js";
 import type { LinkConfigOverride } from "../links/link-config.js";
 import { appendSystemProperty, extractSystemProperties } from "../markdown/frontmatter.js";
-import {
-  renderJson,
-  renderRepoList,
-  renderTokenCreate,
-  renderTokenList,
-  renderUserList,
-  renderVersion,
-  renderVersionList,
-} from "./render.js";
+import { renderJson, renderRepoList, renderVersion, renderVersionList } from "./render.js";
 
 /**
  * A tool's structured payload is always a JSON object — MCP's
@@ -48,9 +39,14 @@ function wrapList<T>(items: T[]): Record<string, unknown> {
   return { items };
 }
 
+/**
+ * The session context carries the header-injected author/scope (see
+ * mcp/server.ts). Handlers merge in tool-arg author/scope only where the
+ * header left a gap — headers beat tool args (noauth plan decision 8).
+ */
 export type ToolHandler = (
   kernel: Kernel,
-  actor: Actor,
+  ctx: CallContext,
   args: Record<string, unknown>,
 ) => ToolResult | Promise<ToolResult>;
 
@@ -123,6 +119,30 @@ function argIntOpt(args: Record<string, unknown>, key: string): number | undefin
 }
 
 /**
+ * Merge a write's `author` tool-arg into the session context. Headers win:
+ * if the session already carries an author (header-injected), the tool arg is
+ * ignored (noauth plan decision 8).
+ */
+function writeCtx(ctx: CallContext, args: Record<string, unknown>): CallContext {
+  if (ctx.author !== undefined) return ctx;
+  const author = argStrOpt(args, "author");
+  return author === undefined ? ctx : { ...ctx, author };
+}
+
+/**
+ * Merge a query's `scope` tool-arg into the session context. Headers win:
+ * a header-injected scope shadows the tool arg entirely.
+ */
+function queryCtx(ctx: CallContext, args: Record<string, unknown>): CallContext {
+  if (ctx.scope !== undefined) return ctx;
+  const scope = args.scope;
+  if (scope === undefined || scope === null) return ctx;
+  // Same structural check as the header/body paths — a repo-less claim is a
+  // loud filter_invalid, not a silent deny_all empty result.
+  return { ...ctx, scope: validateScopeClaims(scope) };
+}
+
+/**
  * Add `$version: <version_id>` to `frontmatter_raw` unless the caller asked
  * for raw output. Non-destructive — plain text append, no YAML round-trip.
  */
@@ -152,8 +172,8 @@ export const TOOL_REGISTRY: ToolEntry[] = [
         },
       },
     },
-    handler: async (kernel, actor, args) => {
-      const result = await kernel.repos.list(actor, {
+    handler: async (kernel, ctx, args) => {
+      const result = await kernel.repos.list(ctx, {
         include_system: argBoolOpt(args, "include_system") ?? false,
       });
       return { structured: wrapList(result), text: renderRepoList(result) };
@@ -167,8 +187,8 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       properties: { repo: { type: "string", description: "Repo slug." } },
       required: ["repo"],
     },
-    handler: async (kernel, actor, args) => {
-      const result = await kernel.repos.get(actor, argStr(args, "repo"));
+    handler: async (kernel, ctx, args) => {
+      const result = await kernel.repos.get(ctx, argStr(args, "repo"));
       return { structured: result, text: renderJson(result) };
     },
   },
@@ -180,8 +200,8 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       properties: { repo: { type: "string", description: "New repo slug." } },
       required: ["repo"],
     },
-    handler: async (kernel, actor, args) => {
-      const result = await kernel.repos.create(actor, argStr(args, "repo"));
+    handler: async (kernel, ctx, args) => {
+      const result = await kernel.repos.create(ctx, argStr(args, "repo"));
       return { structured: result, text: `created ${result.repo}` };
     },
   },
@@ -196,12 +216,8 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       },
       required: ["repo", "new_repo"],
     },
-    handler: async (kernel, actor, args) => {
-      const result = await kernel.repos.rename(
-        actor,
-        argStr(args, "repo"),
-        argStr(args, "new_repo"),
-      );
+    handler: async (kernel, ctx, args) => {
+      const result = await kernel.repos.rename(ctx, argStr(args, "repo"), argStr(args, "new_repo"));
       return { structured: result, text: `renamed to ${result.repo}` };
     },
   },
@@ -213,8 +229,8 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       properties: { repo: { type: "string" } },
       required: ["repo"],
     },
-    handler: async (kernel, actor, args) => {
-      const result = await kernel.repos.delete(actor, argStr(args, "repo"));
+    handler: async (kernel, ctx, args) => {
+      const result = await kernel.repos.delete(ctx, argStr(args, "repo"));
       return { structured: result, text: `deleted (now ${result.repo})` };
     },
   },
@@ -239,9 +255,9 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       },
       required: ["repo", "config"],
     },
-    handler: async (kernel, actor, args) => {
+    handler: async (kernel, ctx, args) => {
       const cfg = args.config as PathConfigOverride | null;
-      const result = await kernel.repos.set_path_config(actor, argStr(args, "repo"), cfg);
+      const result = await kernel.repos.set_path_config(ctx, argStr(args, "repo"), cfg);
       return { structured: result, text: `warnings: ${result.warnings.length}` };
     },
   },
@@ -266,67 +282,13 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       },
       required: ["repo", "config"],
     },
-    handler: async (kernel, actor, args) => {
+    handler: async (kernel, ctx, args) => {
       const cfg = args.config as LinkConfigOverride | null;
-      const result = await kernel.repos.set_link_config(actor, argStr(args, "repo"), cfg);
+      const result = await kernel.repos.set_link_config(ctx, argStr(args, "repo"), cfg);
       return {
         structured: result,
         text: `link_config updated; reindexed ${result.reindexed.documents} doc(s), ${result.reindexed.edges} edge(s)`,
       };
-    },
-  },
-
-  // ---- users ----
-  {
-    name: "users_list",
-    description: "List users.",
-    inputSchema: { type: "object", properties: {} },
-    handler: async (kernel, actor) => {
-      const result = await kernel.users.list(actor);
-      return { structured: wrapList(result), text: renderUserList(result) };
-    },
-  },
-  {
-    name: "users_create",
-    description: "Create a user (admin).",
-    inputSchema: {
-      type: "object",
-      properties: { user: { type: "string" } },
-      required: ["user"],
-    },
-    handler: async (kernel, actor, args) => {
-      const result = await kernel.users.create(actor, argStr(args, "user"));
-      return { structured: result, text: `created ${result.user}` };
-    },
-  },
-  {
-    name: "users_rename",
-    description: "Rename a user (admin).",
-    inputSchema: {
-      type: "object",
-      properties: { user: { type: "string" }, new_user: { type: "string" } },
-      required: ["user", "new_user"],
-    },
-    handler: async (kernel, actor, args) => {
-      const result = await kernel.users.rename(
-        actor,
-        argStr(args, "user"),
-        argStr(args, "new_user"),
-      );
-      return { structured: result, text: `renamed to ${result.user}` };
-    },
-  },
-  {
-    name: "users_delete",
-    description: "Delete a user — system-namespace rename + revoke tokens (§3.4; admin).",
-    inputSchema: {
-      type: "object",
-      properties: { user: { type: "string" } },
-      required: ["user"],
-    },
-    handler: async (kernel, actor, args) => {
-      const result = await kernel.users.delete(actor, argStr(args, "user"));
-      return { structured: result, text: `deleted (now ${result.user})` };
     },
   },
 
@@ -347,8 +309,8 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       },
       required: ["repo", "path"],
     },
-    handler: async (kernel, actor, args) => {
-      const v = await kernel.docs.get(actor, argStr(args, "repo"), argStr(args, "path"));
+    handler: async (kernel, ctx, args) => {
+      const v = await kernel.docs.get(ctx, argStr(args, "repo"), argStr(args, "path"));
       const out = withInjectedVersion(v, args.raw === true);
       return { structured: out, text: renderVersion(out) };
     },
@@ -368,9 +330,9 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       },
       required: ["repo", "version_id"],
     },
-    handler: async (kernel, actor, args) => {
+    handler: async (kernel, ctx, args) => {
       const v = await kernel.docs.get_version(
-        actor,
+        ctx,
         argStr(args, "repo"),
         argStr(args, "version_id"),
       );
@@ -391,8 +353,8 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       },
       required: ["repo", "path"],
     },
-    handler: async (kernel, actor, args) => {
-      const rows = await kernel.docs.history(actor, argStr(args, "repo"), argStr(args, "path"), {
+    handler: async (kernel, ctx, args) => {
+      const rows = await kernel.docs.history(ctx, argStr(args, "repo"), argStr(args, "path"), {
         limit: argIntOpt(args, "limit"),
         before: argStrOpt(args, "before"),
       });
@@ -413,9 +375,9 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       },
       required: ["repo", "path", "from", "to"],
     },
-    handler: async (kernel, actor, args) => {
+    handler: async (kernel, ctx, args) => {
       const d = await kernel.docs.diff(
-        actor,
+        ctx,
         argStr(args, "repo"),
         argStr(args, "path"),
         argStr(args, "from"),
@@ -436,15 +398,24 @@ export const TOOL_REGISTRY: ToolEntry[] = [
         body: { type: "string" },
         frontmatter: { type: "object", additionalProperties: true },
         frontmatter_raw: { type: "string" },
+        author: {
+          type: "string",
+          description: "Opaque author string. The X-Mrplex-Author header, if present, wins.",
+        },
       },
       required: ["repo", "path", "body"],
     },
-    handler: async (kernel, actor, args) => {
-      const v = await kernel.docs.create(actor, argStr(args, "repo"), argStr(args, "path"), {
-        frontmatter: args.frontmatter as never,
-        frontmatter_raw: argStrOpt(args, "frontmatter_raw"),
-        body: argStr(args, "body"),
-      });
+    handler: async (kernel, ctx, args) => {
+      const v = await kernel.docs.create(
+        writeCtx(ctx, args),
+        argStr(args, "repo"),
+        argStr(args, "path"),
+        {
+          frontmatter: args.frontmatter as never,
+          frontmatter_raw: argStrOpt(args, "frontmatter_raw"),
+          body: argStr(args, "body"),
+        },
+      );
       return { structured: v, text: renderVersion(v) };
     },
   },
@@ -465,10 +436,14 @@ export const TOOL_REGISTRY: ToolEntry[] = [
         body: { type: "string" },
         frontmatter: { type: "object", additionalProperties: true },
         frontmatter_raw: { type: "string" },
+        author: {
+          type: "string",
+          description: "Opaque author string. The X-Mrplex-Author header, if present, wins.",
+        },
       },
       required: ["repo", "path"],
     },
-    handler: async (kernel, actor, args) => {
+    handler: async (kernel, ctx, args) => {
       const input: {
         frontmatter?: unknown;
         frontmatter_raw?: string;
@@ -496,7 +471,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       }
 
       const v = await kernel.docs.put(
-        actor,
+        writeCtx(ctx, args),
         argStr(args, "repo"),
         prev,
         argStr(args, "path"),
@@ -513,12 +488,16 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       properties: {
         repo: { type: "string" },
         prev_version_id: { type: "string" },
+        author: {
+          type: "string",
+          description: "Opaque author string. The X-Mrplex-Author header, if present, wins.",
+        },
       },
       required: ["repo", "prev_version_id"],
     },
-    handler: async (kernel, actor, args) => {
+    handler: async (kernel, ctx, args) => {
       const v = await kernel.docs.delete(
-        actor,
+        writeCtx(ctx, args),
         argStr(args, "repo"),
         argStr(args, "prev_version_id"),
       );
@@ -535,8 +514,8 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       properties: { repo: { type: "string" } },
       required: ["repo"],
     },
-    handler: async (kernel, actor, args) => {
-      const r = await kernel.links.backfill(actor, argStr(args, "repo"));
+    handler: async (kernel, ctx, args) => {
+      const r = await kernel.links.backfill(ctx, argStr(args, "repo"));
       return {
         structured: r,
         text: `backfill ${argStr(args, "repo")}: documents=${r.documents} edges=${r.edges}`,
@@ -552,8 +531,8 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       properties: { repo: { type: "string" } },
       required: ["repo"],
     },
-    handler: async (kernel, actor, args) => {
-      const rows = await kernel.links.stale(actor, argStr(args, "repo"));
+    handler: async (kernel, ctx, args) => {
+      const rows = await kernel.links.stale(ctx, argStr(args, "repo"));
       const text = rows.length
         ? rows.map((r) => `${r.source_path}: "${r.written}" → "${r.current}"`).join("\n")
         : "no stale links";
@@ -569,70 +548,12 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       properties: { repo: { type: "string" }, dry_run: { type: "boolean" } },
       required: ["repo"],
     },
-    handler: async (kernel, actor, args) => {
-      const r = await kernel.links.repair(actor, argStr(args, "repo"), {
+    handler: async (kernel, ctx, args) => {
+      const r = await kernel.links.repair(ctx, argStr(args, "repo"), {
         dry_run: argBoolOpt(args, "dry_run") ?? false,
       });
       const text = `${r.dry_run ? "[dry-run] " : ""}repaired=${r.repaired.length} skipped=${r.skipped.length}`;
       return { structured: r, text };
-    },
-  },
-
-  // ---- tokens ----
-  {
-    name: "tokens_list",
-    description: "List your tokens.",
-    inputSchema: { type: "object", properties: {} },
-    handler: async (kernel, actor) => {
-      const rows = await kernel.tokens.list(actor);
-      return { structured: wrapList(rows), text: renderTokenList(rows) };
-    },
-  },
-  {
-    name: "tokens_create",
-    description: "Mint a new token. Plaintext secret returned once — store it.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        label: { type: "string" },
-        scopes: {
-          type: "array",
-          items: {
-            type: "object",
-            additionalProperties: true,
-            description: "ScopeInput — see §6.4.",
-          },
-        },
-        admin: { type: "boolean" },
-        expires_at: { type: "string", description: "ISO-8601" },
-        for_user: {
-          type: "string",
-          description: "Mint on behalf of this user slug (admin only).",
-        },
-      },
-      required: ["label", "scopes"],
-    },
-    handler: async (kernel, actor, args) => {
-      const scopes = (args.scopes ?? []) as ScopeInput[];
-      const result = await kernel.tokens.create(actor, argStr(args, "label"), scopes, {
-        admin: argBoolOpt(args, "admin") ?? false,
-        expires_at: argStrOpt(args, "expires_at") ?? null,
-        for_user: argStrOpt(args, "for_user") ?? null,
-      });
-      return { structured: result, text: renderTokenCreate(result) };
-    },
-  },
-  {
-    name: "tokens_revoke",
-    description: "Revoke a token (self, or any if admin).",
-    inputSchema: {
-      type: "object",
-      properties: { token_id: { type: "string" } },
-      required: ["token_id"],
-    },
-    handler: async (kernel, actor, args) => {
-      const t = await kernel.tokens.revoke(actor, argStr(args, "token_id"));
-      return { structured: t, text: `revoked ${t.id}` };
     },
   },
 
@@ -656,11 +577,18 @@ export const TOOL_REGISTRY: ToolEntry[] = [
         limit: { type: "integer", minimum: 0 },
         include_hidden: { type: "boolean" },
         include_system: { type: "boolean" },
+        scope: {
+          type: "array",
+          description:
+            "Read-visibility claims (ScopeClaim[]) narrowing what this query sees. The X-Mrplex-Scope header, if present, wins.",
+          items: { type: "object", additionalProperties: true },
+        },
       },
     },
-    handler: async (kernel, actor, args) => {
-      const spec = args as QuerySpec;
-      const rows = await kernel.query(actor, spec);
+    handler: async (kernel, ctx, args) => {
+      const { scope: _scope, ...specArgs } = args;
+      const spec = specArgs as QuerySpec;
+      const rows = await kernel.query(queryCtx(ctx, args), spec);
       return { structured: wrapList(rows), text: renderVersionList(rows) };
     },
   },

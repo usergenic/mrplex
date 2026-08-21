@@ -16,13 +16,12 @@ See [docs/design.md](docs/design.md) for the full design.
   - **`$in` today means links you wrote; later it will also include dynamic membership.** A document denotes a set — the docs it links to — and a future release lets a document *also* define members via embedded queries. When that lands, `$in` (and `$has`/`$backlinks()`/`$links()`) transparently widen to the union of written links **and** query-derived membership. If you want to match **only** statically-written links, now and forever, use the `_static` forms (`$in_static`, `--in-static`); they never widen. The `_dyn`-only forms are reserved until that release.
 - **Full-text search** over document body — SQLite FTS5 (porter+unicode61) or Postgres `websearch_to_tsquery`. Composes with filter via AND. Portable syntax subset across both engines: bare terms and quoted phrases.
 - **Semantic rank via embeddings** — pluggable hook (`--embed-url` HTTP or `--embed-cmd` subprocess); mrplex never calls a provider itself. Chunker + backlog worker + brute-force cosine k-NN over `sqlite-vec`; results current-version only, deduped by content hash. Composes with filter/text/scope/sigil-exclusion. No hook configured → `rank_unavailable` (no zero-vector default — silent garbage is worse than a visible gap).
-- **Bearer-token auth** with capability scopes — repo-scoped `read` / `write` path globs (gitignore-style, with negation), admin bit, per-token subset semantics for self-issued tokens.
+- **Full-trust kernel — no in-engine auth.** mrplex authenticates nothing: any caller that can reach the engine can do anything. Authentication, users, and tokens live in a *shell* around it — the OS process boundary for local/stdio use, or a fronting proxy for networked deployments (never expose mrplex directly to an untrusted network). Identity is one opaque `author` string per write (default `"mrplex"`; convention is git's `Full Name <email>`). Read visibility can still be narrowed per call with a `ScopeClaim[]` — repo/path globs (gitignore-style, with negation) evaluated at call time.
 - **HTTP surfaces.** Protocol-true MCP server at `/mcp` (Streamable HTTP + optional STDIO), and a resource-oriented REST surface with `If-Match` / `If-None-Match`, content negotiation (`application/json` or `text/markdown`), `MOVE`, and sibling `/versions` / `/history` / `/diff` roots. Query responses carry ETags for `If-None-Match` → 304.
 - **`mrplex` CLI** — thin client over MCP. `--database` for local embedded mode; `--server` for remote mode against a running server. Every command works identically over both transports.
 - **Two v1 storage adapters — SQLite and Postgres+pgvector.** `--database sqlite:./mrplex.db` (bare path defaults to sqlite) or `--database postgres://user:pw@host:5432/db`. Both pass the same kernel test suite.
 - **Configurable path policy** — hardcoded defaults → server config → per-repo override. `disallowed_chars`, `system_sigils`, `hidden_sigils`, all with sensible defaults (Obsidian's cross-platform-safe rule).
 - **Case-insensitive paths and slugs** — identity is Unicode-normalized (NFC) and case-insensitive (`Alice.md` and `alice.md` are the same document; `docs.get NOTES/alice.md` finds it), while storage preserves the exact case you write.
-- **Bootstrap** — `mrplex bootstrap` mints the root admin token on a fresh database.
 
 ## Quickstart
 
@@ -33,32 +32,33 @@ npm install
 npm link          # puts `mrplex` on your PATH; alternatively, `npm install -g` after publish
 ```
 
-Point every command at the same database, token, and target repo by exporting once:
+No bootstrap, no token — mrplex is a full-trust kernel (whoever can run the
+binary or reach the port is trusted). Point every command at the same database
+and target repo by exporting once:
 
 ```bash
 export MRPLEX_DATABASE=./mrplex.db
-export MRPLEX_TOKEN=$(mrplex bootstrap)   # mints the root admin token exactly once
 export MRPLEX_REPO=notes                  # default repo for `docs *` commands
+export MRPLEX_AUTHOR="Ada Lovelace <ada@example.com>"   # optional; stamped on writes (default "mrplex")
 ```
 
 `docs *` commands read the target repo from `MRPLEX_REPO`; override any call
 with `-r / --repo <slug>`.
 
 **Prefer a config file to environment variables?** `mrplex config set-*` writes
-`$XDG_CONFIG_HOME/mrplex/config.json` (defaults to `~/.config/mrplex/config.json`;
-token stored chmod 600):
+`$XDG_CONFIG_HOME/mrplex/config.json` (defaults to `~/.config/mrplex/config.json`):
 
 ```bash
 mrplex config set-database ./mrplex.db
-mrplex config set-token "$(mrplex bootstrap)"
 mrplex config set-repo notes
-mrplex config set-server http://127.0.0.1:8321   # optional — for remote mode
-mrplex config show                               # summary; token shown as (set) / (unset), never plaintext
+mrplex config set-author "Ada Lovelace <ada@example.com>"   # optional; identity on writes
+mrplex config set-server http://127.0.0.1:8321             # optional — for remote mode
+mrplex config show                                         # summary
 ```
 
 Each setting is resolved **flag → env → config file → hardcoded default**, so a
-one-off `-r other-repo` or `--server https://…` overrides the persisted value
-without editing anything.
+one-off `-r other-repo`, `--author "…"`, or `--server https://…` overrides the
+persisted value without editing anything.
 
 Create the repo and walk a doc through its lifecycle:
 
@@ -85,29 +85,20 @@ V=$(mrplex --json docs put greetings/hi.md --prev "$V" | jq -r .version_id)
 mrplex docs history greetings/hi.md
 ```
 
-Mint a narrower token for an agent (subset of your own scope):
+Narrow read visibility for a single call with `--scope` (a JSON `ScopeClaim[]` of
+repo/path globs, evaluated at call time). Absent scope = full visibility; a
+present claim silently filters `query` and 403s out-of-claim reads:
 
 ```bash
-mrplex tokens create --label "obsidian-plugin" --scope "notes:read=**,write=inbox/**"
+mrplex query --repo notes --filter 'status == "published"' \
+    --scope '[{"repo":"notes","read":["**","!secret/**"]}]'
 ```
 
-Multi-user: the admin creates each user and mints their first token; hand it to
-them out-of-band. From then on the user manages their own tokens (list,
-revoke, mint sub-tokens no wider than what they hold).
-
-```bash
-mrplex users create alice
-ALICE_TOKEN=$(mrplex --json tokens create \
-    --for-user alice \
-    --label "alice-primary" \
-    --scope "notes:read=**,write=inbox/**" \
-  | jq -r .token)
-
-# Alice now uses her own token — no admin bit, scope only on notes/inbox.
-MRPLEX_TOKEN=$ALICE_TOKEN mrplex docs create inbox/hi.md --from-file - <<< $'---\n---\nhi\n'
-MRPLEX_TOKEN=$ALICE_TOKEN mrplex tokens create \
-    --label "alice-obsidian" --scope "notes:read=**,write=inbox/**"
-```
+There are no users, tokens, or per-path write policy in the engine — those are
+the shell's job. For multi-user or networked setups, front mrplex with an auth
+proxy that terminates authn, maps each credential to an author string +
+`ScopeClaim[]`, and injects them via `X-Mrplex-Author` / `X-Mrplex-Scope`
+request headers. Never expose mrplex directly to an untrusted network.
 
 Query — CEL filters + FTS + rank composed:
 
@@ -232,7 +223,7 @@ Writes done while a hook is configured trigger the in-process worker automatical
 ## Development
 
 ```bash
-npm test          # invariants, kernel suite, writes, admin, auth, query, rank, diff, chunker, worker, HTTP surfaces, CLI
+npm test          # invariants, kernel suite, writes, read scopes, query, rank, diff, chunker, worker, HTTP surfaces, CLI
 npm run typecheck # tsc --noEmit, strict
 npm run lint      # biome check
 npm run build     # emit dist/
@@ -248,7 +239,6 @@ npm run pg:up
 
 # Point mrplex at it (`--database` also honored per-command).
 export MRPLEX_DATABASE=postgres://mrplex:mrplex@localhost:5432/mrplex
-mrplex bootstrap
 mrplex serve
 
 # Other lifecycle scripts: `pg:down` (stop), `pg:reset` (wipe volume), `pg:logs`.

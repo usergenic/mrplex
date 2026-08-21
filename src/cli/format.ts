@@ -1,4 +1,4 @@
-import type { Repo, User, Version } from "../kernel/wire.js";
+import type { Repo, Version } from "../kernel/wire.js";
 import { join as joinFrontmatter } from "../markdown/frontmatter.js";
 
 /**
@@ -15,17 +15,9 @@ export function renderReposTable(repos: Repo[]): string {
   return renderTable(["REPO", "PATH CONFIG"], rows);
 }
 
-export function renderUsersTable(users: User[]): string {
-  if (users.length === 0) return "(no users)";
-  return renderTable(
-    ["USER"],
-    users.map((u) => [u.user]),
-  );
-}
-
 export function renderQueryTable(versions: Version[]): string {
   if (versions.length === 0) return "(no results)";
-  const rows = versions.map((v) => [v.repo, v.path, v.version_id, v.author.user, v.created_at]);
+  const rows = versions.map((v) => [v.repo, v.path, v.version_id, v.author, v.created_at]);
   return renderTable(["REPO", "PATH", "VERSION", "AUTHOR", "CREATED_AT"], rows);
 }
 
@@ -34,7 +26,7 @@ export function renderHistoryTable(versions: Version[]): string {
   const rows = versions.map((v) => [
     v.version_id,
     v.created_at,
-    v.author.user,
+    v.author,
     v.next_version_id === null ? "current" : "",
   ]);
   return renderTable(["VERSION", "CREATED_AT", "AUTHOR", "STATE"], rows);

@@ -13,7 +13,7 @@
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import type { ScopeInput } from "../kernel/auth/scope.js";
+import type { CallContext } from "../kernel/context.js";
 import type { UnifiedDiff } from "../kernel/diff.js";
 import { KernelError, isKernelErrorCode } from "../kernel/errors.js";
 import type { FrontmatterInput } from "../kernel/frontmatter-input.js";
@@ -25,19 +25,25 @@ import type {
 } from "../kernel/kernel.js";
 import type { PathConfigOverride } from "../kernel/path-config.js";
 import type { QuerySpec } from "../kernel/query/query.js";
-import type { PathWarning, Repo, Token, User, Version } from "../kernel/wire.js";
+import type { PathWarning, Repo, Version } from "../kernel/wire.js";
 import type { LinkConfigOverride } from "../links/link-config.js";
-import type {
-  HistoryOptions,
-  KernelClient,
-  SetPathConfigResult,
-  TokenCreateResult,
-} from "./kernel-client.js";
+import type { HistoryOptions, KernelClient, SetPathConfigResult } from "./kernel-client.js";
 
 export type RemoteClientConfig = {
   /** Base URL — e.g. http://127.0.0.1:8321 (no trailing /mcp). */
   server: string;
-  token: string;
+  /**
+   * Default context forwarded via `X-Mrplex-*` headers on every request.
+   * The shell in front of a remote server is what a proxy would inject; here
+   * the CLI plays that role for its own calls.
+   */
+  context?: CallContext;
+  /**
+   * Optional bearer to forward verbatim as `Authorization: Bearer <token>`.
+   * mrplex itself ignores it, but a shell fronting a remote server may want
+   * it (noauth plan §1). Absent = no Authorization header.
+   */
+  token?: string;
 };
 
 /**
@@ -47,8 +53,12 @@ export type RemoteClientConfig = {
 export async function openRemoteClient(config: RemoteClientConfig): Promise<KernelClient> {
   const url = new URL(joinUrl(config.server, "/mcp"));
   const client = new Client({ name: "mrplex-cli", version: "0.0.0" });
+  const headers: Record<string, string> = {};
+  if (config.token) headers.Authorization = `Bearer ${config.token}`;
+  if (config.context?.author) headers["X-Mrplex-Author"] = config.context.author;
+  if (config.context?.scope) headers["X-Mrplex-Scope"] = JSON.stringify(config.context.scope);
   const transport = new StreamableHTTPClientTransport(url, {
-    requestInit: { headers: { Authorization: `Bearer ${config.token}` } },
+    requestInit: { headers },
   });
   try {
     await client.connect(transport);
@@ -130,12 +140,6 @@ function buildRemoteClient(client: Client): KernelClient {
       set_link_config: (slug, cfg: LinkConfigOverride | null) =>
         call<SetLinkConfigResult>("repos_set_link_config", { repo: slug, config: cfg }),
     },
-    users: {
-      list: () => callList<User>("users_list", {}),
-      create: (slug) => call<User>("users_create", { user: slug }),
-      rename: (slug, ns) => call<User>("users_rename", { user: slug, new_user: ns }),
-      delete: (slug) => call<User>("users_delete", { user: slug }),
-    },
     docs: {
       get: (repo, path, opts) =>
         call<Version>("docs_get", { repo, path, ...(opts?.raw && { raw: true }) }),
@@ -180,20 +184,6 @@ function buildRemoteClient(client: Client): KernelClient {
           repo,
           ...(opts?.dry_run !== undefined && { dry_run: opts.dry_run }),
         }),
-    },
-    tokens: {
-      list: () => callList<Token>("tokens_list", {}),
-      create: (label, scopes: ScopeInput[], opts) =>
-        call<TokenCreateResult>("tokens_create", {
-          label: label ?? "",
-          scopes,
-          ...(opts?.admin !== undefined && { admin: opts.admin }),
-          ...(opts?.expires_at !== undefined &&
-            opts.expires_at !== null && { expires_at: opts.expires_at }),
-          ...(opts?.for_user !== undefined &&
-            opts.for_user !== null && { for_user: opts.for_user }),
-        }),
-      revoke: (id) => call<Token>("tokens_revoke", { token_id: id }),
     },
     query: async (spec: QuerySpec) => {
       const wrapped = await call<{ items: Version[] }>("query", spec as Record<string, unknown>);

@@ -1,11 +1,9 @@
 /**
  * CLI smoke tests. Exercise the end-to-end path from a seeded database
- * through the CLI to stdout/stderr + exit code — the definition-of-done
- * transcript from docs/archive/m0-plan.md §6 (plus M1's bootstrap-first posture).
+ * through the CLI to stdout/stderr + exit code.
  *
- * M1 removes the SYSTEM_ACTOR anonymous fallback: the CLI now requires a
- * real bearer token, so beforeEach() bootstraps the root token before the
- * seed script populates data (seed writes adapter-level, bypassing auth).
+ * No-auth (noauth plan): there is no bootstrap and no token requirement.
+ * beforeEach just seeds the database; the CLI opens it directly.
  */
 
 import { spawnSync } from "node:child_process";
@@ -14,7 +12,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { bootstrap } from "../src/cli/bootstrap.js";
 
 const REPO_ROOT = join(fileURLToPath(new URL(".", import.meta.url)), "..");
 const CLI = join(REPO_ROOT, "src", "cli", "main.ts");
@@ -22,12 +19,10 @@ const SEED = join(REPO_ROOT, "scripts", "seed.ts");
 
 let workDir: string;
 let dbUrl: string;
-let rootToken: string;
 
 function run(...args: string[]): { stdout: string; stderr: string; status: number } {
   const env: Record<string, string> = {
     ...(process.env as Record<string, string>),
-    MRPLEX_TOKEN: rootToken,
     // Most `docs *` tests target the seeded `notes` repo; individual tests
     // override with an explicit `-r <slug>` when they need something else.
     MRPLEX_REPO: "notes",
@@ -44,13 +39,10 @@ function run(...args: string[]): { stdout: string; stderr: string; status: numbe
   return { stdout: res.stdout, stderr: res.stderr, status: res.status ?? 1 };
 }
 
-beforeEach(async () => {
+beforeEach(() => {
   workDir = mkdtempSync(join(tmpdir(), "mrplex-cli-"));
   mkdirSync(workDir, { recursive: true });
   dbUrl = `sqlite:${join(workDir, "cli.db")}`;
-  // Bootstrap FIRST so an admin token exists, then seed adapter-level data.
-  const { token } = await bootstrap(dbUrl);
-  rootToken = token;
   const seed = spawnSync("node", ["--import", "tsx", SEED, "--database", dbUrl], {
     cwd: REPO_ROOT,
     encoding: "utf8",
@@ -69,12 +61,6 @@ describe("cli", () => {
     expect(out.stdout).toContain("notes");
   });
 
-  it("users list — shows the seeded user", () => {
-    const out = run("users", "list");
-    expect(out.status).toBe(0);
-    expect(out.stdout).toContain("alice");
-  });
-
   it("docs get — returns pretty markdown with frontmatter", () => {
     const out = run("docs", "get", "welcome.md");
     expect(out.status).toBe(0);
@@ -91,7 +77,7 @@ describe("cli", () => {
     expect(v.path).toBe("welcome.md");
     expect(v.version_id).toMatch(/^v\d+$/);
     expect(v.next_version_id).toBeNull();
-    expect(v.author).toEqual({ user: "alice" });
+    expect(v.author).toBe("alice");
   });
 
   it("docs history — newest-first with the current-marker", () => {
@@ -135,17 +121,16 @@ describe("cli", () => {
     expect(out.stdout.endsWith("\n\n")).toBe(false);
   });
 
-  it("no token → exit 3 (unauthorized) — the removed fallback", () => {
-    const res = spawnSync("node", ["--import", "tsx", CLI, "--database", dbUrl, "repos", "list"], {
-      cwd: REPO_ROOT,
-      encoding: "utf8",
-      env: {
-        ...(process.env as Record<string, string>),
-        MRPLEX_TOKEN: "",
-        XDG_CONFIG_HOME: workDir,
-      },
-    });
-    expect(res.status).toBe(3);
-    expect(res.stderr).toContain("unauthorized");
+  it("--author stamps the author on writes", () => {
+    const out = run("--json", "--author", "Ripley <ripley@nostromo>", "docs", "create", "log.md");
+    expect(out.status).toBe(0);
+    const v = JSON.parse(out.stdout);
+    expect(v.author).toBe("Ripley <ripley@nostromo>");
+  });
+
+  it("writes with no --author default to the mrplex identity", () => {
+    const out = run("--json", "docs", "create", "note.md");
+    expect(out.status).toBe(0);
+    expect(JSON.parse(out.stdout).author).toBe("mrplex");
   });
 });

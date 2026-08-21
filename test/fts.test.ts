@@ -17,10 +17,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { sqliteAdapter } from "../src/storage-sqlite/adapter.js";
-import type { RepoRow, Storage, UserRow } from "../src/storage/types.js";
+import type { RepoRow, Storage } from "../src/storage/types.js";
 
 let storage: Storage;
-let user: UserRow;
 let repo: RepoRow;
 let otherRepo: RepoRow;
 
@@ -46,7 +45,6 @@ async function ftsIds(repoIds: readonly number[], text: string): Promise<number[
 
 beforeEach(async () => {
   storage = await fresh();
-  user = await storage.users_create({ slug: "alice", created_at: NOW });
   repo = await storage.repos_create({ slug: "notes", created_at: NOW });
   otherRepo = await storage.repos_create({ slug: "other", created_at: NOW });
 });
@@ -66,7 +64,7 @@ describe("fts trigger sync with version_insert", () => {
       frontmatter_raw: "",
       frontmatter: {},
       body: "The quick brown fox jumps over the lazy dog.",
-      author_id: user.id,
+      author: "alice",
       created_at: NOW,
     });
     expect(await ftsIds([repo.id], "quick")).toEqual([v.id]);
@@ -82,7 +80,7 @@ describe("fts trigger sync with version_insert", () => {
       frontmatter_raw: "",
       frontmatter: {},
       body: "apple pear cherry",
-      author_id: user.id,
+      author: "alice",
       created_at: NOW,
     });
     const v2 = await storage.version_insert({
@@ -93,7 +91,7 @@ describe("fts trigger sync with version_insert", () => {
       frontmatter_raw: "",
       frontmatter: {},
       body: "apple banana cherry",
-      author_id: user.id,
+      author: "alice",
       created_at: LATER,
     });
     // Searching for apple returns only v2 — v1 also contains "apple" but is
@@ -113,7 +111,7 @@ describe("versions_search — FTS branch, current-only filter", () => {
       frontmatter_raw: "",
       frontmatter: {},
       body: "uniquetokenv1",
-      author_id: user.id,
+      author: "alice",
       created_at: NOW,
     });
     await storage.version_insert({
@@ -124,7 +122,7 @@ describe("versions_search — FTS branch, current-only filter", () => {
       frontmatter_raw: "",
       frontmatter: {},
       body: "unrelated content",
-      author_id: user.id,
+      author: "alice",
       created_at: LATER,
     });
     expect(await ftsIds([repo.id], "uniquetokenv1")).toEqual([]);
@@ -141,7 +139,7 @@ describe("versions_search — FTS branch, current-only filter", () => {
       frontmatter_raw: "",
       frontmatter: {},
       body: "sharedterm in notes",
-      author_id: user.id,
+      author: "alice",
       created_at: NOW,
     });
     await storage.version_insert({
@@ -152,7 +150,7 @@ describe("versions_search — FTS branch, current-only filter", () => {
       frontmatter_raw: "",
       frontmatter: {},
       body: "sharedterm in other",
-      author_id: user.id,
+      author: "alice",
       created_at: LATER,
     });
     expect(await ftsIds([repo.id], "sharedterm")).toHaveLength(1);
@@ -170,7 +168,7 @@ describe("versions_search — FTS branch, current-only filter", () => {
       frontmatter_raw: "",
       frontmatter: {},
       body: "anything",
-      author_id: user.id,
+      author: "alice",
       created_at: NOW,
     });
     expect(await ftsIds([], "anything")).toEqual([]);
@@ -186,7 +184,7 @@ describe("versions_search — FTS branch, current-only filter", () => {
       frontmatter_raw: "",
       frontmatter: {},
       body: "the corpus contains only these words",
-      author_id: user.id,
+      author: "alice",
       created_at: NOW,
     });
     expect(await ftsIds([repo.id], "nonexistentterm")).toEqual([]);
@@ -205,7 +203,7 @@ describe("versions_search — FTS ranking + query syntax", () => {
       frontmatter_raw: "",
       frontmatter: {},
       body: "some notes about pricing and other things",
-      author_id: user.id,
+      author: "alice",
       created_at: NOW,
     });
     const v2 = await storage.version_insert({
@@ -216,7 +214,7 @@ describe("versions_search — FTS ranking + query syntax", () => {
       frontmatter_raw: "",
       frontmatter: {},
       body: "pricing pricing pricing — this doc is about pricing",
-      author_id: user.id,
+      author: "alice",
       created_at: LATER,
     });
     const ids = await ftsIds([repo.id], "pricing");
@@ -236,7 +234,7 @@ describe("versions_search — FTS ranking + query syntax", () => {
       frontmatter_raw: "",
       frontmatter: {},
       body: "content about welcome and greeting",
-      author_id: user.id,
+      author: "alice",
       created_at: NOW,
     });
     await storage.version_insert({
@@ -247,7 +245,7 @@ describe("versions_search — FTS ranking + query syntax", () => {
       frontmatter_raw: "",
       frontmatter: {},
       body: "content about pricing and fees",
-      author_id: user.id,
+      author: "alice",
       created_at: LATER,
     });
     expect(await ftsIds([repo.id], "welcome OR pricing")).toHaveLength(2);
@@ -263,7 +261,7 @@ describe("versions_search — FTS ranking + query syntax", () => {
       frontmatter_raw: "",
       frontmatter: {},
       body: "the running dogs jumped over fences",
-      author_id: user.id,
+      author: "alice",
       created_at: NOW,
     });
     // porter stems: run/running/runs → run; dog/dogs → dog
