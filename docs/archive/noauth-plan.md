@@ -18,8 +18,11 @@ Branch `noauth` is cut from `main`.
   ```types
   ScopeClaim = {
     repo:  string | string[],   // slug, glob, or "*" — evaluated at call time against current repos
-    read:  string | string[]    // gitignore-style path globs, §8.2 semantics unchanged
+    paths: string | string[]    // gitignore-style path globs, §8.2 semantics unchanged
   }
+  // Deliberately direction-neutral: a claim says "these repos/paths", not "for reading".
+  // The direction comes from where the claim is used — ctx.scope means read visibility.
+  // (The auth-shell plan reuses the same type for its shell-enforced write matcher.)
 
   CallContext = {
     author?: string,            // writes; default "mrplex"
@@ -38,7 +41,7 @@ Branch `noauth` is cut from `main`.
 
 **Out (deliberately):**
 
-- **Write scopes.** The engine enforces no per-path write policy; that is the shell's job (a shell wrapping mrplex is mrplex-aware and can parse write bodies if it wants path-level rules). The one write invariant that is *not* auth — no caller-supplied path may enter a system-sigil namespace — already lives in `validatePath` (`kernel/validation.ts:103`) independent of authorization and stands untouched. If shell-side write policy proves insufficient, `ScopeClaim` grows a `write` field later; the grammar is shaped so that's additive.
+- **Write scopes.** The engine enforces no per-path write policy; that is the shell's job (a shell wrapping mrplex is mrplex-aware and can parse write bodies if it wants path-level rules). The one write invariant that is *not* auth — no caller-supplied path may enter a system-sigil namespace — already lives in `validatePath` (`kernel/validation.ts:103`) independent of authorization and stands untouched. If shell-side write policy proves insufficient, the engine can accept a parallel write-claim input later (e.g. `ctx.write_scope: ScopeClaim[]`); the direction-neutral claim type makes that purely additive.
 - **Scope attenuation / subset checking.** `assertChildScopeSubset`, `assertAdminSubset`, and the whole "child token must be a subset of parent" apparatus die with tokens. A caller who can supply a scope claim can supply a wider one; narrowing across trust levels is the shell's concern.
 - **Any in-engine authn hook, "trusted header" identity verification, or pluggable auth interface.** The engine trusts every caller equally. No half-measures — an optional-auth mode is the worst of both worlds (surface area of auth, guarantees of none).
 - **Network hardening beyond the existing loopback default.** `serve` already binds `127.0.0.1` unless `--host` says otherwise (`server/serve.ts:88`); that stays. TLS, rate limiting, and exposure decisions are the shell's.
@@ -150,7 +153,7 @@ create table versions (
 7. **Repair preserves author, records nothing else** — the kernel rewriting link text on someone's behalf doesn't reassign their document, and repair calls get no special provenance treatment; that's the shell's concern.
 8. **Header beats body/tool-arg** for context on networked surfaces — the shell injects headers; the payload author may be the shell's untrusted client.
 9. **One fresh `0001_init.sql` per engine + legacy guard**; no upgrade path. Future migrations resume at `0002`.
-10. **Write scoping stays out**, with the `ScopeClaim` grammar shaped so `write` globs are a purely additive future field.
+10. **Write scoping stays out.** `ScopeClaim` is direction-neutral (`{ repo, paths }`) — a claim names territory, and its meaning comes from where it's passed (`ctx.scope` = read visibility). A future engine-side write check would be a separate `ctx.write_scope` input, purely additive.
 11. **Destructive repo ops are ungated.** `repos.create`/`rename`/`delete`/`set_path_config`/`set_link_config` — today admin-gated — carry no in-engine gating at all: reachable = allowed, same as every other write. Restrictions on destructive calls are provided by the access-and-identity shell, which can gate these by route/method without parsing bodies (they're addressable at the URL/tool-name level, unlike path-scoped writes).
 12. **No permission toggles in the engine, period.** A `--read-only` launch flag was considered and rejected — it's a foot-in-the-door for permission controls creeping back into the kernel. Anything permission-shaped (read-only sessions, per-principal restrictions, capability grants) belongs in the authentication-and-permissions shell, which gets its own proper design as a module separate from this kernel. The line the engine holds: `ScopeClaim` is a *query-evaluation input* (narrow what this call sees), and the stdio/CLI `--scope`/`--author` launch flags are merely how a parent process — which in stdio mode *is* the shell — injects that per-session context; neither is, or grows into, a permission system.
 

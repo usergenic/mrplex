@@ -2,7 +2,7 @@
 
 *Markdown Repos, plexed.* A queryable, versioned store for Markdown documents with YAML frontmatter.
 
-See [docs/design.md](docs/design.md) for the full design.
+Current work is planned in [docs/auth-shell-plan.md](docs/auth-shell-plan.md). Prior design docs live in [docs/archive/](docs/archive/) — including the original [design.md](docs/archive/design.md) — and may be out of date where the in-flight no-auth rework supersedes them.
 
 ## Features
 
