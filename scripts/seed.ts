@@ -1,7 +1,11 @@
 /**
  * Seed a fresh mrplex database from ./fixtures. Uses adapter-level writes only
- * (design §M0 seed script — no kernel write surface exists yet). Idempotent-ish:
- * refuses to run against a non-empty database to keep behavior predictable.
+ * (design §M0 seed script — no kernel write surface exists yet), then runs the
+ * links backfill so graph queries resolve against the seeded corpus.
+ *
+ * The per-repo `seedRepo` helper is exported so the integration tests can load
+ * exactly one fixture folder into one repo (a session reseeds only the repo it
+ * exercises). The CLI `main()` seeds every fixture folder.
  *
  * Usage:
  *   npm run seed -- --database ./demo.db
@@ -10,20 +14,49 @@
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
-import { split } from "../src/markdown/frontmatter.js";
-import { parse as parseFrontmatter } from "../src/markdown/frontmatter.js";
+import { backfillRepoLinks } from "../src/links/backfill.js";
+import {
+  HARDCODED_DEFAULTS as LINK_DEFAULTS,
+  type LinkConfigOverride,
+  effectiveLinkConfig,
+} from "../src/links/link-config.js";
+import { parse as parseFrontmatter, split } from "../src/markdown/frontmatter.js";
 import { normalizeDatabaseUrl, openStorage } from "../src/storage/registry.js";
 import type { Storage } from "../src/storage/types.js";
 
 const HERE = fileURLToPath(new URL(".", import.meta.url));
 const FIXTURES_ROOT = join(HERE, "..", "fixtures");
 
-function parseArgs(argv: string[]): { database: string } {
-  const idx = argv.indexOf("--database");
-  const value = idx !== -1 ? argv[idx + 1] : undefined;
-  const database = value ?? process.env.MRPLEX_DATABASE ?? "sqlite:./mrplex.db";
-  return { database: normalizeDatabaseUrl(database) };
-}
+/** Frontmatter fields the starship fixture opts into the link graph. */
+const STARSHIP_LINK_CONFIG: LinkConfigOverride = {
+  fields: ["reports_to", "commander", "crew", "author", "mission", "maintainer", "related"],
+};
+
+/** The fixture folders `main()` seeds, in order, with their repo config. */
+const FIXTURE_REPOS: { fixtureDir: string; repoSlug: string; linkConfig?: LinkConfigOverride }[] = [
+  { fixtureDir: "notes", repoSlug: "notes" },
+  { fixtureDir: "starship", repoSlug: "starship", linkConfig: STARSHIP_LINK_CONFIG },
+];
+
+export type SeedRepoOptions = {
+  /** Fixture folder name under fixtures/ (e.g. "starship"). */
+  fixtureDir: string;
+  /** Repo slug to create and seed into. */
+  repoSlug: string;
+  /** Slug of the author user to attribute versions to. Created if absent. */
+  authorSlug?: string;
+  /** Per-repo link-config override; sets link_config before backfill. */
+  linkConfig?: LinkConfigOverride | null;
+  /** Deterministic clock — returns an ISO timestamp per call. */
+  clock?: () => string;
+};
+
+export type SeedRepoResult = {
+  repoId: number;
+  authorId: number;
+  documents: number;
+  edges: number;
+};
 
 function walkMarkdown(dir: string, out: string[] = []): string[] {
   for (const name of readdirSync(dir)) {
@@ -35,6 +68,73 @@ function walkMarkdown(dir: string, out: string[] = []): string[] {
   return out;
 }
 
+function defaultClock(): () => string {
+  let n = 0;
+  return () => new Date(Date.UTC(2026, 7, 13, 0, 0, n++)).toISOString();
+}
+
+/**
+ * Seed one fixture folder into one repo, then backfill its link index.
+ *
+ * Adapter-level writes (version_insert) mirror the seed script's original
+ * approach — fast and kernel-free. Because those writes bypass the kernel's
+ * in-transaction link maintenance, the derived index starts empty; the closing
+ * `backfillRepoLinks` rebuilds it under the repo's effective link config so
+ * `$in` / `$has` / `$backlinks` / `$links` resolve. Refuses to seed a repo slug
+ * that already exists, so re-running against a live db is a clear error rather
+ * than silent duplication.
+ */
+export async function seedRepo(storage: Storage, opts: SeedRepoOptions): Promise<SeedRepoResult> {
+  const authorSlug = opts.authorSlug ?? "alice";
+  const clock = opts.clock ?? defaultClock();
+
+  if (await storage.repos_by_slug(opts.repoSlug)) {
+    throw new Error(`seed: repo "${opts.repoSlug}" already exists — refusing to seed over it.`);
+  }
+
+  const author =
+    (await storage.users_by_slug(authorSlug)) ??
+    (await storage.users_create({ slug: authorSlug, created_at: clock() }));
+  const repo = await storage.repos_create({ slug: opts.repoSlug, created_at: clock() });
+
+  if (opts.linkConfig != null) {
+    await storage.repos_set_link_config(repo.id, JSON.stringify(opts.linkConfig));
+  }
+
+  const root = join(FIXTURES_ROOT, opts.fixtureDir);
+  const files = walkMarkdown(root).sort();
+  for (const file of files) {
+    const rel = relative(root, file).split("\\").join("/");
+    const raw = readFileSync(file, "utf8");
+    const { frontmatter_raw, body } = split(raw);
+    const frontmatter = parseFrontmatter(frontmatter_raw);
+    const doc = await storage.documents_create(repo.id);
+    await storage.version_insert({
+      document_id: doc.id,
+      repo_id: repo.id,
+      prev_id: null,
+      path: rel,
+      frontmatter_raw,
+      frontmatter,
+      body,
+      author_id: author.id,
+      created_at: clock(),
+    });
+  }
+
+  const config = effectiveLinkConfig(LINK_DEFAULTS, opts.linkConfig ?? null);
+  const { edges } = await backfillRepoLinks(storage, repo.id, config);
+
+  return { repoId: repo.id, authorId: author.id, documents: files.length, edges };
+}
+
+function parseArgs(argv: string[]): { database: string } {
+  const idx = argv.indexOf("--database");
+  const value = idx !== -1 ? argv[idx + 1] : undefined;
+  const database = value ?? process.env.MRPLEX_DATABASE ?? "sqlite:./mrplex.db";
+  return { database: normalizeDatabaseUrl(database) };
+}
+
 async function assertSeedable(storage: Storage): Promise<void> {
   const users = (await storage.users_list()).filter((u) => u.slug !== "system");
   const repos = await storage.repos_list();
@@ -43,75 +143,27 @@ async function assertSeedable(storage: Storage): Promise<void> {
   }
 }
 
-function isoAt(offsetSec: number): string {
-  return new Date(Date.UTC(2026, 7, 13, 0, 0, offsetSec)).toISOString();
-}
-
 async function main(): Promise<void> {
   const args = parseArgs(process.argv);
   console.error(`seed: opening ${args.database}`);
   const storage = await openStorage(args.database);
   try {
     await assertSeedable(storage);
-    let clock = 0;
-
-    const alice = await storage.users_create({ slug: "alice", created_at: isoAt(clock++) });
-    const notes = await storage.repos_create({ slug: "notes", created_at: isoAt(clock++) });
-
-    // Walk the notes fixture directory.
-    const notesRoot = join(FIXTURES_ROOT, "notes");
-    const files = walkMarkdown(notesRoot).sort();
-    const paths = new Map<string, { docId: number; firstVersion: number }>();
-
-    for (const file of files) {
-      const rel = relative(notesRoot, file).split("\\").join("/");
-      const raw = readFileSync(file, "utf8");
-      const { frontmatter_raw, body } = split(raw);
-      const frontmatter = parseFrontmatter(frontmatter_raw);
-      const doc = await storage.documents_create(notes.id);
-      const v = await storage.version_insert({
-        document_id: doc.id,
-        repo_id: notes.id,
-        prev_id: null,
-        path: rel,
-        frontmatter_raw,
-        frontmatter,
-        body,
-        author_id: alice.id,
-        created_at: isoAt(clock++),
-      });
-      paths.set(rel, { docId: doc.id, firstVersion: v.id });
-      console.error(`seed: wrote ${rel} @ v${v.id}`);
+    const clock = defaultClock();
+    for (const { fixtureDir, repoSlug, linkConfig } of FIXTURE_REPOS) {
+      const r = await seedRepo(storage, { fixtureDir, repoSlug, linkConfig, clock });
+      console.error(`seed: ${repoSlug} — ${r.documents} documents, ${r.edges} link edges.`);
     }
-
-    const welcome = paths.get("welcome.md");
-    if (welcome) {
-      const editedRaw = readFileSync(join(notesRoot, "welcome.md"), "utf8");
-      const { frontmatter_raw, body } = split(editedRaw);
-      const frontmatter = parseFrontmatter(frontmatter_raw);
-      const v2 = await storage.version_insert({
-        document_id: welcome.docId,
-        repo_id: notes.id,
-        prev_id: welcome.firstVersion,
-        path: "welcome.md",
-        frontmatter_raw,
-        frontmatter,
-        body: `${body}\n<!-- seeded revision two -->\n`,
-        author_id: alice.id,
-        created_at: isoAt(clock++),
-      });
-      console.error(`seed: wrote welcome.md @ v${v2.id} (second revision)`);
-    }
-
-    console.error(
-      `seed: done — 1 user, 1 repo, ${files.length} documents, ${files.length + 1} versions.`,
-    );
+    console.error("seed: done.");
   } finally {
     await storage.close();
   }
 }
 
-main().catch((err) => {
-  console.error(err instanceof Error ? (err.stack ?? err.message) : String(err));
-  process.exit(1);
-});
+// Only run the CLI when executed directly, not when imported by tests.
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+  main().catch((err) => {
+    console.error(err instanceof Error ? (err.stack ?? err.message) : String(err));
+    process.exit(1);
+  });
+}
