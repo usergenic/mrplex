@@ -26,13 +26,16 @@ import { createWorker } from "../embed/worker.js";
 import { globToRegexSource } from "../kernel/auth/glob.js";
 import { type CallContext, type ScopeClaim, parseScopeClaims } from "../kernel/context.js";
 import { KernelError } from "../kernel/errors.js";
+import { createKernel } from "../kernel/kernel.js";
 import { extractSystemProperties, split as splitFrontmatter } from "../markdown/frontmatter.js";
 import { startMcpStdio } from "../mcp/server.js";
 import { startServer } from "../server/serve.js";
 import { fileAuditSink } from "../shell/audit.js";
 import { mintKey } from "../shell/keys.js";
 import { type Entitlement, PolicyError, compile, loadPolicyFile } from "../shell/policy.js";
+import { startProxyServer } from "../shell/proxy.js";
 import { startShellServer } from "../shell/serve.js";
+import { type StdioCredential, startShellStdio } from "../shell/stdio.js";
 import { normalizeDatabaseUrl, openStorage } from "../storage/registry.js";
 import { type CliConfig, loadConfig, saveConfig } from "./config.js";
 import { exitCodeForKernelError } from "./exit-codes.js";
@@ -158,6 +161,40 @@ function assertServeGate(policy: string | undefined, unsafe: boolean): void {
     (err as unknown as { code: string }).code = "cli_usage";
     throw err;
   }
+}
+
+/**
+ * Resolve a stdio credential from the launcher flags: --principal (trust-by-
+ * spawn) or --key / MRPLEX_SHELL_KEY (an API key). Exactly one must be present.
+ */
+function resolveStdioCredential(
+  principal: string | undefined,
+  key: string | undefined,
+): StdioCredential {
+  if (principal !== undefined && key !== undefined) {
+    const err = new Error("--principal and --key are mutually exclusive");
+    (err as unknown as { code: string }).code = "cli_conflict";
+    throw err;
+  }
+  if (principal !== undefined) return { kind: "principal", id: principal };
+  if (key !== undefined) return { kind: "key", key };
+  const err = new Error("mcp-stdio --policy needs a credential: --principal <id> or --key <key>");
+  (err as unknown as { code: string }).code = "cli_usage";
+  throw err;
+}
+
+/** Wire SIGINT/SIGTERM to close a stdio mount + storage, then exit. */
+function wireStdioShutdown(
+  closeMount: () => Promise<void>,
+  closeStorage: () => Promise<void>,
+): void {
+  const shutdown = async () => {
+    await closeMount().catch(() => {});
+    await closeStorage().catch(() => {});
+    process.exit(0);
+  };
+  process.on("SIGINT", () => void shutdown());
+  process.on("SIGTERM", () => void shutdown());
 }
 
 /**
@@ -478,6 +515,99 @@ function buildProgram(): Command {
             }
           }
 
+          const shutdown = async () => {
+            await handle.close();
+            process.exit(0);
+          };
+          process.on("SIGINT", () => void shutdown());
+          process.on("SIGTERM", () => void shutdown());
+        } catch (err) {
+          reportError(err);
+        }
+      })();
+    });
+
+  // -------- mcp-stdio --------
+  // Guarded stdio MCP over a local database (auth-shell plan §1 launcher mode).
+  // Under the same policy|unsafe gate as serve: a server over a local database
+  // spells out its trust posture. The credential arrives via --principal or
+  // MRPLEX_SHELL_KEY / --key (the OAuth token front lands with WS5).
+  program
+    .command("mcp-stdio")
+    .description("run an MCP session over STDIO against a local database")
+    .option("--policy <file>", "YAML policy file — resolve a guarded principal")
+    .option("--unsafe", "raw full-trust kernel over stdio, NO auth", false)
+    .option("--principal <id>", "trust-by-spawn: run as this policy principal (no credential)")
+    .addOption(new Option("--key <key>", "API key to resolve a principal").env("MRPLEX_SHELL_KEY"))
+    .option("--audit <file>", "append a JSONL audit line per call (--policy only)")
+    .action(function (this: Command) {
+      const gopts = this.optsWithGlobals<GlobalOpts>();
+      const localOpts = this.opts<{
+        policy?: string;
+        unsafe: boolean;
+        principal?: string;
+        key?: string;
+        audit?: string;
+      }>();
+      (async () => {
+        try {
+          assertServeGate(localOpts.policy, localOpts.unsafe);
+          const database = resolveDatabase(gopts);
+          const storage = await openStorage(database);
+
+          if (localOpts.policy === undefined) {
+            // Unsafe: raw kernel, launch-time --author/--scope pin the context.
+            const kernel = createKernel(storage);
+            const mount = await startMcpStdio({ kernel, context: resolveContext(gopts) });
+            wireStdioShutdown(mount.close, storage.close.bind(storage));
+            return;
+          }
+
+          const policy = loadPolicyFile(localOpts.policy);
+          const kernel = createKernel(storage);
+          const credential = resolveStdioCredential(localOpts.principal, localOpts.key);
+          const mount = await startShellStdio({
+            kernel,
+            policy,
+            credential,
+            auditSinkFor: localOpts.audit
+              ? (principal) => fileAuditSink(localOpts.audit as string, principal)
+              : undefined,
+          });
+          wireStdioShutdown(mount.close, storage.close.bind(storage));
+        } catch (err) {
+          reportError(err);
+        }
+      })();
+    });
+
+  // -------- proxy --------
+  // Fronting proxy: authenticate + enforce REST route policy, strip inbound
+  // X-Mrplex-* and inject the entitlement's, forward to a raw engine upstream.
+  // --policy is always required (an unsafe proxy is meaningless).
+  program
+    .command("proxy")
+    .description("authenticating reverse proxy in front of a raw engine upstream")
+    .requiredOption("--policy <file>", "YAML policy file")
+    .requiredOption("--upstream <target>", "unix:<socket-path> or http://<loopback:port>")
+    .option("--port <n>", "TCP port (default 8321)", parsePositiveInt)
+    .option("--host <h>", "bind host (default 127.0.0.1)")
+    .action(function (this: Command) {
+      const localOpts = this.opts<{
+        policy: string;
+        upstream: string;
+        port?: number;
+        host?: string;
+      }>();
+      (async () => {
+        try {
+          const handle = await startProxyServer({
+            policyPath: localOpts.policy,
+            upstream: localOpts.upstream,
+            host: localOpts.host,
+            port: localOpts.port,
+          });
+          process.on("SIGHUP", () => handle.reloadPolicy());
           const shutdown = async () => {
             await handle.close();
             process.exit(0);
