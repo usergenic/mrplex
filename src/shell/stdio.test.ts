@@ -8,7 +8,7 @@
 import { describe, expect, it } from "vitest";
 import { mintKey } from "./keys.js";
 import { parsePolicy } from "./policy.js";
-import { principalForCredential } from "./stdio.js";
+import { resolveCredential } from "./stdio.js";
 
 const key = mintKey();
 const policy = parsePolicy(`
@@ -27,24 +27,34 @@ principals:
     roles: [reader]
 `);
 
-describe("principalForCredential", () => {
-  it("resolves --principal trust-by-spawn when the id exists", () => {
-    expect(principalForCredential(policy, { kind: "principal", id: "bob" })).toBe("bob");
+describe("resolveCredential", () => {
+  it("resolves --principal trust-by-spawn when the id exists", async () => {
+    expect(await resolveCredential(policy, { kind: "principal", id: "bob" })).toEqual({
+      principalId: "bob",
+    });
   });
 
-  it("rejects an unknown --principal", () => {
-    expect(() => principalForCredential(policy, { kind: "principal", id: "ghost" })).toThrow(
+  it("rejects an unknown --principal", async () => {
+    await expect(resolveCredential(policy, { kind: "principal", id: "ghost" })).rejects.toThrow(
       /not defined/,
     );
   });
 
-  it("resolves a valid key to its principal", () => {
-    expect(principalForCredential(policy, { kind: "key", key: key.plaintext })).toBe("alice");
+  it("resolves a valid key to its principal", async () => {
+    expect(await resolveCredential(policy, { kind: "key", key: key.plaintext })).toEqual({
+      principalId: "alice",
+    });
   });
 
-  it("rejects an unknown key", () => {
-    expect(() => principalForCredential(policy, { kind: "key", key: mintKey().plaintext })).toThrow(
-      /does not match/,
+  it("rejects an unknown key", async () => {
+    await expect(
+      resolveCredential(policy, { kind: "key", key: mintKey().plaintext }),
+    ).rejects.toThrow(/does not match/);
+  });
+
+  it("rejects a token credential without an OIDC verifier", async () => {
+    await expect(resolveCredential(policy, { kind: "token", token: "x.y.z" })).rejects.toThrow(
+      /requires OIDC/,
     );
   });
 });

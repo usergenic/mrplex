@@ -13,32 +13,52 @@
  *
  * All three converge on the same `credential → principal → compile() →
  * guardKernel` pipeline; stdio is only special in how the credential arrives.
- * This module owns steps 1 and 2 (the OAuth path lands with WS5's oidc verifier).
  */
 
 import type { Kernel } from "../kernel/kernel.js";
 import { type StdioMount, startMcpStdio } from "../mcp/server.js";
 import { type AuditSink, guardKernel } from "./guard.js";
 import { principalForKey } from "./keys.js";
+import { type OidcVerifier, resolvePrincipalFromClaims } from "./oidc.js";
 import { type Policy, compile } from "./policy.js";
 
-export type StdioCredential = { kind: "principal"; id: string } | { kind: "key"; key: string };
+export type StdioCredential =
+  | { kind: "principal"; id: string }
+  | { kind: "key"; key: string }
+  | { kind: "token"; token: string };
+
+/** A resolved stdio caller: which principal, plus a derived author for tokens. */
+export type StdioResolution = { principalId: string; derivedAuthor?: string };
 
 /**
- * Resolve a stdio credential to a principal id against the policy, or throw a
- * clear error. `--principal` is trust-by-spawn (the id must exist, but no
- * secret is checked); a key is verified by hash like the HTTP front.
+ * Resolve a stdio credential to a principal against the policy, or throw a
+ * clear error. `--principal` is trust-by-spawn (the id must exist, no secret
+ * checked); a key is verified by hash; a token is verified as a JWT (requires
+ * an OIDC verifier) and matched to a principal by its oidc binding.
  */
-export function principalForCredential(policy: Policy, cred: StdioCredential): string {
+export async function resolveCredential(
+  policy: Policy,
+  cred: StdioCredential,
+  oidc?: OidcVerifier,
+): Promise<StdioResolution> {
   if (cred.kind === "principal") {
     if (!(cred.id in policy.principals)) {
       throw new Error(`--principal "${cred.id}" is not defined in the policy file`);
     }
-    return cred.id;
+    return { principalId: cred.id };
   }
-  const id = principalForKey(policy, cred.key);
-  if (id === null) throw new Error("MRPLEX_SHELL_KEY / --key does not match any principal");
-  return id;
+  if (cred.kind === "key") {
+    const id = principalForKey(policy, cred.key);
+    if (id === null) throw new Error("MRPLEX_SHELL_KEY / --key does not match any principal");
+    return { principalId: id };
+  }
+  // token
+  if (oidc === undefined) {
+    throw new Error("a token credential requires OIDC configuration (issuer/audience)");
+  }
+  const claims = await oidc.verify(cred.token);
+  const { principalId, author } = resolvePrincipalFromClaims(policy, claims);
+  return { principalId, derivedAuthor: author };
 }
 
 /**
@@ -50,10 +70,15 @@ export async function startShellStdio(config: {
   kernel: Kernel;
   policy: Policy;
   credential: StdioCredential;
+  oidc?: OidcVerifier;
   auditSinkFor?: (principal: string) => AuditSink;
 }): Promise<StdioMount> {
-  const principalId = principalForCredential(config.policy, config.credential);
-  const entitlement = compile(config.policy, principalId);
+  const { principalId, derivedAuthor } = await resolveCredential(
+    config.policy,
+    config.credential,
+    config.oidc,
+  );
+  const entitlement = compile(config.policy, principalId, derivedAuthor);
   const audit = config.auditSinkFor?.(principalId);
   const guarded = guardKernel(config.kernel, entitlement, audit);
   // The guard derives author + read scope from the entitlement, so no launch-

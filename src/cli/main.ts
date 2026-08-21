@@ -32,6 +32,13 @@ import { startMcpStdio } from "../mcp/server.js";
 import { startServer } from "../server/serve.js";
 import { fileAuditSink } from "../shell/audit.js";
 import { mintKey } from "../shell/keys.js";
+import {
+  type DeviceFlowConfig,
+  deviceFlowLogin,
+  loadTokenSet,
+  saveTokenSet,
+} from "../shell/login.js";
+import { type OidcVerifier, createOidcVerifier } from "../shell/oidc.js";
 import { type Entitlement, PolicyError, compile, loadPolicyFile } from "../shell/policy.js";
 import { startProxyServer } from "../shell/proxy.js";
 import { startShellServer } from "../shell/serve.js";
@@ -164,21 +171,50 @@ function assertServeGate(policy: string | undefined, unsafe: boolean): void {
 }
 
 /**
+ * Build an OIDC verifier from --oidc-issuer/--oidc-audience (both required
+ * together), or undefined when neither is given. Throws cli_usage if only one
+ * is present — a half-configured verifier would silently reject every token.
+ */
+function buildOidcVerifier(opts: {
+  oidcIssuer?: string;
+  oidcAudience?: string;
+  oidcJwksUri?: string;
+}): OidcVerifier | undefined {
+  const { oidcIssuer, oidcAudience, oidcJwksUri } = opts;
+  if (oidcIssuer === undefined && oidcAudience === undefined) return undefined;
+  if (oidcIssuer === undefined || oidcAudience === undefined) {
+    const err = new Error("--oidc-issuer and --oidc-audience must be given together");
+    (err as unknown as { code: string }).code = "cli_usage";
+    throw err;
+  }
+  return createOidcVerifier({
+    issuer: oidcIssuer,
+    audience: oidcAudience,
+    jwksUri: oidcJwksUri,
+  });
+}
+
+/**
  * Resolve a stdio credential from the launcher flags: --principal (trust-by-
  * spawn) or --key / MRPLEX_SHELL_KEY (an API key). Exactly one must be present.
  */
 function resolveStdioCredential(
   principal: string | undefined,
   key: string | undefined,
+  token: string | undefined,
 ): StdioCredential {
-  if (principal !== undefined && key !== undefined) {
-    const err = new Error("--principal and --key are mutually exclusive");
+  const given = [principal, key, token].filter((v) => v !== undefined).length;
+  if (given > 1) {
+    const err = new Error("--principal, --key, and --token are mutually exclusive");
     (err as unknown as { code: string }).code = "cli_conflict";
     throw err;
   }
   if (principal !== undefined) return { kind: "principal", id: principal };
   if (key !== undefined) return { kind: "key", key };
-  const err = new Error("mcp-stdio --policy needs a credential: --principal <id> or --key <key>");
+  if (token !== undefined) return { kind: "token", token };
+  const err = new Error(
+    "mcp-stdio --policy needs a credential: --principal <id>, --key <key>, or --token <jwt>",
+  );
   (err as unknown as { code: string }).code = "cli_usage";
   throw err;
 }
@@ -431,6 +467,9 @@ function buildProgram(): Command {
     .option("--policy <file>", "YAML policy file — run the authenticating shell (auth-shell plan)")
     .option("--unsafe", "serve the raw full-trust kernel with NO auth (say what it is)", false)
     .option("--audit <file>", "append a JSONL audit line per authenticated call (--policy only)")
+    .option("--oidc-issuer <url>", "OIDC issuer to accept JWT bearers from (--policy only)")
+    .option("--oidc-audience <aud>", "OIDC audience the JWT must carry (--policy only)")
+    .option("--oidc-jwks-uri <url>", "JWKS endpoint (default: <issuer>/.well-known/jwks.json)")
     .option("--port <n>", "TCP port (default 8321)", parsePositiveInt)
     .option("--host <h>", "bind host (default 127.0.0.1)")
     .option("--mcp-stdio", "also expose MCP over STDIO for the launch token (--unsafe only)", false)
@@ -442,6 +481,9 @@ function buildProgram(): Command {
         policy?: string;
         unsafe: boolean;
         audit?: string;
+        oidcIssuer?: string;
+        oidcAudience?: string;
+        oidcJwksUri?: string;
         port?: number;
         host?: string;
         mcpStdio: boolean;
@@ -476,6 +518,7 @@ function buildProgram(): Command {
               auditSinkFor: localOpts.audit
                 ? (principal) => fileAuditSink(localOpts.audit as string, principal)
                 : undefined,
+              oidc: buildOidcVerifier(localOpts),
             });
             process.on("SIGHUP", () => shellHandle.reloadPolicy());
             const shutdown = async () => {
@@ -530,8 +573,8 @@ function buildProgram(): Command {
   // -------- mcp-stdio --------
   // Guarded stdio MCP over a local database (auth-shell plan §1 launcher mode).
   // Under the same policy|unsafe gate as serve: a server over a local database
-  // spells out its trust posture. The credential arrives via --principal or
-  // MRPLEX_SHELL_KEY / --key (the OAuth token front lands with WS5).
+  // spells out its trust posture. The credential arrives via --principal,
+  // MRPLEX_SHELL_KEY / --key, or MRPLEX_SHELL_TOKEN / --token (an OAuth JWT).
   program
     .command("mcp-stdio")
     .description("run an MCP session over STDIO against a local database")
@@ -539,6 +582,14 @@ function buildProgram(): Command {
     .option("--unsafe", "raw full-trust kernel over stdio, NO auth", false)
     .option("--principal <id>", "trust-by-spawn: run as this policy principal (no credential)")
     .addOption(new Option("--key <key>", "API key to resolve a principal").env("MRPLEX_SHELL_KEY"))
+    .addOption(
+      new Option("--token <jwt>", "OAuth access token to resolve a principal").env(
+        "MRPLEX_SHELL_TOKEN",
+      ),
+    )
+    .option("--oidc-issuer <url>", "OIDC issuer for --token verification")
+    .option("--oidc-audience <aud>", "OIDC audience for --token verification")
+    .option("--oidc-jwks-uri <url>", "JWKS endpoint (default: <issuer>/.well-known/jwks.json)")
     .option("--audit <file>", "append a JSONL audit line per call (--policy only)")
     .action(function (this: Command) {
       const gopts = this.optsWithGlobals<GlobalOpts>();
@@ -547,6 +598,10 @@ function buildProgram(): Command {
         unsafe: boolean;
         principal?: string;
         key?: string;
+        token?: string;
+        oidcIssuer?: string;
+        oidcAudience?: string;
+        oidcJwksUri?: string;
         audit?: string;
       }>();
       (async () => {
@@ -565,11 +620,16 @@ function buildProgram(): Command {
 
           const policy = loadPolicyFile(localOpts.policy);
           const kernel = createKernel(storage);
-          const credential = resolveStdioCredential(localOpts.principal, localOpts.key);
+          const credential = resolveStdioCredential(
+            localOpts.principal,
+            localOpts.key,
+            localOpts.token,
+          );
           const mount = await startShellStdio({
             kernel,
             policy,
             credential,
+            oidc: buildOidcVerifier(localOpts),
             auditSinkFor: localOpts.audit
               ? (principal) => fileAuditSink(localOpts.audit as string, principal)
               : undefined,
@@ -618,6 +678,55 @@ function buildProgram(): Command {
           reportError(err);
         }
       })();
+    });
+
+  // -------- login --------
+  // OAuth device-authorization flow (auth-shell plan §1 login). Needs only the
+  // IdP's client config, not policy — mrplex is the resource server, the IdP is
+  // the authorization server. Caches access + refresh tokens (mode 600) for
+  // `mcp-stdio --token` to pick up.
+  program
+    .command("login")
+    .description("sign in via the OAuth device flow; cache the token for mcp-stdio")
+    .requiredOption("--device-authorization-endpoint <url>", "OAuth device authorization endpoint")
+    .requiredOption("--token-endpoint <url>", "OAuth token endpoint")
+    .requiredOption("--client-id <id>", "OAuth client id")
+    .option("--scope <scopes>", "space-delimited scopes", "openid email profile offline_access")
+    .action(function (this: Command) {
+      const localOpts = this.opts<{
+        deviceAuthorizationEndpoint: string;
+        tokenEndpoint: string;
+        clientId: string;
+        scope: string;
+      }>();
+      (async () => {
+        try {
+          const cfg: DeviceFlowConfig = {
+            deviceAuthorizationEndpoint: localOpts.deviceAuthorizationEndpoint,
+            tokenEndpoint: localOpts.tokenEndpoint,
+            clientId: localOpts.clientId,
+            scope: localOpts.scope,
+          };
+          const tokens = await deviceFlowLogin(cfg);
+          saveTokenSet(tokens);
+          process.stderr.write("login: token cached (chmod 600)\n");
+        } catch (err) {
+          process.stderr.write(`login failed: ${(err as Error).message}\n`);
+          process.exit(1);
+        }
+      })();
+    });
+
+  program
+    .command("logout")
+    .description("clear the cached OAuth token")
+    .action(() => {
+      // Overwrite with an empty token set rather than deleting — keeps the
+      // mode-600 file in place and makes the intent explicit.
+      if (loadTokenSet() !== null) {
+        saveTokenSet({ access_token: "" });
+      }
+      process.stderr.write("logout: cached token cleared\n");
     });
 
   // -------- config --------
