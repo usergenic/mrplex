@@ -471,7 +471,7 @@ export function runKernelSuite(factory: AdapterFactory): void {
           frontmatter_raw: "",
           body: "",
         });
-        const scoped: CallContext = { scope: [{ repo: "notes", read: ["public.md"] }] };
+        const scoped: CallContext = { scope: [{ repo: "notes", paths: ["public.md"] }] };
         const rows = await kernel.query(scoped, { repo: "notes" });
         expect(rows.map((r) => r.path)).toEqual(["public.md"]);
       });
@@ -761,7 +761,7 @@ export function runKernelSuite(factory: AdapterFactory): void {
         await mk(admin, "public.md", "p");
         await mk(admin, "secret/moc.md", "[p](/public.md)");
         const scoped: CallContext = {
-          scope: [{ repo: "notes", read: ["**", "!secret/**"] }],
+          scope: [{ repo: "notes", paths: ["**", "!secret/**"] }],
         };
         // Full-access caller sees public.md is referenced; the scoped caller
         // can't read the secret source, so the edge is invisible.

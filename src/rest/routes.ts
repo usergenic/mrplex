@@ -21,7 +21,11 @@ import type { PathConfigOverride } from "../kernel/path-config.js";
 import type { QuerySpec } from "../kernel/query/query.js";
 import type { Version } from "../kernel/wire.js";
 import { appendSystemProperty, extractSystemProperties } from "../markdown/frontmatter.js";
-import { contextFromHeaders } from "../server/headers.js";
+import {
+  type ContextForRequest,
+  type KernelForRequest,
+  contextFromHeaders,
+} from "../server/headers.js";
 import { httpErrorForThrowable } from "../server/http-error.js";
 import type { Storage } from "../storage/types.js";
 import { etagOf, parseIfMatch, parseIfNoneMatch } from "./conditional.js";
@@ -39,6 +43,18 @@ export type RestMount = {
 export type RestConfig = {
   kernel: Kernel;
   storage: Storage;
+  /**
+   * How each request becomes a CallContext. Defaults to reading the
+   * `X-Mrplex-*` headers; an authenticating shell substitutes an
+   * entitlement-derived context here.
+   */
+  contextForRequest?: ContextForRequest;
+  /**
+   * How each request obtains its Kernel. Defaults to the shared `kernel`; an
+   * authenticating shell returns a per-principal guarded kernel (and may throw
+   * to reject the request before any dispatch).
+   */
+  kernelForRequest?: KernelForRequest;
 };
 
 // -----------------------------------------------------------------------------
@@ -204,10 +220,15 @@ function queryEtag(versions: readonly Version[]): string {
 
 export function mountRestSurface(config: RestConfig): RestMount {
   const { kernel, storage } = config;
+  const contextForRequest = config.contextForRequest ?? contextFromHeaders;
+  const kernelForRequest = config.kernelForRequest ?? (() => kernel);
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     try {
-      await dispatch(req, res, kernel, storage);
+      // Resolve the per-request kernel FIRST — the shell authenticates here and
+      // may throw (e.g. 401) before any routing happens.
+      const reqKernel = await kernelForRequest(req);
+      await dispatch(req, res, reqKernel, storage, contextForRequest);
     } catch (err) {
       writeError(res, err);
     }
@@ -221,6 +242,7 @@ async function dispatch(
   res: ServerResponse,
   kernel: Kernel,
   storage: Storage,
+  contextForRequest: ContextForRequest,
 ): Promise<void> {
   const { segments, query } = parseUrl(req.url ?? "/");
   const method = (req.method ?? "GET").toUpperCase();
@@ -233,12 +255,12 @@ async function dispatch(
 
   // /query — GET or POST.
   if (segments[0] === "query" && segments.length === 1) {
-    return dispatchQuery(req, res, kernel, query, method);
+    return dispatchQuery(req, res, kernel, query, method, contextForRequest);
   }
 
   // /repos and everything under it (config, docs, versions, history).
   if (segments[0] === "repos") {
-    return dispatchRepos(req, res, kernel, storage, segments, query, method);
+    return dispatchRepos(req, res, kernel, storage, segments, query, method, contextForRequest);
   }
 
   notFound(res);
@@ -256,9 +278,10 @@ async function dispatchRepos(
   segments: string[],
   query: URLSearchParams,
   method: string,
+  contextForRequest: ContextForRequest,
 ): Promise<void> {
   void storage;
-  const ctx = contextFromHeaders(req);
+  const ctx = await contextForRequest(req);
 
   // GET /repos, POST /repos
   if (segments.length === 1) {
@@ -591,8 +614,9 @@ async function dispatchQuery(
   kernel: Kernel,
   query: URLSearchParams,
   method: string,
+  contextForRequest: ContextForRequest,
 ): Promise<void> {
-  const ctx = contextFromHeaders(req);
+  const ctx = await contextForRequest(req);
 
   let spec: QuerySpec;
   if (method === "GET") {

@@ -13,6 +13,29 @@
 
 import type { IncomingMessage } from "node:http";
 import { type CallContext, parseScopeClaims } from "../kernel/context.js";
+import type { Kernel } from "../kernel/kernel.js";
+
+/**
+ * How a surface turns a request into the `CallContext` it dispatches with.
+ * The REST and MCP mounts accept one of these instead of hard-calling
+ * [[contextFromHeaders]], so an authenticating shell can substitute an
+ * entitlement-derived context (author + read scope from a credential, not
+ * from client-supplied headers) without forking the surface code. The default
+ * everywhere is `contextFromHeaders`. May be async — a shell front verifying a
+ * JWT does I/O; the header default does not.
+ */
+export type ContextForRequest = (req: IncomingMessage) => CallContext | Promise<CallContext>;
+
+/**
+ * How a surface obtains the `Kernel` to dispatch a request against. The default
+ * (a closure returning the one shared kernel) is what the raw engine uses; the
+ * auth shell supplies a factory that authenticates the request and returns a
+ * per-principal *guarded* kernel — so write/destructive policy lives in the
+ * decorator, not in the surface. May throw (auth failure) or be async
+ * (credential verification does I/O); the surface maps a throw to its error
+ * response, so an `HttpResponseError(401, "unauthorized")` becomes a clean 401.
+ */
+export type KernelForRequest = (req: IncomingMessage) => Kernel | Promise<Kernel>;
 
 export function contextFromHeaders(req: IncomingMessage): CallContext {
   const ctx: CallContext = {};

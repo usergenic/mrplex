@@ -2,7 +2,7 @@
 
 *Markdown Repos, plexed.* A queryable, versioned store for Markdown documents with YAML frontmatter.
 
-See [docs/design.md](docs/design.md) for the full design.
+Two layers: a **full-trust kernel** (no in-engine auth — whoever reaches it can do anything) and an **access-and-identity shell** that wraps it (API keys / OIDC, per-path write policy, an audit log). See [docs/security.md](docs/security.md) for the trust model and deployment shapes. Prior design docs live in [docs/archive/](docs/archive/) — including the original [design.md](docs/archive/design.md) — and may be out of date where later work supersedes them.
 
 ## Features
 
@@ -32,9 +32,10 @@ npm install
 npm link          # puts `mrplex` on your PATH; alternatively, `npm install -g` after publish
 ```
 
-No bootstrap, no token — mrplex is a full-trust kernel (whoever can run the
-binary or reach the port is trusted). Point every command at the same database
-and target repo by exporting once:
+No bootstrap, no token for local use — the kernel is full-trust (whoever can run
+the binary or reach the port is trusted). Add authentication for shared or
+networked deployments with the shell (see [Authentication](#authentication)).
+Point every command at the same database and target repo by exporting once:
 
 ```bash
 export MRPLEX_DATABASE=./mrplex.db
@@ -91,14 +92,14 @@ present claim silently filters `query` and 403s out-of-claim reads:
 
 ```bash
 mrplex query --repo notes --filter 'status == "published"' \
-    --scope '[{"repo":"notes","read":["**","!secret/**"]}]'
+    --scope '[{"repo":"notes","paths":["**","!secret/**"]}]'
 ```
 
 There are no users, tokens, or per-path write policy in the engine — those are
-the shell's job. For multi-user or networked setups, front mrplex with an auth
-proxy that terminates authn, maps each credential to an author string +
-`ScopeClaim[]`, and injects them via `X-Mrplex-Author` / `X-Mrplex-Scope`
-request headers. Never expose mrplex directly to an untrusted network.
+the shell's job. For multi-user or networked setups, run the built-in
+authenticating shell instead of the raw kernel — see
+[Authentication](#authentication) below and [docs/security.md](docs/security.md).
+Never expose the raw kernel (`serve --unsafe`) directly to an untrusted network.
 
 Query — CEL filters + FTS + rank composed:
 
@@ -170,17 +171,150 @@ mrplex -r notes links repair
 mrplex -r notes links backfill
 ```
 
-Serve the HTTP surfaces and drive the CLI remotely:
+Serve the HTTP surfaces and drive the CLI remotely. `serve` must spell out its
+trust posture — exactly one of `--policy <file>` (the authenticating shell) or
+`--unsafe` (the raw full-trust kernel). It refuses to start with neither or both,
+so full trust is never a forgotten-flag accident:
 
 ```bash
-# Start the server (REST + MCP Streamable HTTP on :8321 by default)
-mrplex serve --port 8321 &
+# Full-trust local dev (no auth). --unsafe is deliberate and explicit.
+mrplex serve --unsafe --port 8321 &
 
 # Same commands, now over the network — --server takes precedence over --database
 mrplex --server http://127.0.0.1:8321 docs get greetings/hi.md
 mrplex --server http://127.0.0.1:8321 query -r notes --filter 'status == "published"'
 mrplex --server http://127.0.0.1:8321 docs diff greetings/hi.md --from v1 --to v3
 ```
+
+## Authentication
+
+For anything beyond single-user local use, run the **authenticating shell** —
+`serve --policy`. It reads a declarative YAML policy (roles, principals, grants,
+key hashes, OIDC bindings), authenticates each request, and dispatches against a
+per-principal *guarded* kernel: read visibility is narrowed, write and
+destructive ops are enforced per-path, the author is derived from the credential
+(never the client's word), and every call is audited. The kernel never learns
+any of this exists.
+
+```yaml
+# policy.yaml
+roles:
+  editor:
+    grants:
+      - repo: notes
+        read: "**"
+        write: ["drafts/**", "inbox/**"]
+  operator:
+    grants:
+      - { repo: "*", read: "**", write: "**" }
+    destructive: true
+
+principals:
+  brendan:
+    author: Brendan Baldwin <brendan@example.com>
+    roles: [operator]
+    keys:
+      - sha256:...        # `mrplex key mint brendan --policy policy.yaml`
+  ann:
+    roles: [editor]
+    oidc: { email: ann@example.com }   # author derived from the JWT
+```
+
+```bash
+# Mint an API key — prints the plaintext ONCE, appends the hash to the policy.
+mrplex key mint brendan --policy policy.yaml
+
+# Inspect a principal's effective entitlement ("why can't X write Y").
+mrplex policy check brendan --policy policy.yaml
+
+# Run the authenticating shell (embedded — no separate engine process).
+mrplex serve --policy policy.yaml --audit audit.jsonl --port 8321 &
+
+# Clients present a bearer credential; the server's policy governs them.
+curl -H "Authorization: Bearer $KEY" http://127.0.0.1:8321/repos
+
+# Accept IdP-issued JWTs too (OIDC): pin issuer + audience.
+mrplex serve --policy policy.yaml \
+    --oidc-issuer https://idp.example.com --oidc-audience https://mrplex.example.com
+mrplex login --client-id mrplex-cli \
+    --device-authorization-endpoint https://idp.example.com/oauth/device/code \
+    --token-endpoint https://idp.example.com/oauth/token \
+    --audience https://mrplex.example.com     # match the server's --oidc-audience
+```
+
+Three deployment shapes — **embedded** (`serve --policy`, one process, no engine
+listener), **launcher** (`mcp-stdio --policy`, a guarded stdio MCP session), and
+**fronting proxy** (`proxy --policy --upstream`, for topologies that must run the
+engine separately). Edit the policy file and `kill -HUP` the server to reload
+grants and key revocations without a restart. Full details, trust boundaries,
+and the header-injection contract are in [docs/security.md](docs/security.md).
+
+### Walkthrough: OIDC login with Auth0
+
+A concrete end-to-end for wiring an IdP. Auth0 is used here; the shape is the
+same for Okta, Keycloak, Entra, etc. — only the endpoint URLs differ.
+
+**1. In the Auth0 dashboard.**
+
+- Create an **API** (Applications → APIs). Its **Identifier** is the `audience`
+  — e.g. `https://mrplex.example.com`. Note the tenant issuer, which is your
+  tenant domain with a trailing slash: `https://YOUR_TENANT.us.auth0.com/`.
+- Create an application of type **Native** (the device flow needs a public
+  client). Enable the **Device Code** grant under its Advanced → Grant Types.
+  Note its **Client ID**.
+
+**2. Point the server at the tenant.** The issuer's JWKS is discovered at
+`<issuer>/.well-known/jwks.json`, so only issuer + audience are required:
+
+```bash
+mrplex serve --policy policy.yaml \
+    --oidc-issuer   https://YOUR_TENANT.us.auth0.com/ \
+    --oidc-audience https://mrplex.example.com \
+    --port 8321 &
+```
+
+**3. Bind a principal by claim.** Auth0 puts the user's email in the token; the
+shell only trusts it when `email_verified` is true (see [docs/security.md](docs/security.md)),
+so bind by `email` for verified users, or by the issuer-stable `sub` otherwise:
+
+```yaml
+principals:
+  ann:
+    roles: [editor]
+    oidc: { email: ann@example.com }        # author derived as "Name <ann@example.com>"
+  ci-bot:
+    author: ci-bot <ci@example.com>
+    roles: [editor]
+    oidc: { sub: "auth0|4b1c..." }           # service account: bind by sub
+```
+
+**4. Sign in from the CLI.** `--audience` is **required for Auth0** — without it
+Auth0 returns an *opaque* access token that fails JWKS verification; passing the
+API identifier makes it mint a verifiable JWT. Use the same value as the
+server's `--oidc-audience`:
+
+```bash
+mrplex login \
+    --client-id  YOUR_NATIVE_CLIENT_ID \
+    --device-authorization-endpoint https://YOUR_TENANT.us.auth0.com/oauth/device/code \
+    --token-endpoint                https://YOUR_TENANT.us.auth0.com/oauth/token \
+    --audience   https://mrplex.example.com \
+    --scope "openid email profile offline_access"
+# → visit the URL, enter the code; the token is cached (mode 600).
+```
+
+**5. Use the token.** `mcp-stdio` picks up the cached token automatically (or
+pass `--token` / `MRPLEX_SHELL_TOKEN` explicitly); over HTTP, present it as a
+bearer:
+
+```bash
+TOKEN=$(mrplex login ... && cat "${XDG_CONFIG_HOME:-$HOME/.config}/mrplex/token.json" | jq -r .access_token)
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8321/repos
+```
+
+Troubleshooting: a 401 with a token that *looks* valid almost always means the
+token is opaque (missing `--audience`) or the issuer/audience don't match the
+server's pins exactly (Auth0 issuers include the trailing slash).
 
 > Prefer not to `npm link`? Use `npx mrplex …` from the repo, or add
 > `./node_modules/.bin` to your `PATH`. Every `mrplex …` command in
@@ -194,11 +328,13 @@ mrplex ships **no** embedding provider — you wire one up. Two hook shapes:
 ```bash
 # HTTP endpoint — server POSTs { chunks: [...] } and expects
 # { vectors: [[...]], model: "…", dim: N }.
-mrplex serve --embed-url http://127.0.0.1:8399
+mrplex serve --unsafe --embed-url http://127.0.0.1:8399
 
 # Subprocess — one JSON line in / one JSON line out over stdin/stdout.
-mrplex serve --embed-cmd "path/to/embedder --stdio"
+mrplex serve --unsafe --embed-cmd "path/to/embedder --stdio"
 ```
+
+(The `--policy` shell accepts the same `--embed-*` flags.)
 
 Either flag can also come from `MRPLEX_EMBED_URL` / `MRPLEX_EMBED_CMD` env or CLI config. `--embed-url` and `--embed-cmd` are mutually exclusive.
 
@@ -239,7 +375,7 @@ npm run pg:up
 
 # Point mrplex at it (`--database` also honored per-command).
 export MRPLEX_DATABASE=postgres://mrplex:mrplex@localhost:5432/mrplex
-mrplex serve
+mrplex serve --unsafe
 
 # Other lifecycle scripts: `pg:down` (stop), `pg:reset` (wipe volume), `pg:logs`.
 

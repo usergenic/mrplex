@@ -156,7 +156,7 @@ describe("query — scope filter (§8.2)", () => {
     await seedDoc("notes", "public.md", {}, "");
     await seedDoc("notes", "secret/hidden.md", {}, "");
     const scoped: CallContext = {
-      scope: [{ repo: "notes", read: ["public.md"] }],
+      scope: [{ repo: "notes", paths: ["public.md"] }],
     };
     const results = await kernel.query(scoped, { repo: "notes" });
     expect(results.map((v) => v.path)).toEqual(["public.md"]);
@@ -174,7 +174,7 @@ describe("query — scope filter (§8.2)", () => {
     await seedDoc("notes", "drafts/pinned/two.md", {}, "");
     await seedDoc("notes", "drafts/three.md", {}, "");
     const scoped: CallContext = {
-      scope: [{ repo: "notes", read: ["drafts/**", "!drafts/pinned/**"] }],
+      scope: [{ repo: "notes", paths: ["drafts/**", "!drafts/pinned/**"] }],
     };
     const results = await kernel.query(scoped, { repo: "notes" });
     expect(results.map((v) => v.path).sort()).toEqual(["drafts/one.md", "drafts/three.md"]);
@@ -188,7 +188,7 @@ describe("query — scope filter (§8.2)", () => {
     for (let i = 0; i < 10; i++) await seedDoc("notes", `out/${i}.md`, {}, "");
     for (let i = 0; i < 10; i++) await seedDoc("notes", `in/${i}.md`, {}, "");
     const scoped: CallContext = {
-      scope: [{ repo: "notes", read: ["in/**"] }],
+      scope: [{ repo: "notes", paths: ["in/**"] }],
     };
     const results = await kernel.query(scoped, { repo: "notes", limit: 5 });
     expect(results).toHaveLength(5);

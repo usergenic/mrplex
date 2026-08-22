@@ -57,7 +57,7 @@ beforeEach(async () => {
 
   serveProc = spawn(
     "node",
-    [...LOADER_ARGS, "--database", dbUrl, "serve", "--port", String(PORT)],
+    [...LOADER_ARGS, "--database", dbUrl, "serve", "--unsafe", "--port", String(PORT)],
     {
       cwd: REPO_ROOT,
       env: {

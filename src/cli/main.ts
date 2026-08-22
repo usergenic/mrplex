@@ -14,8 +14,9 @@
  * itself ignores it. serve deliberately bypasses the seam — it IS the server.
  */
 
-import { readFileSync } from "node:fs";
+import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import { Command, InvalidArgumentError, Option } from "commander";
+import { parseDocument as parseYamlDocument } from "yaml";
 import type { KernelClient } from "../client/kernel-client.js";
 import { openLocalClient } from "../client/local.js";
 import { openRemoteClient } from "../client/remote-mcp.js";
@@ -25,9 +26,23 @@ import { createWorker } from "../embed/worker.js";
 import { globToRegexSource } from "../kernel/auth/glob.js";
 import { type CallContext, type ScopeClaim, parseScopeClaims } from "../kernel/context.js";
 import { KernelError } from "../kernel/errors.js";
+import { createKernel } from "../kernel/kernel.js";
 import { extractSystemProperties, split as splitFrontmatter } from "../markdown/frontmatter.js";
 import { startMcpStdio } from "../mcp/server.js";
 import { startServer } from "../server/serve.js";
+import { fileAuditSink } from "../shell/audit.js";
+import { mintKey } from "../shell/keys.js";
+import {
+  type DeviceFlowConfig,
+  deviceFlowLogin,
+  loadTokenSet,
+  saveTokenSet,
+} from "../shell/login.js";
+import { type OidcVerifier, createOidcVerifier } from "../shell/oidc.js";
+import { type Entitlement, PolicyError, compile, loadPolicyFile } from "../shell/policy.js";
+import { startProxyServer } from "../shell/proxy.js";
+import { startShellServer } from "../shell/serve.js";
+import { type StdioCredential, startShellStdio } from "../shell/stdio.js";
 import { normalizeDatabaseUrl, openStorage } from "../storage/registry.js";
 import { type CliConfig, loadConfig, saveConfig } from "./config.js";
 import { exitCodeForKernelError } from "./exit-codes.js";
@@ -137,6 +152,88 @@ function resolveServer(opts: GlobalOpts): string | undefined {
 }
 
 /**
+ * The policy|unsafe gate (auth-shell plan decision 11). A server-starting
+ * command demands EXACTLY ONE of --policy or --unsafe. Throws a cli_usage
+ * error otherwise so the CLI exits non-zero with a clear message — the raw
+ * kernel is a choice you spell out, never a default you fall into.
+ */
+function assertServeGate(policy: string | undefined, unsafe: boolean): void {
+  const hasPolicy = policy !== undefined;
+  if (hasPolicy === unsafe) {
+    const err = new Error(
+      hasPolicy
+        ? "--policy and --unsafe are mutually exclusive; pick one"
+        : "refusing to start: pass --policy <file> (authenticated) or --unsafe (full-trust, no auth)",
+    );
+    (err as unknown as { code: string }).code = "cli_usage";
+    throw err;
+  }
+}
+
+/**
+ * Build an OIDC verifier from --oidc-issuer/--oidc-audience (both required
+ * together), or undefined when neither is given. Throws cli_usage if only one
+ * is present — a half-configured verifier would silently reject every token.
+ */
+function buildOidcVerifier(opts: {
+  oidcIssuer?: string;
+  oidcAudience?: string;
+  oidcJwksUri?: string;
+}): OidcVerifier | undefined {
+  const { oidcIssuer, oidcAudience, oidcJwksUri } = opts;
+  if (oidcIssuer === undefined && oidcAudience === undefined) return undefined;
+  if (oidcIssuer === undefined || oidcAudience === undefined) {
+    const err = new Error("--oidc-issuer and --oidc-audience must be given together");
+    (err as unknown as { code: string }).code = "cli_usage";
+    throw err;
+  }
+  return createOidcVerifier({
+    issuer: oidcIssuer,
+    audience: oidcAudience,
+    jwksUri: oidcJwksUri,
+  });
+}
+
+/**
+ * Resolve a stdio credential from the launcher flags: --principal (trust-by-
+ * spawn) or --key / MRPLEX_SHELL_KEY (an API key). Exactly one must be present.
+ */
+function resolveStdioCredential(
+  principal: string | undefined,
+  key: string | undefined,
+  token: string | undefined,
+): StdioCredential {
+  const given = [principal, key, token].filter((v) => v !== undefined).length;
+  if (given > 1) {
+    const err = new Error("--principal, --key, and --token are mutually exclusive");
+    (err as unknown as { code: string }).code = "cli_conflict";
+    throw err;
+  }
+  if (principal !== undefined) return { kind: "principal", id: principal };
+  if (key !== undefined) return { kind: "key", key };
+  if (token !== undefined) return { kind: "token", token };
+  const err = new Error(
+    "mcp-stdio --policy needs a credential: --principal <id>, --key <key>, or --token <jwt>",
+  );
+  (err as unknown as { code: string }).code = "cli_usage";
+  throw err;
+}
+
+/** Wire SIGINT/SIGTERM to close a stdio mount + storage, then exit. */
+function wireStdioShutdown(
+  closeMount: () => Promise<void>,
+  closeStorage: () => Promise<void>,
+): void {
+  const shutdown = async () => {
+    await closeMount().catch(() => {});
+    await closeStorage().catch(() => {});
+    process.exit(0);
+  };
+  process.on("SIGINT", () => void shutdown());
+  process.on("SIGTERM", () => void shutdown());
+}
+
+/**
  * Resolve the target repo slug for `docs *` commands — flag → env → config.
  * Throws a friendly cli-usage error if none is set; the CLI turns that into
  * a non-zero exit.
@@ -239,6 +336,62 @@ function reportError(err: unknown): never {
   process.exit(1);
 }
 
+/**
+ * Append a minted key's hash under `principals.<id>.keys` in a policy file,
+ * preserving comments and formatting via the yaml Document API (issuance is a
+ * diff, auth-shell decision 3). Throws if the principal isn't present — mint
+ * doesn't invent principals.
+ */
+function appendKeyToPolicy(policyPath: string, principalId: string, hash: string): void {
+  const text = readFileSync(policyPath, "utf8");
+  const doc = parseYamlDocument(text);
+  const principals = doc.getIn(["principals"]);
+  if (!principals || !doc.hasIn(["principals", principalId])) {
+    const err = new Error(`policy: principal "${principalId}" not found in ${policyPath}`);
+    (err as unknown as { code: string }).code = "cli_usage";
+    throw err;
+  }
+  if (!doc.hasIn(["principals", principalId, "keys"])) {
+    doc.setIn(["principals", principalId, "keys"], doc.createNode([hash]));
+  } else {
+    const keys = doc.getIn(["principals", principalId, "keys"]) as {
+      add?: (v: unknown) => void;
+    };
+    if (typeof keys.add !== "function") {
+      const err = new Error(`policy: principals.${principalId}.keys is not a list`);
+      (err as unknown as { code: string }).code = "cli_usage";
+      throw err;
+    }
+    keys.add(hash);
+  }
+  // Atomic write: a tmp file on the same volume + rename, so an interleaved
+  // reader (a SIGHUP reload) or a racing `key mint` sees either the whole old
+  // file or the whole new one, never a torn intermediate. Doesn't prevent two
+  // concurrent mints from losing one key (last rename wins), but eliminates
+  // partial reads/writes.
+  const tmp = `${policyPath}.tmp.${process.pid}`;
+  writeFileSync(tmp, String(doc));
+  renameSync(tmp, policyPath);
+}
+
+/** Human-readable dump of an effective entitlement — the operator's "why can't
+ * X read Y" answer. */
+function renderEntitlement(principalId: string, e: Entitlement): string {
+  const claims = (list: Entitlement["read"]): string =>
+    list.length === 0
+      ? "    (none)\n"
+      : list
+          .map((c) => `    repo=${JSON.stringify(c.repo)} paths=${JSON.stringify(c.paths)}\n`)
+          .join("");
+  return (
+    `principal: ${principalId}\n` +
+    `author:    ${e.author}\n` +
+    `destructive: ${e.destructive}   impersonate: ${e.impersonate}\n` +
+    `read:\n${claims(e.read)}` +
+    `write:\n${claims(e.write)}`
+  );
+}
+
 function readFromFile(pathOrDash: string): string {
   if (pathOrDash === "-") {
     return readFileSync(0, "utf8"); // fd 0 = stdin
@@ -311,17 +464,33 @@ function buildProgram(): Command {
     });
 
   // -------- serve --------
+  // The policy|unsafe gate (auth-shell plan decision 11): a command that starts
+  // a server over a local database must spell out exactly one of --policy (run
+  // the authenticating shell) or --unsafe (raw full-trust kernel). Neither →
+  // refuse; both → refuse. Full trust is never the result of a forgotten flag.
   program
     .command("serve")
     .description("start HTTP surfaces (REST + MCP Streamable HTTP) — §7.3")
+    .option("--policy <file>", "YAML policy file — run the authenticating shell (auth-shell plan)")
+    .option("--unsafe", "serve the raw full-trust kernel with NO auth (say what it is)", false)
+    .option("--audit <file>", "append a JSONL audit line per authenticated call (--policy only)")
+    .option("--oidc-issuer <url>", "OIDC issuer to accept JWT bearers from (--policy only)")
+    .option("--oidc-audience <aud>", "OIDC audience the JWT must carry (--policy only)")
+    .option("--oidc-jwks-uri <url>", "JWKS endpoint (default: <issuer>/.well-known/jwks.json)")
     .option("--port <n>", "TCP port (default 8321)", parsePositiveInt)
     .option("--host <h>", "bind host (default 127.0.0.1)")
-    .option("--mcp-stdio", "also expose MCP over STDIO for the launch token", false)
+    .option("--mcp-stdio", "also expose MCP over STDIO for the launch token (--unsafe only)", false)
     .option("--embed-url <url>", "HTTP embedding endpoint (§5.3)")
     .option("--embed-cmd <cmd>", "subprocess embedding command (JSON-lines over stdio)")
     .action(function (this: Command) {
       const gopts = this.optsWithGlobals<GlobalOpts>();
       const localOpts = this.opts<{
+        policy?: string;
+        unsafe: boolean;
+        audit?: string;
+        oidcIssuer?: string;
+        oidcAudience?: string;
+        oidcJwksUri?: string;
         port?: number;
         host?: string;
         mcpStdio: boolean;
@@ -330,11 +499,50 @@ function buildProgram(): Command {
       }>();
       (async () => {
         try {
+          assertServeGate(localOpts.policy, localOpts.unsafe);
           const database = resolveDatabase(gopts);
           const embedCfg = resolveEmbedConfig({
             embed_url: localOpts.embedUrl,
             embed_cmd: localOpts.embedCmd,
           });
+
+          // Authenticated shell mode.
+          if (localOpts.policy !== undefined) {
+            if (localOpts.mcpStdio) {
+              const err = new Error(
+                "--mcp-stdio is unsafe-mode only; use `mrplex mcp-stdio` instead",
+              );
+              (err as unknown as { code: string }).code = "cli_conflict";
+              throw err;
+            }
+            const shellHandle = await startShellServer({
+              database,
+              policyPath: localOpts.policy,
+              host: localOpts.host,
+              port: localOpts.port,
+              embed: embedCfg,
+              auditPath: localOpts.audit,
+              auditSinkFor: localOpts.audit
+                ? (principal) => fileAuditSink(localOpts.audit as string, principal)
+                : undefined,
+              oidc: buildOidcVerifier(localOpts),
+            });
+            process.on("SIGHUP", () => shellHandle.reloadPolicy());
+            const shutdown = async () => {
+              await shellHandle.close();
+              process.exit(0);
+            };
+            process.on("SIGINT", () => void shutdown());
+            process.on("SIGTERM", () => void shutdown());
+            return;
+          }
+
+          // Unsafe raw-kernel mode.
+          if (localOpts.audit !== undefined) {
+            const err = new Error("--audit requires --policy (nothing to attribute without auth)");
+            (err as unknown as { code: string }).code = "cli_conflict";
+            throw err;
+          }
           const handle = await startServer({
             database,
             host: localOpts.host,
@@ -367,6 +575,181 @@ function buildProgram(): Command {
           reportError(err);
         }
       })();
+    });
+
+  // -------- mcp-stdio --------
+  // Guarded stdio MCP over a local database (auth-shell plan §1 launcher mode).
+  // Under the same policy|unsafe gate as serve: a server over a local database
+  // spells out its trust posture. The credential arrives via --principal,
+  // MRPLEX_SHELL_KEY / --key, or MRPLEX_SHELL_TOKEN / --token (an OAuth JWT).
+  program
+    .command("mcp-stdio")
+    .description("run an MCP session over STDIO against a local database")
+    .option("--policy <file>", "YAML policy file — resolve a guarded principal")
+    .option("--unsafe", "raw full-trust kernel over stdio, NO auth", false)
+    .option("--principal <id>", "trust-by-spawn: run as this policy principal (no credential)")
+    .addOption(new Option("--key <key>", "API key to resolve a principal").env("MRPLEX_SHELL_KEY"))
+    .addOption(
+      new Option("--token <jwt>", "OAuth access token to resolve a principal").env(
+        "MRPLEX_SHELL_TOKEN",
+      ),
+    )
+    .option("--oidc-issuer <url>", "OIDC issuer for --token verification")
+    .option("--oidc-audience <aud>", "OIDC audience for --token verification")
+    .option("--oidc-jwks-uri <url>", "JWKS endpoint (default: <issuer>/.well-known/jwks.json)")
+    .option("--audit <file>", "append a JSONL audit line per call (--policy only)")
+    .action(function (this: Command) {
+      const gopts = this.optsWithGlobals<GlobalOpts>();
+      const localOpts = this.opts<{
+        policy?: string;
+        unsafe: boolean;
+        principal?: string;
+        key?: string;
+        token?: string;
+        oidcIssuer?: string;
+        oidcAudience?: string;
+        oidcJwksUri?: string;
+        audit?: string;
+      }>();
+      (async () => {
+        try {
+          assertServeGate(localOpts.policy, localOpts.unsafe);
+          const database = resolveDatabase(gopts);
+
+          if (localOpts.policy === undefined) {
+            // Unsafe: raw kernel, launch-time --author/--scope pin the context.
+            const storage = await openStorage(database);
+            const kernel = createKernel(storage);
+            const mount = await startMcpStdio({ kernel, context: resolveContext(gopts) });
+            wireStdioShutdown(mount.close, storage.close.bind(storage));
+            return;
+          }
+
+          // Resolve everything fallible (policy parse, credential shape, OIDC
+          // config) BEFORE opening storage, so a malformed policy — a real
+          // operator failure mode — fails without leaking a db connection.
+          const policy = loadPolicyFile(localOpts.policy);
+          const credential = resolveStdioCredential(
+            localOpts.principal,
+            localOpts.key,
+            localOpts.token,
+          );
+          const oidc = buildOidcVerifier(localOpts);
+          const storage = await openStorage(database);
+          const kernel = createKernel(storage);
+          const mount = await startShellStdio({
+            kernel,
+            policy,
+            credential,
+            oidc,
+            auditSinkFor: localOpts.audit
+              ? (principal) => fileAuditSink(localOpts.audit as string, principal)
+              : undefined,
+          });
+          wireStdioShutdown(mount.close, storage.close.bind(storage));
+        } catch (err) {
+          reportError(err);
+        }
+      })();
+    });
+
+  // -------- proxy --------
+  // Fronting proxy: authenticate + enforce REST route policy, strip inbound
+  // X-Mrplex-* and inject the entitlement's, forward to a raw engine upstream.
+  // --policy is always required (an unsafe proxy is meaningless).
+  program
+    .command("proxy")
+    .description("authenticating reverse proxy in front of a raw engine upstream")
+    .requiredOption("--policy <file>", "YAML policy file")
+    .requiredOption("--upstream <target>", "unix:<socket-path> or http://<loopback:port>")
+    .option("--audit <file>", "append a JSONL audit line per authenticated request")
+    .option("--port <n>", "TCP port (default 8321)", parsePositiveInt)
+    .option("--host <h>", "bind host (default 127.0.0.1)")
+    .action(function (this: Command) {
+      const localOpts = this.opts<{
+        policy: string;
+        upstream: string;
+        audit?: string;
+        port?: number;
+        host?: string;
+      }>();
+      (async () => {
+        try {
+          const handle = await startProxyServer({
+            policyPath: localOpts.policy,
+            upstream: localOpts.upstream,
+            host: localOpts.host,
+            port: localOpts.port,
+            auditSinkFor: localOpts.audit
+              ? (principal) => fileAuditSink(localOpts.audit as string, principal)
+              : undefined,
+          });
+          process.on("SIGHUP", () => handle.reloadPolicy());
+          const shutdown = async () => {
+            await handle.close();
+            process.exit(0);
+          };
+          process.on("SIGINT", () => void shutdown());
+          process.on("SIGTERM", () => void shutdown());
+        } catch (err) {
+          reportError(err);
+        }
+      })();
+    });
+
+  // -------- login --------
+  // OAuth device-authorization flow (auth-shell plan §1 login). Needs only the
+  // IdP's client config, not policy — mrplex is the resource server, the IdP is
+  // the authorization server. Caches access + refresh tokens (mode 600) for
+  // `mcp-stdio --token` to pick up.
+  program
+    .command("login")
+    .description("sign in via the OAuth device flow; cache the token for mcp-stdio")
+    .requiredOption("--device-authorization-endpoint <url>", "OAuth device authorization endpoint")
+    .requiredOption("--token-endpoint <url>", "OAuth token endpoint")
+    .requiredOption("--client-id <id>", "OAuth client id")
+    .option("--scope <scopes>", "space-delimited scopes", "openid email profile offline_access")
+    .option(
+      "--audience <aud>",
+      "OAuth audience — required by Auth0 (and some IdPs) to issue a JWT access token rather than an opaque one; use the same value as the server's --oidc-audience",
+    )
+    .action(function (this: Command) {
+      const localOpts = this.opts<{
+        deviceAuthorizationEndpoint: string;
+        tokenEndpoint: string;
+        clientId: string;
+        scope: string;
+        audience?: string;
+      }>();
+      (async () => {
+        try {
+          const cfg: DeviceFlowConfig = {
+            deviceAuthorizationEndpoint: localOpts.deviceAuthorizationEndpoint,
+            tokenEndpoint: localOpts.tokenEndpoint,
+            clientId: localOpts.clientId,
+            scope: localOpts.scope,
+            audience: localOpts.audience,
+          };
+          const tokens = await deviceFlowLogin(cfg);
+          saveTokenSet(tokens);
+          process.stderr.write("login: token cached (chmod 600)\n");
+        } catch (err) {
+          process.stderr.write(`login failed: ${(err as Error).message}\n`);
+          process.exit(1);
+        }
+      })();
+    });
+
+  program
+    .command("logout")
+    .description("clear the cached OAuth token")
+    .action(() => {
+      // Overwrite with an empty token set rather than deleting — keeps the
+      // mode-600 file in place and makes the intent explicit.
+      if (loadTokenSet() !== null) {
+        saveTokenSet({ access_token: "" });
+      }
+      process.stderr.write("logout: cached token cleared\n");
     });
 
   // -------- config --------
@@ -423,6 +806,67 @@ function buildProgram(): Command {
         process.stdout.write(
           `database: ${c.database ?? "(unset)"}\nserver:   ${c.server ?? "(unset)"}\nrepo:     ${c.repo ?? "(unset)"}\nauthor:   ${c.author ?? "(unset)"}\ntoken:    ${c.token ? "(set)" : "(unset)"}\n`,
         );
+      }
+    });
+
+  // -------- key (policy tooling) --------
+  // `key mint` and `policy check` read/edit the policy file by definition, so
+  // they take --policy directly and never touch the serve gate (auth-shell §1
+  // "Policy tooling").
+  const key = program.command("key").description("API-key tooling for the auth shell");
+  key
+    .command("mint <principal>")
+    .description("generate a new API key; print the plaintext ONCE and the sha256 hash to store")
+    .option("--policy <file>", "append the hash under the principal's `keys:` in this policy file")
+    .action(function (this: Command, principal: string) {
+      const localOpts = this.opts<{ policy?: string }>();
+      try {
+        const { plaintext, hash } = mintKey();
+        if (localOpts.policy !== undefined) {
+          appendKeyToPolicy(localOpts.policy, principal, hash);
+          process.stderr.write(`key: appended hash under principals.${principal}.keys\n`);
+        } else {
+          process.stderr.write(
+            `key: add this line under principals.${principal}.keys in your policy file:\n  - ${hash}\n`,
+          );
+        }
+        // The plaintext is shown ONCE, on stdout, so it can be piped/captured;
+        // it is never stored — only the hash lives in the policy file.
+        process.stdout.write(`${plaintext}\n`);
+      } catch (err) {
+        reportError(err);
+      }
+    });
+
+  // -------- policy --------
+  const policy = program.command("policy").description("policy-file tooling for the auth shell");
+  policy
+    .command("check [principal]")
+    .description("validate a policy file; with a principal, print its effective entitlement")
+    .requiredOption("--policy <file>", "policy file to load")
+    .action(function (this: Command, principal: string | undefined) {
+      const localOpts = this.opts<{ policy: string }>();
+      const gopts = this.optsWithGlobals<GlobalOpts>();
+      try {
+        const loaded = loadPolicyFile(localOpts.policy);
+        if (principal === undefined) {
+          const nP = Object.keys(loaded.principals).length;
+          const nR = Object.keys(loaded.roles).length;
+          process.stderr.write(`policy OK: ${nR} role(s), ${nP} principal(s)\n`);
+          return;
+        }
+        const entitlement = compile(loaded, principal);
+        if (gopts.json) {
+          process.stdout.write(`${JSON.stringify(entitlement, null, 2)}\n`);
+        } else {
+          process.stdout.write(renderEntitlement(principal, entitlement));
+        }
+      } catch (err) {
+        if (err instanceof PolicyError) {
+          process.stderr.write(`policy: ${err.message}\n`);
+          process.exit(1);
+        }
+        reportError(err);
       }
     });
 

@@ -15,6 +15,23 @@
 
 import { KernelError, type KernelErrorCode } from "../kernel/errors.js";
 
+/**
+ * An error that already knows its HTTP shape. The engine never throws this —
+ * it exists so a fronting layer (the auth shell) can reject a request with a
+ * status the surface catalog doesn't cover (e.g. 401 `unauthorized`) without
+ * the surface having to import the shell. `httpErrorForThrowable` honors it.
+ */
+export class HttpResponseError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly code: string,
+    public readonly data: Record<string, unknown> = {},
+  ) {
+    super(code);
+    this.name = "HttpResponseError";
+  }
+}
+
 export type HttpErrorBody =
   | { code: KernelErrorCode; data: Record<string, unknown> }
   | { code: "internal_error"; data: Record<string, unknown> };
@@ -88,6 +105,9 @@ export function httpErrorForKernelError(err: KernelError): HttpError {
  */
 export function httpErrorForThrowable(err: unknown): HttpError {
   if (err instanceof KernelError) return httpErrorForKernelError(err);
+  if (err instanceof HttpResponseError) {
+    return { status: err.status, body: { code: err.code, data: err.data } as HttpErrorBody };
+  }
   return {
     status: 500,
     body: { code: "internal_error", data: {} },

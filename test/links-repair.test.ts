@@ -204,7 +204,7 @@ describe("mrplex links repair", () => {
 
     const scoped: CallContext = {
       author: "alice",
-      scope: [{ repo: "notes", read: ["**", "!locked/**"] }],
+      scope: [{ repo: "notes", paths: ["**", "!locked/**"] }],
     };
     const res = await kernel.links.repair(scoped, "notes");
     expect(res.repaired).toEqual([]);

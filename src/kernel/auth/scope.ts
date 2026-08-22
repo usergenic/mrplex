@@ -29,13 +29,13 @@ const asList = (v: string | string[] | undefined): string[] =>
 
 /**
  * Normalized claim: repo patterns split from the `"*"` fast-path, plus the
- * read globs. `hasWildcard` distinguishes the dynamic all-repos claim (covers
+ * path globs. `hasWildcard` distinguishes the dynamic all-repos claim (covers
  * repos created after the call is issued) for scope-group compilation.
  */
 export type ClaimMatcher = {
   repoPatterns: string[];
   hasWildcard: boolean;
-  read: string[];
+  paths: string[];
 };
 
 export function normalizeClaims(claims: readonly ScopeClaim[]): ClaimMatcher[] {
@@ -44,7 +44,7 @@ export function normalizeClaims(claims: readonly ScopeClaim[]): ClaimMatcher[] {
     return {
       repoPatterns,
       hasWildcard: repoPatterns.includes("*"),
-      read: asList(c.read),
+      paths: asList(c.paths),
     };
   });
 }
@@ -66,7 +66,7 @@ export function claimsGrantRead(
 ): boolean {
   for (const m of matchers) {
     if (!matcherCoversRepo(m, repoSlug)) continue;
-    if (pathMatchesGlobs(m.read, path)) return true;
+    if (pathMatchesGlobs(m.paths, path)) return true;
   }
   return false;
 }
@@ -83,7 +83,7 @@ export function claimsGrantRepo(matchers: readonly ClaimMatcher[], repoSlug: str
 /**
  * Compile claims into `SearchPlan` scope groups against the current repo set.
  * A wildcard claim maps to the dynamic `"*"` group; a concrete claim resolves
- * its repo patterns to the matching current repo ids. Claims with no read
+ * its repo patterns to the matching current repo ids. Claims with no path
  * globs contribute nothing (they grant no path).
  */
 export function claimsToScopeGroups(
@@ -92,15 +92,15 @@ export function claimsToScopeGroups(
 ): ScopeGroup[] {
   const groups: ScopeGroup[] = [];
   for (const m of matchers) {
-    if (m.read.length === 0) continue;
+    if (m.paths.length === 0) continue;
     if (m.hasWildcard) {
-      groups.push({ repos: "*", globs: m.read });
+      groups.push({ repos: "*", globs: m.paths });
       continue;
     }
     const ids = repos
       .filter((r) => m.repoPatterns.some((p) => slugMatchesPattern(p, r.slug)))
       .map((r) => r.id);
-    if (ids.length > 0) groups.push({ repos: ids, globs: m.read });
+    if (ids.length > 0) groups.push({ repos: ids, globs: m.paths });
   }
   return groups;
 }

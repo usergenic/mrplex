@@ -22,13 +22,30 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import type { CallContext } from "../kernel/context.js";
 import { KernelError } from "../kernel/errors.js";
 import type { Kernel } from "../kernel/kernel.js";
-import { contextFromHeaders } from "../server/headers.js";
+import {
+  type ContextForRequest,
+  type KernelForRequest,
+  contextFromHeaders,
+} from "../server/headers.js";
+import { httpErrorForThrowable } from "../server/http-error.js";
 import type { Storage } from "../storage/types.js";
 import { TOOL_REGISTRY, toolByName } from "./tools.js";
 
 export type McpConfig = {
   kernel: Kernel;
   storage: Storage;
+  /**
+   * How each request becomes a CallContext. Defaults to reading the
+   * `X-Mrplex-*` headers; an authenticating shell substitutes an
+   * entitlement-derived context here.
+   */
+  contextForRequest?: ContextForRequest;
+  /**
+   * How each request obtains its Kernel. Defaults to the shared `kernel`; an
+   * authenticating shell returns a per-principal guarded kernel (and may throw
+   * to reject the request before the SDK parses the frame).
+   */
+  kernelForRequest?: KernelForRequest;
 };
 
 export type McpMount = {
@@ -46,28 +63,32 @@ export type McpMount = {
  */
 export async function mountMcpStreamableHttp(config: McpConfig): Promise<McpMount> {
   const { kernel } = config;
+  const contextForRequest = config.contextForRequest ?? contextFromHeaders;
+  const kernelForRequest = config.kernelForRequest ?? (() => kernel);
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    // Read the per-request CallContext from headers. A malformed X-Mrplex-Scope
-    // is a client error (KernelError "filter_invalid") — refuse before the SDK
-    // parses the frame.
+    // Resolve the per-request kernel and CallContext before the SDK parses the
+    // frame. Either step may throw: the shell's `kernelForRequest` rejects an
+    // unauthenticated caller (HttpResponseError → its own status), and a
+    // malformed X-Mrplex-Scope is a KernelError "filter_invalid" → 400. A bad
+    // credential or claim is a loud error, never a silent full-access fallback.
+    let reqKernel: Kernel;
     let ctx: CallContext;
     try {
-      ctx = contextFromHeaders(req);
+      reqKernel = await kernelForRequest(req);
+      ctx = await contextForRequest(req);
     } catch (err) {
-      res.statusCode = 400;
+      const { status, body } = httpErrorForThrowable(err);
+      // A generic 500 body from a non-kernel throwable is opaque here; keep the
+      // MCP-friendly filter_invalid shape for the malformed-input case.
+      const payload = err instanceof KernelError ? { code: err.code, data: err.data } : body;
+      res.statusCode = err instanceof KernelError ? 400 : status;
       res.setHeader("Content-Type", "application/json");
-      res.end(
-        JSON.stringify(
-          err instanceof KernelError
-            ? { code: err.code, data: err.data }
-            : { code: "filter_invalid", data: { reason: String(err) } },
-        ),
-      );
+      res.end(JSON.stringify(payload));
       return;
     }
 
-    const server = buildMcpServer(kernel, () => ctx);
+    const server = buildMcpServer(reqKernel, () => ctx);
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined, // stateless per m3-plan decision 3
       enableJsonResponse: true,
