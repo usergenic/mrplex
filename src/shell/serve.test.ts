@@ -115,6 +115,67 @@ describe("authentication", () => {
   });
 });
 
+describe("token in URL path (/k/<token>/…)", () => {
+  it("authenticates a read via the path prefix — no Authorization header", async () => {
+    const r = await fetch(`${base}/k/${encodeURIComponent(editorKey.plaintext)}/repos`);
+    expect(r.status).toBe(200);
+  });
+
+  it("routes /k/<token>/mcp to the MCP surface (not 404)", async () => {
+    const r = await fetch(`${base}/k/${encodeURIComponent(operatorKey.plaintext)}/mcp`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-06-18",
+          capabilities: {},
+          clientInfo: { name: "t", version: "0" },
+        },
+      }),
+    });
+    // The point is it reached the authenticated MCP surface — not 401/404.
+    expect(r.status).toBe(200);
+  });
+
+  it("enforces policy on a path-authenticated write", async () => {
+    // Editor may write drafts/** but not published/**.
+    const ok = await fetch(
+      `${base}/k/${encodeURIComponent(editorKey.plaintext)}/repos/notes/docs/drafts/p.md`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "text/markdown", "If-None-Match": "*" },
+        body: "x",
+      },
+    );
+    expect(ok.status).toBe(201);
+    const denied = await fetch(
+      `${base}/k/${encodeURIComponent(editorKey.plaintext)}/repos/notes/docs/published/p.md`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "text/markdown", "If-None-Match": "*" },
+        body: "x",
+      },
+    );
+    expect(denied.status).toBe(403);
+  });
+
+  it("401s a bad token in the path", async () => {
+    const r = await fetch(`${base}/k/${encodeURIComponent(mintKey().plaintext)}/repos`);
+    expect(r.status).toBe(401);
+  });
+
+  it("still 401s a /k/ prefix with an empty token (falls through to no-credential)", async () => {
+    const r = await fetch(`${base}/k//repos`);
+    expect(r.status).toBe(401);
+  });
+});
+
 describe("write policy over the wire", () => {
   it("allows an editor to create inside drafts/**", async () => {
     const r = await req("PUT", "/repos/notes/docs/drafts/new.md", {

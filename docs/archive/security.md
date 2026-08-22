@@ -129,6 +129,28 @@ load, where the operator can see it.
 A bearer is tried as an API key first (no I/O), then as a JWT when an OIDC
 verifier is configured.
 
+### Credential delivery: header vs. URL path
+
+The credential normally arrives in the `Authorization: Bearer <token>` header.
+The embedded `serve` also accepts it as a **URL path prefix** —
+`https://host/k/<token>/mcp`, `https://host/k/<token>/repos/...` — for clients
+that can set a URL but not a header (some MCP connectors, ChatGPT among them).
+The `<token>` is the *same* credential (an API key or a JWT); nothing about
+issuance, hashing, or revocation changes. The shell strips the `/k/<token>`
+prefix before routing, so the rest of the pipeline is identical to the header
+path, and the header still wins when both are present.
+
+**Security note — this trades header-secrecy for path-secrecy.** Under HTTPS the
+full path is inside the TLS envelope, so no network observer sees the token, and
+MCP is server-to-server (no browser/referrer leakage). mrplex rewrites `req.url`
+to the clean form *before* anything routes or logs on it, so its own logs and
+audit records never contain the token. **But an upstream reverse proxy or
+ingress may log the original request line, including the secret** — so prefer
+the header where the client allows it, and if you use the path form, ensure any
+fronting proxy scrubs `/k/<token>` from its access logs (or don't log paths). A
+leaked path-token is a leaked key: rotate it with `key mint` and drop the old
+hash from the policy.
+
 ## Deployment shapes
 
 ### Embedded (primary) — `mrplex serve --policy policy.yaml`
