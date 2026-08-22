@@ -15,12 +15,14 @@
  */
 
 import { type CallContext, validateScopeClaims } from "../kernel/context.js";
+import { KernelError } from "../kernel/errors.js";
 import type { Kernel } from "../kernel/kernel.js";
 import type { PathConfigOverride } from "../kernel/path-config.js";
 import type { QuerySpec } from "../kernel/query/query.js";
 import type { Version } from "../kernel/wire.js";
 import type { LinkConfigOverride } from "../links/link-config.js";
 import { appendSystemProperty, extractSystemProperties } from "../markdown/frontmatter.js";
+import { QUERY_SYNTAX_DOC } from "./query-syntax.js";
 import { renderJson, renderRepoList, renderVersion, renderVersionList } from "./render.js";
 
 /**
@@ -560,23 +562,63 @@ export const TOOL_REGISTRY: ToolEntry[] = [
   // ---- query ----
   {
     name: "query",
-    description: "Query documents — CEL filter + FTS text; §5.",
+    description:
+      "Query documents. Three composable modes that intersect when combined: `filter` (a CEL " +
+      "boolean expression over frontmatter fields and $-prefixed intrinsics), `text` (full-text " +
+      "search over bodies), and `rank` (semantic similarity via embeddings). Returns current " +
+      "versions only, ordered by rank score, else text relevance, else last-update time " +
+      "descending. Filter examples: " +
+      `status == "published" && "pricing" in list(tags)` +
+      " (list() matches scalar-or-list frontmatter uniformly) — " +
+      `$path.startsWith("guides/")` +
+      " ($-intrinsics: $path, $updated_at, $body) — " +
+      `$in("moc/**") && !$in("moc/contractors.md")` +
+      " (link-graph membership) — " +
+      "$links().size() == 0" +
+      " (leaf docs) — " +
+      `$backlinks().exists(d, d.status == "draft")` +
+      ". Call the `query_syntax` tool for the full filter-language reference.",
     inputSchema: {
       type: "object",
       properties: {
         repo: {
           oneOf: [{ type: "string" }, { type: "array", items: { type: "string" } }],
+          description:
+            'Repo slug, gitignore-style glob (e.g. "team-*"), or a list of either. ' +
+            "Omitted = every repo the caller can see.",
         },
-        filter: { type: "string" },
-        text: { type: "string" },
+        filter: {
+          type: "string",
+          description:
+            "CEL boolean expression. Bare identifiers are frontmatter keys (a missing key never " +
+            "matches); `$path` / `$updated_at` (ISO-8601 UTC) / `$body` are document intrinsics; " +
+            '`"x" in list(field)` handles scalar-or-list frontmatter; `$in(glob)` / `$has(glob)` ' +
+            "/ `$backlinks()` / `$links()` query the link graph. String functions: contains, " +
+            "startsWith, endsWith, matches, size. Full reference: the `query_syntax` tool.",
+        },
+        text: {
+          type: "string",
+          description:
+            "Full-text search over document bodies. Portable syntax: space-separated terms " +
+            '(implicit AND) and "quoted phrases"; other operators are storage-backend-specific.',
+        },
         rank: {
           type: "string",
           description:
-            "Semantic rank via embeddings (§5.1). Requires an embed hook; else rank_unavailable.",
+            'Semantic rank via embeddings (§5.1) — a natural-language query, e.g. "tiered SaaS ' +
+            'pricing". Requires an embed hook on the server; else rank_unavailable.',
         },
-        limit: { type: "integer", minimum: 0 },
-        include_hidden: { type: "boolean" },
-        include_system: { type: "boolean" },
+        limit: { type: "integer", minimum: 0, description: "Max results (default 50)." },
+        include_hidden: {
+          type: "boolean",
+          description: "Include docs under hidden path segments (e.g. `.drafts/…`).",
+        },
+        include_system: {
+          type: "boolean",
+          description:
+            "Include docs under system path segments (e.g. `:deleted/…`) — how you browse " +
+            "trash to find documents to restore.",
+        },
         scope: {
           type: "array",
           description:
@@ -588,9 +630,34 @@ export const TOOL_REGISTRY: ToolEntry[] = [
     handler: async (kernel, ctx, args) => {
       const { scope: _scope, ...specArgs } = args;
       const spec = specArgs as QuerySpec;
-      const rows = await kernel.query(queryCtx(ctx, args), spec);
-      return { structured: wrapList(rows), text: renderVersionList(rows) };
+      try {
+        const rows = await kernel.query(queryCtx(ctx, args), spec);
+        return { structured: wrapList(rows), text: renderVersionList(rows) };
+      } catch (err) {
+        // Teach through the error: a bad filter is the moment the caller
+        // most wants the language reference.
+        if (err instanceof KernelError && err.code === "filter_invalid") {
+          throw new KernelError("filter_invalid", {
+            ...(err.data as Record<string, unknown>),
+            hint: "call the `query_syntax` tool for the full filter-language reference",
+          });
+        }
+        throw err;
+      }
     },
+  },
+  {
+    name: "query_syntax",
+    description:
+      "Reference documentation for the `query` tool's filter language: CEL syntax, $-intrinsics " +
+      "($path, $updated_at, $body), list() scalar-or-list polymorphism, link-graph predicates " +
+      "($in, $has, $backlinks(), $links()), text-search syntax, and rank mode. Call this before " +
+      "writing a non-trivial filter, or after a filter_invalid error.",
+    inputSchema: { type: "object", properties: {} },
+    handler: () => ({
+      structured: { reference: QUERY_SYNTAX_DOC },
+      text: QUERY_SYNTAX_DOC,
+    }),
   },
 ];
 

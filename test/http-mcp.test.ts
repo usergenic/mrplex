@@ -37,9 +37,9 @@ afterEach(async () => {
 });
 
 describe("MCP lifecycle + tools/list", () => {
-  it("lists 18 tools (no user/token tools after noauth; links_* + set_link_config)", async () => {
+  it("lists 19 tools (no user/token tools after noauth; links_* + set_link_config + query_syntax)", async () => {
     const r = await client.listTools();
-    expect(r.tools.length).toBe(18);
+    expect(r.tools.length).toBe(19);
     // Sample the important names.
     const names = new Set(r.tools.map((t) => t.name));
     for (const name of [
@@ -51,6 +51,7 @@ describe("MCP lifecycle + tools/list", () => {
       "docs_delete",
       "docs_diff",
       "query",
+      "query_syntax",
       "links_backfill",
       "links_stale",
       "links_repair",
@@ -69,6 +70,25 @@ describe("MCP lifecycle + tools/list", () => {
     for (const t of r.tools) {
       expect(t.inputSchema.type).toBe("object");
     }
+  });
+
+  it("initialize surfaces server instructions covering the key conventions", async () => {
+    const instructions = client.getInstructions();
+    expect(instructions).toBeDefined();
+    for (const needle of ["$version", "stale_prev", "query_syntax", "frontmatter_raw"]) {
+      expect(instructions).toContain(needle);
+    }
+  });
+
+  it("the query tool description teaches the filter language and points at query_syntax", async () => {
+    const r = await client.listTools();
+    const query = r.tools.find((t) => t.name === "query");
+    expect(query?.description).toContain("query_syntax");
+    expect(query?.description).toContain("$path");
+    const filterDesc = (query?.inputSchema.properties as Record<string, { description?: string }>)
+      .filter?.description;
+    expect(filterDesc).toContain("list(");
+    expect(filterDesc).toContain("$backlinks()");
   });
 });
 
@@ -247,5 +267,29 @@ describe("MCP query round-trip", () => {
     });
     const items = (r.structuredContent as { items: unknown[] }).items;
     expect(items.length).toBe(1);
+  });
+
+  it("filter_invalid carries a hint pointing at query_syntax", async () => {
+    await client.callTool({ name: "repos_create", arguments: { repo: "notes" } });
+    const r = await client.callTool({
+      name: "query",
+      arguments: { repo: "notes", filter: "status ==" },
+    });
+    expect(r.isError).toBe(true);
+    const payload = JSON.parse(((r.content as { text: string }[])[0] as { text: string }).text);
+    expect(payload.code).toBe("filter_invalid");
+    expect(payload.data.hint).toContain("query_syntax");
+  });
+
+  it("query_syntax returns the filter-language reference", async () => {
+    const r = await client.callTool({ name: "query_syntax", arguments: {} });
+    expect(r.isError).toBeFalsy();
+    const reference = (r.structuredContent as { reference: string }).reference;
+    for (const needle of ["$path", "$updated_at", "$body", "list(", "$in(", "$backlinks()"]) {
+      expect(reference).toContain(needle);
+    }
+    // The text content mirrors the structured form so text-only clients
+    // (and models reading tool output as text) get the same doc.
+    expect(((r.content as { text: string }[])[0] as { text: string }).text).toBe(reference);
   });
 });

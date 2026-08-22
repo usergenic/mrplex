@@ -112,13 +112,29 @@ export async function mountMcpStreamableHttp(config: McpConfig): Promise<McpMoun
 }
 
 /**
+ * Server-level instructions surfaced to clients at `initialize`. Cross-tool
+ * conventions live here; per-tool details belong in tool descriptions
+ * (tools.ts) and the `query_syntax` reference. Clients vary in whether they
+ * show these to the model — don't put anything here that isn't ALSO
+ * discoverable through a tool description or an error message.
+ */
+const SERVER_INSTRUCTIONS = `mrplex is a queryable, versioned store for Markdown documents with YAML frontmatter, organized into repos.
+
+Conventions:
+- Reads (docs_get / docs_get_version) return frontmatter_raw with a server-injected \`$version: <version_id>\` line. Pass that frontmatter_raw back to docs_put unchanged and prev_version_id may be omitted — the embedded $version supplies it. \`$\`-prefixed frontmatter keys are server-owned and are stripped from writes.
+- Writes use optimistic concurrency: docs_put / docs_delete need the previous version id; a \`stale_prev\` error means someone else wrote first — re-read (docs_get) and retry against the new version.
+- When writing frontmatter, provide exactly one of \`frontmatter\` (JSON object) or \`frontmatter_raw\` (verbatim YAML).
+- The \`query\` tool's filter is a CEL expression with \`$\`-prefixed intrinsics ($path, $updated_at, $body) and link-graph predicates ($in, $has, $backlinks(), $links()). Call the \`query_syntax\` tool for the full language reference before writing a non-trivial filter.
+- Tool failures return an in-band error object { code, data }: e.g. filter_invalid (bad query — data.reason explains, data.hint says what to consult), stale_prev (concurrency conflict), doc_not_found, rank_unavailable (no embedding hook configured). Codes are stable; reasons are prose.`;
+
+/**
  * Build a low-level MCP Server with tools/list + tools/call handlers wired
  * up. The `getContext` closure supplies the session's CallContext at call time.
  */
 function buildMcpServer(kernel: Kernel, getContext: () => CallContext): McpLowLevelServer {
   const server = new McpLowLevelServer(
     { name: "mrplex", version: "0.0.0" },
-    { capabilities: { tools: {} } },
+    { capabilities: { tools: {} }, instructions: SERVER_INSTRUCTIONS },
   );
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
