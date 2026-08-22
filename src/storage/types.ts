@@ -290,6 +290,18 @@ export type Storage = {
   ): Promise<VersionRow[]>;
 
   /**
+   * Document ids of live versions in `repo_id` whose path matches ANY of the
+   * given anchored regex sources (`^…$`, the gitignore-glob compilation used
+   * everywhere). Path matching happens in SQL (SQLite `regexp()` UDF, Postgres
+   * `~`) so the graph root-resolution path never materializes the whole repo.
+   * An empty `path_regexes` returns [].
+   */
+  versions_live_document_ids_matching(
+    repo_id: number,
+    path_regexes: readonly string[],
+  ): Promise<number[]>;
+
+  /**
    * Composed query — the kernel orchestrator (§5) hands over a structured
    * `SearchPlan` (repo ids + parsed CEL AST + scope regex sources + sigil
    * exclusions + optional text + candidate whitelist + limit); the adapter

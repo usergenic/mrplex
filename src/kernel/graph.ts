@@ -20,7 +20,7 @@
 import { BODY_FIELD } from "../links/extract.js";
 import type { SearchPlan, SigilExclusion } from "../storage/search-plan.js";
 import type { AdjacentLink, RepoRow, Storage, VersionRow } from "../storage/types.js";
-import { compileGlob } from "./auth/glob.js";
+import { globToRegexSource } from "./auth/glob.js";
 import { type ClaimMatcher, claimsGrantRepo, claimsToScopeGroups } from "./auth/scope.js";
 import { KernelError, repoNotFound } from "./errors.js";
 import { type PathConfig, effectivePathConfig, parseRepoOverride } from "./path-config.js";
@@ -244,9 +244,28 @@ function buildScope(claims: ClaimMatcher[] | null, repo: RepoRow): SearchPlan["s
 // -----------------------------------------------------------------------------
 
 /**
+ * Max candidate document ids per `versions_search` call. A BFS ring is bounded
+ * only by fan-out, not by `max_documents`, so a large ring's candidate/neighbor
+ * set could otherwise overflow SQLite's bound-variable cap (via
+ * `candidate_document_ids`). We chunk under it and union; the visibility
+ * predicate is per-row (no cross-chunk ordering), so the union is exact.
+ */
+const VISIBILITY_CHUNK_SIZE = 20000;
+
+/** Split ids into chunks of at most VISIBILITY_CHUNK_SIZE. */
+function idChunks(ids: readonly number[]): number[][] {
+  if (ids.length <= VISIBILITY_CHUNK_SIZE) return ids.length === 0 ? [] : [[...ids]];
+  const out: number[][] = [];
+  for (let i = 0; i < ids.length; i += VISIBILITY_CHUNK_SIZE) {
+    out.push(ids.slice(i, i + VISIBILITY_CHUNK_SIZE));
+  }
+  return out;
+}
+
+/**
  * Return the subset of `docIds` that are visible at hop `degrees` — i.e. live
  * current documents passing scope∧sigils∧filter (with `$degrees` bound to
- * `degrees`). One `versions_search` pass over the candidate document set.
+ * `degrees`). Runs a `versions_search` pass per id-chunk and unions the rows.
  */
 async function visibleAt(
   internal: Internal,
@@ -257,17 +276,20 @@ async function visibleAt(
   if (internal.scope.kind === "deny_all") return [];
   const filterAst =
     internal.filterAst === undefined ? undefined : bindDegrees(internal.filterAst, degrees);
-  const plan: SearchPlan = {
-    repo_ids: [internal.repo.id],
-    // A generous cap: we want every visible candidate. candidate_document_ids
-    // already bounds the result to the batch.
-    limit: docIds.length,
-    filter_ast: filterAst,
-    sigils: internal.sigils,
-    scope: internal.scope,
-    candidate_document_ids: docIds,
-  };
-  return internal.storage.versions_search(plan);
+  const out: VersionRow[] = [];
+  for (const chunk of idChunks(docIds)) {
+    const plan: SearchPlan = {
+      repo_ids: [internal.repo.id],
+      // candidate_document_ids already bounds the result to the chunk.
+      limit: chunk.length,
+      filter_ast: filterAst,
+      sigils: internal.sigils,
+      scope: internal.scope,
+      candidate_document_ids: chunk,
+    };
+    out.push(...(await internal.storage.versions_search(plan)));
+  }
+  return out;
 }
 
 /**
@@ -278,15 +300,18 @@ async function visibleAt(
 async function scopeVisible(internal: Internal, docIds: readonly number[]): Promise<Set<number>> {
   if (docIds.length === 0) return new Set();
   if (internal.scope.kind === "deny_all") return new Set();
-  const plan: SearchPlan = {
-    repo_ids: [internal.repo.id],
-    limit: docIds.length,
-    sigils: internal.sigils,
-    scope: internal.scope,
-    candidate_document_ids: docIds,
-  };
-  const rows = await internal.storage.versions_search(plan);
-  return new Set(rows.map((r) => r.document_id));
+  const visible = new Set<number>();
+  for (const chunk of idChunks(docIds)) {
+    const plan: SearchPlan = {
+      repo_ids: [internal.repo.id],
+      limit: chunk.length,
+      sigils: internal.sigils,
+      scope: internal.scope,
+      candidate_document_ids: chunk,
+    };
+    for (const r of await internal.storage.versions_search(plan)) visible.add(r.document_id);
+  }
+  return visible;
 }
 
 // -----------------------------------------------------------------------------
@@ -294,16 +319,18 @@ async function scopeVisible(internal: Internal, docIds: readonly number[]): Prom
 // -----------------------------------------------------------------------------
 
 async function resolveRoots(internal: Internal, patterns: string[]): Promise<VersionRow[]> {
-  // Candidate live docs whose path matches any root pattern.
-  const live = await internal.storage.versions_live_by_repo(internal.repo.id);
-  const regexes = patterns.map((p) => compileGlob(p));
-  const matchIds = live
-    .filter((v) => regexes.some((re) => re.test(v.path)))
-    .map((v) => v.document_id);
+  // Match root patterns against live paths IN SQL (SQLite regexp() / Postgres
+  // `~`), so a graph call never materializes the whole repo just to find its
+  // roots. Each gitignore-glob compiles to the same anchored regex source the
+  // scope/link-predicate compilers use.
+  const regexes = patterns.map((p) => `^${globToRegexSource(p)}$`);
+  const matchIds = await internal.storage.versions_live_document_ids_matching(
+    internal.repo.id,
+    regexes,
+  );
   if (matchIds.length === 0) return [];
   // Roots are visible + filter-matching at $degrees = 0.
-  const visible = await visibleAt(internal, matchIds, 0);
-  return visible;
+  return visibleAt(internal, matchIds, 0);
 }
 
 // -----------------------------------------------------------------------------
@@ -542,7 +569,7 @@ async function inducedLinks(
     const source = pathById.get(r.source_id);
     const target = pathById.get(r.target_id);
     if (source === undefined || target === undefined) continue;
-    const field = r.field === BODY_FIELD ? BODY_FIELD : r.field;
+    const field = r.field;
     const key = `${source} ${target} ${field}`;
     if (seen.has(key)) continue;
     seen.add(key);

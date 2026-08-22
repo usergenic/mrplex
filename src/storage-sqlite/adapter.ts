@@ -45,6 +45,35 @@ const hydrateVersion = (row: VersionRawRow): VersionRow => ({
 });
 
 /**
+ * Max ids per `IN (?,…)` chunk. SQLite's SQLITE_MAX_VARIABLE_NUMBER is 32766
+ * in modern builds; we leave generous headroom for the other bound params
+ * (repo_id, etc.) a query may carry alongside the id list.
+ */
+const ID_CHUNK_SIZE = 20000;
+
+/**
+ * Run an `IN`-list query in chunks so a large id batch can't overflow
+ * SQLite's bound-variable cap, and flatten the per-chunk rows. `run` receives
+ * the `?,?,…` placeholder string and the chunk's ids. Callers whose query is
+ * `DISTINCT` and partitions rows by the chunked column (e.g. `source_id IN …`)
+ * get a correct union with no extra dedup; a `<= ID_CHUNK_SIZE` batch runs as
+ * a single query. An empty batch runs nothing.
+ */
+function chunkedInList<T>(
+  ids: readonly number[],
+  run: (placeholders: string, chunk: readonly number[]) => T[],
+): T[] {
+  if (ids.length === 0) return [];
+  const out: T[] = [];
+  for (let i = 0; i < ids.length; i += ID_CHUNK_SIZE) {
+    const chunk = ids.slice(i, i + ID_CHUNK_SIZE);
+    const ph = chunk.map(() => "?").join(",");
+    out.push(...run(ph, chunk));
+  }
+  return out;
+}
+
+/**
  * Compile + cache RE2JS patterns per SqliteStorage instance. Returns null
  * for patterns that fail to compile — matches SQLite's regexp() convention
  * of "no match" rather than raising, so a bad pattern doesn't kill the
@@ -367,44 +396,72 @@ class SqliteStorage implements Storage {
     repo_id: number,
     source_ids: readonly number[],
   ): Promise<AdjacentLink[]> {
-    if (source_ids.length === 0) return [];
-    const ph = source_ids.map(() => "?").join(",");
-    return this.db
-      .prepare(
-        `select distinct source_id, target_id, field
-         from links
-         where repo_id = ? and target_id is not null and source_id in (${ph})`,
-      )
-      .all(repo_id, ...source_ids) as AdjacentLink[];
+    // Chunk the id batch under SQLITE_MAX_VARIABLE_NUMBER (§graph WS1): a
+    // hub-heavy repo's neighbor fan-out can exceed the bound-variable cap.
+    // Chunks are disjoint by source_id, so unioning the DISTINCT results needs
+    // no further dedup.
+    return chunkedInList<AdjacentLink>(
+      source_ids,
+      (ph, ids) =>
+        this.db
+          .prepare(
+            `select distinct source_id, target_id, field
+           from links
+           where repo_id = ? and target_id is not null and source_id in (${ph})`,
+          )
+          .all(repo_id, ...ids) as AdjacentLink[],
+    );
   }
 
   async links_adjacent_in(repo_id: number, target_ids: readonly number[]): Promise<AdjacentLink[]> {
-    if (target_ids.length === 0) return [];
-    const ph = target_ids.map(() => "?").join(",");
-    return this.db
-      .prepare(
-        `select distinct source_id, target_id, field
-         from links
-         where repo_id = ? and target_id is not null and target_id in (${ph})`,
-      )
-      .all(repo_id, ...target_ids) as AdjacentLink[];
+    return chunkedInList<AdjacentLink>(
+      target_ids,
+      (ph, ids) =>
+        this.db
+          .prepare(
+            `select distinct source_id, target_id, field
+           from links
+           where repo_id = ? and target_id is not null and target_id in (${ph})`,
+          )
+          .all(repo_id, ...ids) as AdjacentLink[],
+    );
   }
 
   async versions_current_by_documents(
     repo_id: number,
     document_ids: readonly number[],
   ): Promise<VersionRow[]> {
-    if (document_ids.length === 0) return [];
-    const ph = document_ids.map(() => "?").join(",");
+    const rows = await chunkedInList<VersionRawRow>(
+      document_ids,
+      (ph, ids) =>
+        this.db
+          .prepare(
+            `select id, document_id, repo_id, prev_id, next_id, path,
+                  frontmatter_raw, frontmatter, body, author, created_at
+           from versions
+           where repo_id = ? and next_id is null and document_id in (${ph})`,
+          )
+          .all(repo_id, ...ids) as VersionRawRow[],
+    );
+    return rows.map(hydrateVersion);
+  }
+
+  async versions_live_document_ids_matching(
+    repo_id: number,
+    path_regexes: readonly string[],
+  ): Promise<number[]> {
+    if (path_regexes.length === 0) return [];
+    // Match live paths in SQL via the regexp() UDF — one OR'd term per pattern.
+    // Pattern lists are tiny (a graph call's root globs), so no chunking; the
+    // repo-scoped row set is what could be large, and it never leaves SQLite.
+    const ors = path_regexes.map(() => "regexp(?, path)").join(" OR ");
     const rows = this.db
       .prepare(
-        `select id, document_id, repo_id, prev_id, next_id, path,
-                frontmatter_raw, frontmatter, body, author, created_at
-         from versions
-         where repo_id = ? and next_id is null and document_id in (${ph})`,
+        `select document_id from versions
+         where repo_id = ? and next_id is null and (${ors})`,
       )
-      .all(repo_id, ...document_ids) as VersionRawRow[];
-    return rows.map(hydrateVersion);
+      .all(repo_id, ...path_regexes) as { document_id: number }[];
+    return rows.map((r) => r.document_id);
   }
 
   async versions_search(plan: SearchPlan): Promise<VersionRow[]> {

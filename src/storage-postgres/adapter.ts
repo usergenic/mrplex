@@ -493,6 +493,23 @@ class PostgresStorage implements Storage {
     });
   }
 
+  async versions_live_document_ids_matching(
+    repo_id: number,
+    path_regexes: readonly string[],
+  ): Promise<number[]> {
+    if (path_regexes.length === 0) return [];
+    // `path ~ ANY($2)` matches against the whole regex array in one predicate;
+    // POSIX ARE, same engine the scope-glob compiler uses.
+    return this.withClient(async (c) => {
+      const res = await c.query<{ document_id: number }>(
+        `select document_id from versions
+         where repo_id = $1 and next_id is null and path ~ ANY($2::text[])`,
+        [repo_id, path_regexes],
+      );
+      return res.rows.map((r) => r.document_id);
+    });
+  }
+
   async versions_search(plan: SearchPlan): Promise<VersionRow[]> {
     if (plan.repo_ids.length === 0) return [];
     if (plan.scope.kind === "deny_all") return [];
