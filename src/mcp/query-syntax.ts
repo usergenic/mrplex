@@ -133,6 +133,18 @@ statically-written links, now and forever. The bare forms are identical
 today, but will transparently widen to include query-derived (dynamic)
 membership in a future release. \`_dyn\` forms are reserved and rejected.
 
+### \`$degrees\` — graph mode only
+
+\`$degrees\` is a scalar available **only inside a \`graph\` call's
+\`filter\`**, never in a \`query\` filter (using it there is a
+\`filter_invalid\` error). It is the minimum number of hops from the
+nearest root at which the current document was reached, under that call's
+direction lens. In \`graph\`, \`filter\` is *visibility*, not selection: a
+non-matching document is hidden and blocks paths through itself. This lets
+a filter shape the traversal, e.g. \`$degrees <= 1 || type == "person"\` —
+include everything within one hop, but keep following \`person\` documents
+deeper. See the \`graph\` tool for the full read surface.
+
 ## text — full-text search
 
 Portable syntax across storage backends: space-separated terms (implicit

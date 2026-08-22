@@ -432,6 +432,79 @@ describe("REST query", () => {
   });
 });
 
+describe("REST graph", () => {
+  type GraphBody = {
+    documents: { $path: string; $degrees: number }[];
+    links: { source: string; target: string; field: string }[];
+    frontier: string[];
+    complete_degrees: number;
+    truncated: boolean;
+  };
+
+  beforeEach(async () => {
+    await fetch(`${base}/repos`, {
+      method: "POST",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ slug: "notes" }),
+    });
+    await fetch(`${base}/repos/notes/docs/leaf.md`, {
+      method: "PUT",
+      headers: { ...authHeaders(), "Content-Type": "text/markdown", "If-None-Match": "*" },
+      body: "---\ntitle: Leaf\n---\n",
+    });
+    await fetch(`${base}/repos/notes/docs/root.md`, {
+      method: "PUT",
+      headers: { ...authHeaders(), "Content-Type": "text/markdown", "If-None-Match": "*" },
+      body: "---\ntitle: Root\n---\n[leaf](leaf.md)\n",
+    });
+  });
+
+  it("GET /repos/{repo}/graph returns the structured result", async () => {
+    const r = await fetch(`${base}/repos/notes/graph?roots=root.md&direction=out&degrees=1`, {
+      headers: authHeaders(),
+    });
+    expect(r.status).toBe(200);
+    const body = await readJson<GraphBody>(r);
+    expect(body.documents.map((d) => d.$path)).toEqual(["root.md", "leaf.md"]);
+    expect(body.links).toEqual([{ source: "root.md", target: "leaf.md", field: "$body" }]);
+    expect(body.complete_degrees).toBe(1);
+  });
+
+  it("POST and GET return identical structured results", async () => {
+    const getR = await fetch(`${base}/repos/notes/graph?roots=root.md&direction=out&degrees=1`, {
+      headers: authHeaders(),
+    });
+    const postR = await fetch(`${base}/repos/notes/graph`, {
+      method: "POST",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ roots: "root.md", direction: "out", degrees: 1 }),
+    });
+    expect(postR.status).toBe(200);
+    expect(await readJson<GraphBody>(postR)).toEqual(await readJson<GraphBody>(getR));
+  });
+
+  it("a glob matching nothing yields an empty result, not an error", async () => {
+    const r = await fetch(`${base}/repos/notes/graph?roots=nope/**`, { headers: authHeaders() });
+    expect(r.status).toBe(200);
+    const body = await readJson<GraphBody>(r);
+    expect(body.documents).toEqual([]);
+  });
+
+  it("a $degrees filter is accepted over POST", async () => {
+    const r = await fetch(`${base}/repos/notes/graph`, {
+      method: "POST",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({
+        roots: "root.md",
+        direction: "out",
+        degrees: 3,
+        filter: "$degrees <= 1",
+      }),
+    });
+    expect(r.status).toBe(200);
+  });
+});
+
 describe("REST scope header", () => {
   beforeEach(async () => {
     await fetch(`${base}/repos`, {

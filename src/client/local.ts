@@ -87,6 +87,7 @@ function buildClient(
       repair: (repo, opts) => kernel.links.repair(ctx, repo, opts),
     },
     query: (spec) => kernel.query(ctx, spec),
+    graph: (spec) => kernel.graph(ctx, spec),
     close: async () => {
       if (closed) return;
       closed = true;

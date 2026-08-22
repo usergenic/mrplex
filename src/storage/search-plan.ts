@@ -78,4 +78,13 @@ export type SearchPlan = {
    * them in the order given so the kernel's rank-score sort is stable.
    */
   candidate_ids?: readonly number[];
+  /**
+   * Optional candidate DOCUMENT-id whitelist (graph read surface,
+   * docs/graph-plan.md WS2). When present, the adapter restricts results to
+   * live versions whose `document_id` is in this set — the kernel uses it to
+   * evaluate scope∧filter visibility over a BFS round's candidate documents
+   * in one pass. Unlike `candidate_ids` (version ids, order-significant for
+   * rank), this imposes no ordering.
+   */
+  candidate_document_ids?: readonly number[];
 };

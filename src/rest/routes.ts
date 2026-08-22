@@ -19,7 +19,7 @@ import { KernelError } from "../kernel/errors.js";
 import type { Kernel } from "../kernel/kernel.js";
 import type { PathConfigOverride } from "../kernel/path-config.js";
 import type { QuerySpec } from "../kernel/query/query.js";
-import type { Version } from "../kernel/wire.js";
+import type { GraphSpec, Version } from "../kernel/wire.js";
 import { appendSystemProperty, extractSystemProperties } from "../markdown/frontmatter.js";
 import {
   type ContextForRequest,
@@ -402,7 +402,80 @@ async function dispatchRepos(
     return;
   }
 
+  // /repos/{repo}/graph — GET or POST (mirrors /query's duality).
+  if (segments[2] === "graph" && segments.length === 3) {
+    return dispatchGraph(req, res, kernel, ctx, repoSlug, query, method);
+  }
+
   notFound(res);
+}
+
+/**
+ * Graph read surface (docs/graph-plan.md §WS4). GET encodes the simple cases in
+ * query params; POST takes a JSON GraphSpec body when filter/select/arrays get
+ * awkward to URL-encode. Repo comes from the path; the body's `repo` (if any)
+ * is ignored in favor of the route. Scope header wins over a body `scope`.
+ */
+async function dispatchGraph(
+  req: IncomingMessage,
+  res: ServerResponse,
+  kernel: Kernel,
+  ctx: CallContext,
+  repoSlug: string,
+  query: URLSearchParams,
+  method: string,
+): Promise<void> {
+  let spec: GraphSpec;
+  if (method === "GET") {
+    spec = graphSpecFromQueryString(query, repoSlug);
+  } else if (method === "POST") {
+    const body = parseJsonBody(await readBody(req)) as Record<string, unknown>;
+    if (body.scope !== undefined) {
+      if (ctx.scope === undefined) {
+        ctx.scope = validateScopeClaims(body.scope);
+      }
+      const { scope: _scope, ...rest } = body;
+      spec = { ...rest, repo: repoSlug } as GraphSpec;
+    } else {
+      spec = { ...body, repo: repoSlug } as GraphSpec;
+    }
+  } else {
+    return methodNotAllowed(res, method, ["GET", "POST"]);
+  }
+
+  const result = await kernel.graph(ctx, spec);
+  writeJson(res, 200, result);
+}
+
+/**
+ * Parse GraphSpec from query params. `roots`/`fields`/`select` accept repeated
+ * params or comma-joined values (matching /query's `repo` convention);
+ * `direction`/`degrees`/`filter`/`max_documents` are scalars.
+ */
+function graphSpecFromQueryString(query: URLSearchParams, repoSlug: string): GraphSpec {
+  const spec: GraphSpec = { repo: repoSlug, roots: collectListParam(query, "roots") };
+  const direction = query.get("direction");
+  if (direction !== null) spec.direction = direction as GraphSpec["direction"];
+  const degrees = readOptionalIntQueryParam(query, "degrees");
+  if (degrees !== undefined) spec.degrees = degrees;
+  const fields = collectListParam(query, "fields");
+  if (fields.length > 0) spec.fields = fields;
+  const filter = query.get("filter");
+  if (filter !== null) spec.filter = filter;
+  const select = collectListParam(query, "select");
+  if (select.length > 0) spec.select = select;
+  const maxDocuments = readOptionalIntQueryParam(query, "max_documents");
+  if (maxDocuments !== undefined) spec.max_documents = maxDocuments;
+  return spec;
+}
+
+/** Flatten repeated and/or comma-joined query params into a string[]. */
+function collectListParam(query: URLSearchParams, key: string): string[] {
+  const flat: string[] = [];
+  for (const raw of query.getAll(key)) {
+    for (const item of raw.split(",")) if (item.length > 0) flat.push(item);
+  }
+  return flat;
 }
 
 async function dispatchDocs(

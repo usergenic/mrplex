@@ -14,6 +14,7 @@ Two layers: a **full-trust kernel** (no in-engine auth — whoever reaches it ca
 - **CEL filter queries** over frontmatter fields and `$`-prefixed intrinsics (`$path`, `$updated_at`, `$body`). `list()` polymorphism handles scalar-or-list frontmatter uniformly.
 - **Link graph** — a derived index over Markdown links (CommonMark inline/reference, wikilinks `[[page]]`, and opt-in frontmatter reference fields), maintained in the write transaction and bound to document *identity* so backlinks survive renames. Query it in CEL with possession-language intrinsics: `$in(glob)` / `$has(glob)` (membership, optional field restriction) and `$backlinks()` / `$links()` collections (`.size()`, `.exists()`, `.all()`). Composes as set algebra: `$in("moc/**") && !$in("moc/contractors.md")`, `!$in("**")` (orphans), `$links().size() == 0` (leaves). Every predicate respects the caller's read scope — the visible graph equals the readable graph. `mrplex links stale` / `repair` fix link *text* after a move (the graph itself never breaks). See §11.2.
   - **`$in` today means links you wrote; later it will also include dynamic membership.** A document denotes a set — the docs it links to — and a future release lets a document *also* define members via embedded queries. When that lands, `$in` (and `$has`/`$backlinks()`/`$links()`) transparently widen to the union of written links **and** query-derived membership. If you want to match **only** statically-written links, now and forever, use the `_static` forms (`$in_static`, `--in-static`); they never widen. The `_dyn`-only forms are reserved until that release.
+- **Graph exploration** — where a CEL query answers *which* documents match, `graph` answers *how* documents connect: a read-only BFS neighborhood expansion over the link index. From a root set, expand outward under a direction lens (`out`/`in`/`both`) up to N hops, returning the reached **documents** and the **links** between them, a `frontier` for cursorless continuation, and truncation metadata. `filter` is *visibility* (a non-matching doc is hidden and blocks paths through it) and gains a graph-only `$degrees` intrinsic — e.g. `$degrees <= 1 || type == "person"` expands everything one hop but keeps following person docs. Kernel op, `graph` MCP tool, `/repos/{repo}/graph` REST route (GET + POST), and `mrplex graph --render summary|yaml|mermaid|json` CLI. See §11.3 / `docs/archive/graph-plan.md`.
 - **Full-text search** over document body — SQLite FTS5 (porter+unicode61) or Postgres `websearch_to_tsquery`. Composes with filter via AND. Portable syntax subset across both engines: bare terms and quoted phrases.
 - **Semantic rank via embeddings** — pluggable hook (`--embed-url` HTTP or `--embed-cmd` subprocess); mrplex never calls a provider itself. Chunker + backlog worker + brute-force cosine k-NN over `sqlite-vec`; results current-version only, deduped by content hash. Composes with filter/text/scope/sigil-exclusion. No hook configured → `rank_unavailable` (no zero-vector default — silent garbage is worse than a visible gap).
 - **Full-trust kernel — no in-engine auth.** mrplex authenticates nothing: any caller that can reach the engine can do anything. Authentication, users, and tokens live in a *shell* around it — the OS process boundary for local/stdio use, or a fronting proxy for networked deployments (never expose mrplex directly to an untrusted network). Identity is one opaque `author` string per write (default `"mrplex"`; convention is git's `Full Name <email>`). Read visibility can still be narrowed per call with a `ScopeClaim[]` — repo/path globs (gitignore-style, with negation) evaluated at call time.
@@ -169,6 +170,25 @@ mrplex -r notes links repair
 
 # Rebuild the index from scratch (e.g. after changing link_config).
 mrplex -r notes links backfill
+```
+
+Explore *how* documents connect — `graph` neighborhood expansion (§11.3):
+
+```bash
+# What a map-of-content reaches, two hops out (the contents tree).
+mrplex graph -r notes --roots 'moc/**' --degrees 2 --direction out
+
+# filter is visibility, and $degrees binds: expand everything one hop, but
+# keep following person docs deeper (a non-match also blocks paths through it).
+mrplex graph -r notes --roots moc/employees.md \
+    --filter '$degrees <= 1 || type == "person"'
+
+# Co-citation: root → shared-target ← sibling appears under the undirected lens.
+mrplex graph -r notes --roots people/sam.md --direction both --degrees 2
+
+# Renderings are a surface choice, not a call parameter.
+mrplex graph -r notes --roots moc/employees.md --render mermaid   # showable
+mrplex graph -r notes --roots moc/employees.md --render yaml
 ```
 
 Serve the HTTP surfaces and drive the CLI remotely. `serve` must spell out its

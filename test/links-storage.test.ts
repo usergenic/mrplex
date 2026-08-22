@@ -157,3 +157,46 @@ describe("links_by_repo", () => {
     expect(await storage.links_by_repo(repoId)).toEqual([]);
   });
 });
+
+describe("adjacency reads (graph read surface, docs/graph-plan.md WS1)", () => {
+  // docA → docB (resolved) and docA → dangling; docB → docA (resolved).
+  beforeEach(async () => {
+    await storage.links_replace(repoId, docA, [
+      edge({ ord: 0, field: "$body", target_norm: "b.md", target_id: docB }),
+      edge({ ord: 1, field: "$body", target_norm: "b.md", target_id: docB }), // duplicate triple
+      edge({ ord: 2, field: "parent", target_norm: "b.md", target_id: docB }), // distinct field
+      edge({ ord: 3, field: "$body", target_norm: "gone.md", target_id: null }), // dangling
+    ]);
+    await storage.links_replace(repoId, docB, [
+      edge({ ord: 0, field: "$body", target_norm: "a.md", target_id: docA }),
+    ]);
+  });
+
+  it("links_adjacent_out returns distinct (source,target,field), dangling excluded", async () => {
+    const rows = await storage.links_adjacent_out(repoId, [docA]);
+    const norm = rows.map((r) => `${r.source_id}:${r.target_id}:${r.field}`).sort();
+    // Two duplicate $body edges collapse to one; the parent edge is distinct;
+    // the dangling edge is excluded.
+    expect(norm).toEqual([`${docA}:${docB}:$body`, `${docA}:${docB}:parent`]);
+  });
+
+  it("links_adjacent_in returns distinct inbound triples", async () => {
+    const rows = await storage.links_adjacent_in(repoId, [docB]);
+    expect(rows.map((r) => `${r.source_id}:${r.target_id}:${r.field}`).sort()).toEqual([
+      `${docA}:${docB}:$body`,
+      `${docA}:${docB}:parent`,
+    ]);
+  });
+
+  it("adjacency reads are batched over the id list", async () => {
+    const out = await storage.links_adjacent_out(repoId, [docA, docB]);
+    // docA→docB ($body, parent) + docB→docA ($body) = three distinct triples.
+    expect(out.length).toBe(3);
+  });
+
+  it("empty id lists short-circuit to []", async () => {
+    expect(await storage.links_adjacent_out(repoId, [])).toEqual([]);
+    expect(await storage.links_adjacent_in(repoId, [])).toEqual([]);
+    expect(await storage.versions_current_by_documents(repoId, [])).toEqual([]);
+  });
+});

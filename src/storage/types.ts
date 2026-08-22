@@ -131,6 +131,20 @@ export type LinkRow = {
 };
 
 /**
+ * A distinct resolved adjacency triple for the graph read surface
+ * (docs/graph-plan.md WS1). `ord`, `target_raw`, and `target_norm` never
+ * leave storage on this path: adjacency reads collapse multiple occurrences
+ * of the same `(source, target, field)` to one row (`SELECT DISTINCT`) and
+ * exclude dangling edges (`target_id IS NULL`). Both endpoints are document
+ * ids; the kernel maps them to paths and applies scope.
+ */
+export type AdjacentLink = {
+  source_id: number;
+  target_id: number;
+  field: string;
+};
+
+/**
  * Embedding backlog (design §3.2, §5.3). One row per version awaiting
  * (or having failed) embedding. `attempts` counts failed tries; a fresh
  * enqueue resets `attempts` and `next_retry_at` so a superseding write
@@ -247,6 +261,33 @@ export type Storage = {
 
   /** Every link row in a repo, ordered by (source_id, ord) (tests, verify). */
   links_by_repo(repo_id: number): Promise<LinkRow[]>;
+
+  /**
+   * Outbound adjacency for a batch of source documents: distinct
+   * `(source_id, target_id, field)` triples where `source_id` is in the
+   * batch. Dangling edges (`target_id IS NULL`) are excluded in SQL. Used by
+   * the graph read surface (docs/graph-plan.md WS1); the kernel applies
+   * scope/filter visibility to the endpoints. `ord` never leaves storage.
+   */
+  links_adjacent_out(repo_id: number, source_ids: readonly number[]): Promise<AdjacentLink[]>;
+
+  /**
+   * Inbound adjacency for a batch of target documents: distinct
+   * `(source_id, target_id, field)` triples where `target_id` is in the
+   * batch (resolved edges only). The counterpart to links_adjacent_out.
+   */
+  links_adjacent_in(repo_id: number, target_ids: readonly number[]): Promise<AdjacentLink[]>;
+
+  /**
+   * Current-version rows for a batch of document ids (graph read surface).
+   * Only live rows (`next_id IS NULL`) in `repo_id`; ids not currently live
+   * are simply absent. The kernel needs the paths + frontmatter to project
+   * documents and to apply scope to graph endpoints.
+   */
+  versions_current_by_documents(
+    repo_id: number,
+    document_ids: readonly number[],
+  ): Promise<VersionRow[]>;
 
   /**
    * Composed query — the kernel orchestrator (§5) hands over a structured

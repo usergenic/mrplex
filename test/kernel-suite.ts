@@ -850,5 +850,146 @@ export function runKernelSuite(factory: AdapterFactory): void {
         }
       });
     });
+
+    // -----------------------------------------------------------------
+    // kernel.graph — the read surface (docs/graph-plan.md). Cross-cutting
+    // cases lifted here so both adapters agree byte-for-byte. The
+    // semantics-exhaustive suite lives in test/graph.test.ts (SQLite).
+    // -----------------------------------------------------------------
+    describe("graph (read surface) — adapter parity", () => {
+      const mk = async (
+        actor: CallContext,
+        path: string,
+        body: string,
+        frontmatter?: Record<string, unknown>,
+      ) => {
+        const fm = frontmatter ? { frontmatter } : { frontmatter_raw: "" };
+        return kernel.docs.create(actor, "notes", path, { ...fm, body });
+      };
+      const gpaths = async (
+        actor: CallContext,
+        spec: Omit<Parameters<Kernel["graph"]>[1], "repo">,
+      ) => (await kernel.graph(actor, { repo: "notes", ...spec })).documents.map((d) => d.$path);
+
+      it("out lens expands source→target transitively, degree-ordered", async () => {
+        const actor = await aliceActor();
+        await mk(actor, "leaf.md", "");
+        await mk(actor, "mid.md", "[l](leaf.md)");
+        await mk(actor, "root.md", "[m](mid.md)");
+        expect(await gpaths(actor, { roots: "root.md", direction: "out", degrees: 2 })).toEqual([
+          "root.md",
+          "mid.md",
+          "leaf.md",
+        ]);
+      });
+
+      it("both lens surfaces a co-cited sibling at degrees 2", async () => {
+        const actor = await aliceActor();
+        await mk(actor, "shared.md", "");
+        await mk(actor, "root.md", "[s](shared.md)");
+        await mk(actor, "sibling.md", "[s](shared.md)");
+        expect(await gpaths(actor, { roots: "root.md", direction: "both", degrees: 2 })).toEqual([
+          "root.md",
+          "shared.md",
+          "sibling.md",
+        ]);
+      });
+
+      it("$degrees binds as visibility and prunes deeper non-matches", async () => {
+        const actor = await aliceActor();
+        await mk(actor, "note.md", "", { type: "note" });
+        await mk(actor, "p2.md", "[n](note.md)", { type: "person" });
+        await mk(actor, "p1.md", "[p2](p2.md)", { type: "person" });
+        await mk(actor, "root.md", "[p1](p1.md)");
+        const r = await gpaths(actor, {
+          roots: "root.md",
+          direction: "out",
+          degrees: 5,
+          filter: '$degrees <= 1 || type == "person"',
+        });
+        expect(r).toEqual(["root.md", "p1.md", "p2.md"]);
+      });
+
+      it("induced links are distinct (source,target,field) over returned docs", async () => {
+        const actor = await aliceActor();
+        await mk(actor, "a.md", "");
+        await mk(actor, "b.md", "[a](a.md)");
+        await mk(actor, "root.md", "[b](b.md) and [a](a.md)");
+        const r = await kernel.graph(actor, {
+          repo: "notes",
+          roots: "root.md",
+          direction: "out",
+          degrees: 2,
+        });
+        expect(r.links).toEqual([
+          { source: "b.md", target: "a.md", field: "$body" },
+          { source: "root.md", target: "a.md", field: "$body" },
+          { source: "root.md", target: "b.md", field: "$body" },
+        ]);
+      });
+
+      it("$links/$backlinks count distinct scope-visible documents", async () => {
+        const actor = await aliceActor();
+        await mk(actor, "a.md", "");
+        await mk(actor, "b.md", "");
+        await mk(actor, "hub.md", "[a](a.md) [b](b.md)");
+        await mk(actor, "x.md", "[h](hub.md)");
+        const r = await kernel.graph(actor, { repo: "notes", roots: "hub.md", degrees: 0 });
+        expect(r.documents[0]?.$links).toBe(2);
+        expect(r.documents[0]?.$backlinks).toBe(1);
+      });
+
+      it("scope hides an out-of-scope endpoint, its links, and shrinks counts", async () => {
+        const actor = await aliceActor();
+        await mk(actor, "secret.md", "");
+        await mk(actor, "visible.md", "");
+        await mk(actor, "root.md", "[s](secret.md) [v](visible.md)");
+        const scoped: CallContext = { scope: [{ repo: "notes", paths: ["**", "!secret.md"] }] };
+        const r = await kernel.graph(scoped, {
+          repo: "notes",
+          roots: "root.md",
+          direction: "out",
+          degrees: 1,
+        });
+        expect(r.documents.map((d) => d.$path)).toEqual(["root.md", "visible.md"]);
+        expect(r.links).toEqual([{ source: "root.md", target: "visible.md", field: "$body" }]);
+        expect(r.documents.find((d) => d.$path === "root.md")?.$links).toBe(1);
+      });
+
+      it("frontier lists a doc at the cap with unenumerated neighbors; a sated doc is not frontier", async () => {
+        const actor = await aliceActor();
+        await mk(actor, "leaf.md", "");
+        await mk(actor, "mid.md", "[l](leaf.md)");
+        await mk(actor, "root.md", "[m](mid.md)");
+        await mk(actor, "sated.md", "");
+        await mk(actor, "hub.md", "[s](sated.md)");
+        const chained = await kernel.graph(actor, {
+          repo: "notes",
+          roots: "root.md",
+          direction: "out",
+          degrees: 1,
+        });
+        expect(chained.frontier).toEqual(["mid.md"]);
+        const flat = await kernel.graph(actor, {
+          repo: "notes",
+          roots: "hub.md",
+          direction: "out",
+          degrees: 1,
+        });
+        expect(flat.frontier).toEqual([]);
+      });
+
+      it("is deterministic across repeated runs (byte-equal)", async () => {
+        const actor = await aliceActor();
+        await mk(actor, "a.md", "");
+        await mk(actor, "b.md", "[a](a.md)");
+        await mk(actor, "c.md", "[a](a.md) [b](b.md)");
+        await mk(actor, "root.md", "[b](b.md) [c](c.md)");
+        const spec = { repo: "notes", roots: "root.md", direction: "both" as const, degrees: 3 };
+        const r1 = JSON.stringify(await kernel.graph(actor, spec));
+        const r2 = JSON.stringify(await kernel.graph(actor, spec));
+        expect(r1).toBe(r2);
+      });
+    });
   });
 }

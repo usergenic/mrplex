@@ -3,6 +3,7 @@ import Database from "better-sqlite3";
 import { normalizeKey } from "../kernel/casefold.js";
 import type { SearchPlan } from "../storage/search-plan.js";
 import type {
+  AdjacentLink,
   BacklogRow,
   BacklogStatus,
   ChunkRow,
@@ -360,6 +361,50 @@ class SqliteStorage implements Storage {
          from links where repo_id = ? order by source_id, ord`,
       )
       .all(repo_id) as LinkRow[];
+  }
+
+  async links_adjacent_out(
+    repo_id: number,
+    source_ids: readonly number[],
+  ): Promise<AdjacentLink[]> {
+    if (source_ids.length === 0) return [];
+    const ph = source_ids.map(() => "?").join(",");
+    return this.db
+      .prepare(
+        `select distinct source_id, target_id, field
+         from links
+         where repo_id = ? and target_id is not null and source_id in (${ph})`,
+      )
+      .all(repo_id, ...source_ids) as AdjacentLink[];
+  }
+
+  async links_adjacent_in(repo_id: number, target_ids: readonly number[]): Promise<AdjacentLink[]> {
+    if (target_ids.length === 0) return [];
+    const ph = target_ids.map(() => "?").join(",");
+    return this.db
+      .prepare(
+        `select distinct source_id, target_id, field
+         from links
+         where repo_id = ? and target_id is not null and target_id in (${ph})`,
+      )
+      .all(repo_id, ...target_ids) as AdjacentLink[];
+  }
+
+  async versions_current_by_documents(
+    repo_id: number,
+    document_ids: readonly number[],
+  ): Promise<VersionRow[]> {
+    if (document_ids.length === 0) return [];
+    const ph = document_ids.map(() => "?").join(",");
+    const rows = this.db
+      .prepare(
+        `select id, document_id, repo_id, prev_id, next_id, path,
+                frontmatter_raw, frontmatter, body, author, created_at
+         from versions
+         where repo_id = ? and next_id is null and document_id in (${ph})`,
+      )
+      .all(repo_id, ...document_ids) as VersionRawRow[];
+    return rows.map(hydrateVersion);
   }
 
   async versions_search(plan: SearchPlan): Promise<VersionRow[]> {

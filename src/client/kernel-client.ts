@@ -21,7 +21,7 @@ import type {
 } from "../kernel/kernel.js";
 import type { PathConfigOverride } from "../kernel/path-config.js";
 import type { QuerySpec } from "../kernel/query/query.js";
-import type { PathWarning, Repo, Version } from "../kernel/wire.js";
+import type { GraphResult, GraphSpec, PathWarning, Repo, Version } from "../kernel/wire.js";
 import type { LinkConfigOverride } from "../links/link-config.js";
 
 export type HistoryOptions = { limit?: number; before?: string };
@@ -75,6 +75,7 @@ export type KernelClient = {
     repair(repo: string, opts?: { dry_run?: boolean }): Promise<RepairResult>;
   };
   query(spec: QuerySpec): Promise<Version[]>;
+  graph(spec: GraphSpec): Promise<GraphResult>;
 
   /** Release any transport-owned resources. Idempotent. */
   close(): Promise<void>;

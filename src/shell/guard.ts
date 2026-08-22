@@ -222,6 +222,11 @@ export function guardKernel(kernel: Kernel, entitlement: Entitlement, audit?: Au
     },
 
     query: (_ctx, spec) => forward("query", {}, () => kernel.query(readCtx(), spec)),
+
+    // Read-only neighborhood expansion; scoped to read visibility. Traversal
+    // stays kernel-side (the engine applies scope∧filter as visibility).
+    graph: (_ctx, spec) =>
+      forward("graph", { repo: spec.repo }, () => kernel.graph(readCtx(), spec)),
   };
 }
 

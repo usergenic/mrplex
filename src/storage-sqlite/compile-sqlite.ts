@@ -71,6 +71,14 @@ export function compileSearchPlan(plan: SearchPlan): CompiledSql {
     for (const id of plan.candidate_ids) params.push(id);
   }
 
+  // Candidate DOCUMENT-id whitelist (graph read surface). Restricts to live
+  // versions of these documents so a BFS round's visibility check is one pass.
+  if (plan.candidate_document_ids && plan.candidate_document_ids.length > 0) {
+    const docPh = plan.candidate_document_ids.map(() => "?").join(",");
+    clauses.push(`versions.document_id IN (${docPh})`);
+    for (const id of plan.candidate_document_ids) params.push(id);
+  }
+
   const cols = `versions.id, versions.document_id, versions.repo_id,
                 versions.prev_id, versions.next_id, versions.path,
                 versions.frontmatter_raw, versions.frontmatter,
