@@ -235,10 +235,11 @@ curl -H "Authorization: Bearer $KEY" http://127.0.0.1:8321/repos
 
 # Accept IdP-issued JWTs too (OIDC): pin issuer + audience.
 mrplex serve --policy policy.yaml \
-    --oidc-issuer https://idp.example.com --oidc-audience mrplex
+    --oidc-issuer https://idp.example.com --oidc-audience https://mrplex.example.com
 mrplex login --client-id mrplex-cli \
     --device-authorization-endpoint https://idp.example.com/oauth/device/code \
-    --token-endpoint https://idp.example.com/oauth/token
+    --token-endpoint https://idp.example.com/oauth/token \
+    --audience https://mrplex.example.com     # match the server's --oidc-audience
 ```
 
 Three deployment shapes — **embedded** (`serve --policy`, one process, no engine
@@ -247,6 +248,73 @@ listener), **launcher** (`mcp-stdio --policy`, a guarded stdio MCP session), and
 engine separately). Edit the policy file and `kill -HUP` the server to reload
 grants and key revocations without a restart. Full details, trust boundaries,
 and the header-injection contract are in [docs/security.md](docs/security.md).
+
+### Walkthrough: OIDC login with Auth0
+
+A concrete end-to-end for wiring an IdP. Auth0 is used here; the shape is the
+same for Okta, Keycloak, Entra, etc. — only the endpoint URLs differ.
+
+**1. In the Auth0 dashboard.**
+
+- Create an **API** (Applications → APIs). Its **Identifier** is the `audience`
+  — e.g. `https://mrplex.example.com`. Note the tenant issuer, which is your
+  tenant domain with a trailing slash: `https://YOUR_TENANT.us.auth0.com/`.
+- Create an application of type **Native** (the device flow needs a public
+  client). Enable the **Device Code** grant under its Advanced → Grant Types.
+  Note its **Client ID**.
+
+**2. Point the server at the tenant.** The issuer's JWKS is discovered at
+`<issuer>/.well-known/jwks.json`, so only issuer + audience are required:
+
+```bash
+mrplex serve --policy policy.yaml \
+    --oidc-issuer   https://YOUR_TENANT.us.auth0.com/ \
+    --oidc-audience https://mrplex.example.com \
+    --port 8321 &
+```
+
+**3. Bind a principal by claim.** Auth0 puts the user's email in the token; the
+shell only trusts it when `email_verified` is true (see [docs/security.md](docs/security.md)),
+so bind by `email` for verified users, or by the issuer-stable `sub` otherwise:
+
+```yaml
+principals:
+  ann:
+    roles: [editor]
+    oidc: { email: ann@example.com }        # author derived as "Name <ann@example.com>"
+  ci-bot:
+    author: ci-bot <ci@example.com>
+    roles: [editor]
+    oidc: { sub: "auth0|4b1c..." }           # service account: bind by sub
+```
+
+**4. Sign in from the CLI.** `--audience` is **required for Auth0** — without it
+Auth0 returns an *opaque* access token that fails JWKS verification; passing the
+API identifier makes it mint a verifiable JWT. Use the same value as the
+server's `--oidc-audience`:
+
+```bash
+mrplex login \
+    --client-id  YOUR_NATIVE_CLIENT_ID \
+    --device-authorization-endpoint https://YOUR_TENANT.us.auth0.com/oauth/device/code \
+    --token-endpoint                https://YOUR_TENANT.us.auth0.com/oauth/token \
+    --audience   https://mrplex.example.com \
+    --scope "openid email profile offline_access"
+# → visit the URL, enter the code; the token is cached (mode 600).
+```
+
+**5. Use the token.** `mcp-stdio` picks up the cached token automatically (or
+pass `--token` / `MRPLEX_SHELL_TOKEN` explicitly); over HTTP, present it as a
+bearer:
+
+```bash
+TOKEN=$(mrplex login ... && cat "${XDG_CONFIG_HOME:-$HOME/.config}/mrplex/token.json" | jq -r .access_token)
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8321/repos
+```
+
+Troubleshooting: a 401 with a token that *looks* valid almost always means the
+token is opaque (missing `--audience`) or the issuer/audience don't match the
+server's pins exactly (Auth0 issuers include the trailing slash).
 
 > Prefer not to `npm link`? Use `npx mrplex …` from the repo, or add
 > `./node_modules/.bin` to your `PATH`. Every `mrplex …` command in

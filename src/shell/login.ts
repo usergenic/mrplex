@@ -26,6 +26,14 @@ export type DeviceFlowConfig = {
   clientId: string;
   /** Space-delimited scopes (e.g. "openid email profile offline_access"). */
   scope?: string;
+  /**
+   * OAuth `audience` — the API the token is for. Auth0 (and some other IdPs)
+   * only issue a *JWT* access token when the device-authorization request names
+   * an audience; without it they return an opaque token that fails the shell's
+   * JWKS verification. Sent in the device-authorization request when set. This
+   * is the shell's `--oidc-audience` value.
+   */
+  audience?: string;
 };
 
 export type TokenSet = {
@@ -96,6 +104,8 @@ export async function deviceFlowLogin(
   const authResp = await postForm(config.deviceAuthorizationEndpoint, {
     client_id: config.clientId,
     scope: config.scope ?? "openid email profile offline_access",
+    // Only include audience when set — some IdPs reject an empty/unknown one.
+    ...(config.audience !== undefined ? { audience: config.audience } : {}),
   });
   if (!authResp.ok) {
     throw new Error(`device authorization failed: HTTP ${authResp.status}`);

@@ -71,9 +71,11 @@ describe("deviceFlowLogin", () => {
   let server: Server;
   let baseUrl: string;
   let pollsUntilGrant: number;
+  let deviceForm: URLSearchParams | undefined;
 
   beforeEach(async () => {
     pollsUntilGrant = 2;
+    deviceForm = undefined;
     let polls = 0;
     server = createServer((req, res) => {
       let body = "";
@@ -84,6 +86,7 @@ describe("deviceFlowLogin", () => {
         const form = new URLSearchParams(body);
         res.setHeader("Content-Type", "application/json");
         if (req.url === "/device") {
+          deviceForm = form;
           res.end(
             JSON.stringify({
               device_code: "dev-code",
@@ -143,6 +146,31 @@ describe("deviceFlowLogin", () => {
     expect(tokens.refresh_token).toBe("refresh-1");
     expect(tokens.expires_at).toBeGreaterThan(Date.now());
     expect(prompts.join("\n")).toMatch(/WXYZ-1234/);
+  });
+
+  it("includes audience in the device-authorization request when set", async () => {
+    await deviceFlowLogin(
+      {
+        deviceAuthorizationEndpoint: `${baseUrl}/device`,
+        tokenEndpoint: `${baseUrl}/token`,
+        clientId: "cli",
+        audience: "https://api.example.com",
+      },
+      () => {},
+    );
+    expect(deviceForm?.get("audience")).toBe("https://api.example.com");
+  });
+
+  it("omits audience when not set", async () => {
+    await deviceFlowLogin(
+      {
+        deviceAuthorizationEndpoint: `${baseUrl}/device`,
+        tokenEndpoint: `${baseUrl}/token`,
+        clientId: "cli",
+      },
+      () => {},
+    );
+    expect(deviceForm?.has("audience")).toBe(false);
   });
 
   it("refreshes an access token, carrying the refresh token forward", async () => {

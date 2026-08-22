@@ -709,12 +709,17 @@ function buildProgram(): Command {
     .requiredOption("--token-endpoint <url>", "OAuth token endpoint")
     .requiredOption("--client-id <id>", "OAuth client id")
     .option("--scope <scopes>", "space-delimited scopes", "openid email profile offline_access")
+    .option(
+      "--audience <aud>",
+      "OAuth audience — required by Auth0 (and some IdPs) to issue a JWT access token rather than an opaque one; use the same value as the server's --oidc-audience",
+    )
     .action(function (this: Command) {
       const localOpts = this.opts<{
         deviceAuthorizationEndpoint: string;
         tokenEndpoint: string;
         clientId: string;
         scope: string;
+        audience?: string;
       }>();
       (async () => {
         try {
@@ -723,6 +728,7 @@ function buildProgram(): Command {
             tokenEndpoint: localOpts.tokenEndpoint,
             clientId: localOpts.clientId,
             scope: localOpts.scope,
+            audience: localOpts.audience,
           };
           const tokens = await deviceFlowLogin(cfg);
           saveTokenSet(tokens);
