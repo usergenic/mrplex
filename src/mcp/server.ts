@@ -125,7 +125,7 @@ Conventions:
 - Writes use optimistic concurrency: docs_put / docs_delete need the previous version id; a \`stale_prev\` error means someone else wrote first — re-read (docs_get) and retry against the new version.
 - When writing frontmatter, provide exactly one of \`frontmatter\` (JSON object) or \`frontmatter_raw\` (verbatim YAML).
 - The \`query\` tool's filter is a CEL expression with \`$\`-prefixed intrinsics ($path, $updated_at, $body) and link-graph predicates ($in, $has, $backlinks(), $links()). Call the \`query_syntax\` tool for the full language reference before writing a non-trivial filter.
-- Tool failures return an in-band error object { code, data }: e.g. filter_invalid (bad query — data.reason explains, data.hint says what to consult), stale_prev (concurrency conflict), doc_not_found, rank_unavailable (no embedding hook configured). Codes are stable; reasons are prose.`;
+- Tool failures return an in-band error (isError: true) with a JSON object { code, data } in the text content: e.g. filter_invalid (bad query — data.reason explains, data.hint says what to consult), stale_prev (concurrency conflict), doc_not_found, rank_unavailable (no embedding hook configured). Codes are stable; reasons are prose. Error results carry no structuredContent (tool outputSchema describes success shapes only).`;
 
 /**
  * Build a low-level MCP Server with tools/list + tools/call handlers wired
@@ -142,6 +142,7 @@ function buildMcpServer(kernel: Kernel, getContext: () => CallContext): McpLowLe
       name: t.name,
       description: t.description,
       inputSchema: t.inputSchema,
+      ...(t.outputSchema !== undefined && { outputSchema: t.outputSchema }),
     })),
   }));
 
@@ -182,15 +183,18 @@ function buildMcpServer(kernel: Kernel, getContext: () => CallContext): McpLowLe
 
 /**
  * Package a KernelError as an in-band tool error per §6.2 / m3-plan
- * decision. `isError: true`, JSON body in the content, mirrored in
- * structuredContent so agents that read the structured form still see it.
+ * decision. `isError: true` with the JSON `{ code, data }` payload in the
+ * text content — and deliberately NO structuredContent: tools declare
+ * `outputSchema` for their success shapes, and spec-conformant clients
+ * (the SDK included) validate any structuredContent present against it
+ * even on error results. Error consumers parse the text channel
+ * (client/remote-mcp.ts does exactly that).
  */
 function toolError(payload: { code: string; data: Record<string, unknown> }) {
   const text = JSON.stringify(payload);
   return {
     isError: true,
     content: [{ type: "text" as const, text }],
-    structuredContent: payload as Record<string, unknown>,
   };
 }
 

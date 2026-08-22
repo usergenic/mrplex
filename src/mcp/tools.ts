@@ -56,12 +56,20 @@ export type ToolEntry = {
   name: string;
   description: string;
   inputSchema: JsonSchema;
+  /**
+   * Success-result shape of `structuredContent` (MCP `outputSchema`).
+   * In-band tool errors carry no structuredContent (server.ts toolError),
+   * so this describes success results only — per spec, error results are
+   * exempt from output-schema conformance.
+   */
+  outputSchema?: JsonSchema;
   handler: ToolHandler;
 };
 
 // A very small subset of JSON Schema — enough for what our tools accept.
 type JsonSchema = {
   type: "object";
+  description?: string;
   properties: Record<string, JsonSchemaProp>;
   required?: string[];
   additionalProperties?: false;
@@ -77,6 +85,7 @@ type JsonSchemaProp =
       type: "object";
       description?: string;
       properties?: Record<string, JsonSchemaProp>;
+      required?: string[];
       additionalProperties?: boolean | JsonSchemaProp;
     }
   | { oneOf: JsonSchemaProp[]; description?: string }
@@ -157,6 +166,168 @@ function withInjectedVersion(v: Version, raw: boolean): Version {
 }
 
 // -----------------------------------------------------------------------------
+// Output schemas — success-result shapes of `structuredContent` (wire types,
+// §6.4), declared via MCP's `outputSchema` so clients know what each tool
+// returns without calling it. SDK clients validate any structuredContent
+// against these — including on isError results — which is why toolError
+// (server.ts) keeps the error payload in the text channel only.
+// -----------------------------------------------------------------------------
+
+/** `{ items: [...] }` — the wrapList shape for list-returning tools. */
+function listResultSchema(item: JsonSchemaProp, description: string): JsonSchema {
+  return {
+    type: "object",
+    properties: { items: { type: "array", items: item, description } },
+    required: ["items"],
+  };
+}
+
+const REPO_SCHEMA: JsonSchema = {
+  type: "object",
+  description: "A repo (wire shape).",
+  properties: {
+    repo: { type: "string", description: "Repo slug." },
+    path_config: {
+      anyOf: [{ type: "object", additionalProperties: true }, { type: "null" }],
+      description: "Per-repo path-config override; null = server defaults.",
+    },
+  },
+  required: ["repo", "path_config"],
+};
+
+const VERSION_SCHEMA: JsonSchema = {
+  type: "object",
+  description: "A document version (wire shape §6.4).",
+  properties: {
+    version_id: {
+      type: "string",
+      description: "Opaque version id — usable as prev_version_id on the next write.",
+    },
+    prev_version_id: { anyOf: [{ type: "string" }, { type: "null" }] },
+    next_version_id: {
+      anyOf: [{ type: "string" }, { type: "null" }],
+      description: "null when this is the document's current version.",
+    },
+    repo: { type: "string", description: "Repo slug." },
+    path: { type: "string" },
+    frontmatter: {
+      type: "object",
+      additionalProperties: true,
+      description: "Frontmatter parsed to JSON (the query view of frontmatter_raw).",
+    },
+    frontmatter_raw: {
+      type: "string",
+      description:
+        "Verbatim YAML frontmatter. Reads append a server-injected `$version: <id>` line " +
+        "unless raw: true.",
+    },
+    body: { type: "string", description: "Markdown body." },
+    author: { type: "string", description: "Opaque author string." },
+    created_at: { type: "string", description: "ISO-8601 UTC." },
+  },
+  required: [
+    "version_id",
+    "prev_version_id",
+    "next_version_id",
+    "repo",
+    "path",
+    "frontmatter",
+    "frontmatter_raw",
+    "body",
+    "author",
+    "created_at",
+  ],
+};
+
+const DIFF_SCHEMA: JsonSchema = {
+  type: "object",
+  properties: {
+    repo: { type: "string" },
+    path: { type: "string" },
+    from_version_id: { type: "string" },
+    to_version_id: { type: "string" },
+    patch: { type: "string", description: "Unified diff text." },
+  },
+  required: ["repo", "path", "from_version_id", "to_version_id", "patch"],
+};
+
+const LINKS_BACKFILL_SCHEMA: JsonSchema = {
+  type: "object",
+  properties: {
+    documents: { type: "integer", description: "Live documents (re)extracted." },
+    edges: { type: "integer", description: "Link edges indexed." },
+  },
+  required: ["documents", "edges"],
+};
+
+const STALE_LINK_SCHEMA: JsonSchema = {
+  type: "object",
+  description: "A live doc whose written link text no longer matches the target's current path.",
+  properties: {
+    repo: { type: "string" },
+    source_path: { type: "string", description: "Doc containing the stale link." },
+    ord: { type: "integer", description: "Link's ordinal within the source doc." },
+    written: { type: "string", description: "Link target as written." },
+    current: { type: "string", description: "Target's current path." },
+  },
+  required: ["repo", "source_path", "ord", "written", "current"],
+};
+
+const LINKS_REPAIR_SCHEMA: JsonSchema = {
+  type: "object",
+  properties: {
+    dry_run: { type: "boolean" },
+    repaired: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: { path: { type: "string" }, edges: { type: "integer" } },
+        required: ["path", "edges"],
+      },
+    },
+    skipped: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: { path: { type: "string" }, reason: { type: "string" } },
+        required: ["path", "reason"],
+      },
+    },
+  },
+  required: ["dry_run", "repaired", "skipped"],
+};
+
+const SET_PATH_CONFIG_RESULT_SCHEMA: JsonSchema = {
+  type: "object",
+  properties: {
+    repo: REPO_SCHEMA,
+    warnings: {
+      type: "array",
+      description: "Existing paths that violate the new config (flagged, not rejected).",
+      items: {
+        type: "object",
+        properties: {
+          version_id: { type: "string" },
+          path: { type: "string" },
+          reason: { type: "string" },
+        },
+        required: ["version_id", "path", "reason"],
+      },
+    },
+  },
+  required: ["repo", "warnings"],
+};
+
+const SET_LINK_CONFIG_RESULT_SCHEMA: JsonSchema = {
+  type: "object",
+  properties: {
+    repo: REPO_SCHEMA,
+    reindexed: LINKS_BACKFILL_SCHEMA,
+  },
+  required: ["repo", "reindexed"],
+};
+
+// -----------------------------------------------------------------------------
 // Tool definitions
 // -----------------------------------------------------------------------------
 
@@ -174,6 +345,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
         },
       },
     },
+    outputSchema: listResultSchema(REPO_SCHEMA, "Repos the caller can address."),
     handler: async (kernel, ctx, args) => {
       const result = await kernel.repos.list(ctx, {
         include_system: argBoolOpt(args, "include_system") ?? false,
@@ -189,6 +361,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       properties: { repo: { type: "string", description: "Repo slug." } },
       required: ["repo"],
     },
+    outputSchema: REPO_SCHEMA,
     handler: async (kernel, ctx, args) => {
       const result = await kernel.repos.get(ctx, argStr(args, "repo"));
       return { structured: result, text: renderJson(result) };
@@ -202,6 +375,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       properties: { repo: { type: "string", description: "New repo slug." } },
       required: ["repo"],
     },
+    outputSchema: REPO_SCHEMA,
     handler: async (kernel, ctx, args) => {
       const result = await kernel.repos.create(ctx, argStr(args, "repo"));
       return { structured: result, text: `created ${result.repo}` };
@@ -218,6 +392,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       },
       required: ["repo", "new_repo"],
     },
+    outputSchema: REPO_SCHEMA,
     handler: async (kernel, ctx, args) => {
       const result = await kernel.repos.rename(ctx, argStr(args, "repo"), argStr(args, "new_repo"));
       return { structured: result, text: `renamed to ${result.repo}` };
@@ -231,6 +406,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       properties: { repo: { type: "string" } },
       required: ["repo"],
     },
+    outputSchema: REPO_SCHEMA,
     handler: async (kernel, ctx, args) => {
       const result = await kernel.repos.delete(ctx, argStr(args, "repo"));
       return { structured: result, text: `deleted (now ${result.repo})` };
@@ -257,6 +433,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       },
       required: ["repo", "config"],
     },
+    outputSchema: SET_PATH_CONFIG_RESULT_SCHEMA,
     handler: async (kernel, ctx, args) => {
       const cfg = args.config as PathConfigOverride | null;
       const result = await kernel.repos.set_path_config(ctx, argStr(args, "repo"), cfg);
@@ -284,6 +461,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       },
       required: ["repo", "config"],
     },
+    outputSchema: SET_LINK_CONFIG_RESULT_SCHEMA,
     handler: async (kernel, ctx, args) => {
       const cfg = args.config as LinkConfigOverride | null;
       const result = await kernel.repos.set_link_config(ctx, argStr(args, "repo"), cfg);
@@ -311,6 +489,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       },
       required: ["repo", "path"],
     },
+    outputSchema: VERSION_SCHEMA,
     handler: async (kernel, ctx, args) => {
       const v = await kernel.docs.get(ctx, argStr(args, "repo"), argStr(args, "path"));
       const out = withInjectedVersion(v, args.raw === true);
@@ -332,6 +511,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       },
       required: ["repo", "version_id"],
     },
+    outputSchema: VERSION_SCHEMA,
     handler: async (kernel, ctx, args) => {
       const v = await kernel.docs.get_version(
         ctx,
@@ -355,6 +535,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       },
       required: ["repo", "path"],
     },
+    outputSchema: listResultSchema(VERSION_SCHEMA, "Versions newest-first."),
     handler: async (kernel, ctx, args) => {
       const rows = await kernel.docs.history(ctx, argStr(args, "repo"), argStr(args, "path"), {
         limit: argIntOpt(args, "limit"),
@@ -377,6 +558,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       },
       required: ["repo", "path", "from", "to"],
     },
+    outputSchema: DIFF_SCHEMA,
     handler: async (kernel, ctx, args) => {
       const d = await kernel.docs.diff(
         ctx,
@@ -407,6 +589,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       },
       required: ["repo", "path", "body"],
     },
+    outputSchema: VERSION_SCHEMA,
     handler: async (kernel, ctx, args) => {
       const v = await kernel.docs.create(
         writeCtx(ctx, args),
@@ -445,6 +628,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       },
       required: ["repo", "path"],
     },
+    outputSchema: VERSION_SCHEMA,
     handler: async (kernel, ctx, args) => {
       const input: {
         frontmatter?: unknown;
@@ -497,6 +681,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       },
       required: ["repo", "prev_version_id"],
     },
+    outputSchema: VERSION_SCHEMA,
     handler: async (kernel, ctx, args) => {
       const v = await kernel.docs.delete(
         writeCtx(ctx, args),
@@ -516,6 +701,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       properties: { repo: { type: "string" } },
       required: ["repo"],
     },
+    outputSchema: LINKS_BACKFILL_SCHEMA,
     handler: async (kernel, ctx, args) => {
       const r = await kernel.links.backfill(ctx, argStr(args, "repo"));
       return {
@@ -533,6 +719,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       properties: { repo: { type: "string" } },
       required: ["repo"],
     },
+    outputSchema: listResultSchema(STALE_LINK_SCHEMA, "Stale links in live docs."),
     handler: async (kernel, ctx, args) => {
       const rows = await kernel.links.stale(ctx, argStr(args, "repo"));
       const text = rows.length
@@ -550,6 +737,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       properties: { repo: { type: "string" }, dry_run: { type: "boolean" } },
       required: ["repo"],
     },
+    outputSchema: LINKS_REPAIR_SCHEMA,
     handler: async (kernel, ctx, args) => {
       const r = await kernel.links.repair(ctx, argStr(args, "repo"), {
         dry_run: argBoolOpt(args, "dry_run") ?? false,
@@ -627,6 +815,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
         },
       },
     },
+    outputSchema: listResultSchema(VERSION_SCHEMA, "Matching current document versions."),
     handler: async (kernel, ctx, args) => {
       const { scope: _scope, ...specArgs } = args;
       const spec = specArgs as QuerySpec;
@@ -654,6 +843,16 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       "($in, $has, $backlinks(), $links()), text-search syntax, and rank mode. Call this before " +
       "writing a non-trivial filter, or after a filter_invalid error.",
     inputSchema: { type: "object", properties: {} },
+    outputSchema: {
+      type: "object",
+      properties: {
+        reference: {
+          type: "string",
+          description: "Markdown reference for the query filter language.",
+        },
+      },
+      required: ["reference"],
+    },
     handler: () => ({
       structured: { reference: QUERY_SYNTAX_DOC },
       text: QUERY_SYNTAX_DOC,

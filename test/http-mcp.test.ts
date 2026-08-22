@@ -65,10 +65,11 @@ describe("MCP lifecycle + tools/list", () => {
     }
   });
 
-  it("every tool has an object inputSchema", async () => {
+  it("every tool has an object inputSchema and declares an object outputSchema", async () => {
     const r = await client.listTools();
     for (const t of r.tools) {
       expect(t.inputSchema.type).toBe("object");
+      expect(t.outputSchema?.type, `${t.name} outputSchema`).toBe("object");
     }
   });
 
@@ -279,6 +280,66 @@ describe("MCP query round-trip", () => {
     const payload = JSON.parse(((r.content as { text: string }[])[0] as { text: string }).text);
     expect(payload.code).toBe("filter_invalid");
     expect(payload.data.hint).toContain("query_syntax");
+  });
+
+  it("every tool's structuredContent conforms to its outputSchema (SDK client-side validation)", async () => {
+    // listTools caches per-tool output validators in the SDK client; every
+    // callTool after this throws if structuredContent violates the schema.
+    // Walking all 19 tools proves the declared shapes match reality.
+    await client.listTools();
+    const call = async (name: string, args: Record<string, unknown> = {}) => {
+      const r = await client.callTool({ name, arguments: args });
+      expect(r.isError, `${name} errored: ${JSON.stringify(r.content)}`).toBeFalsy();
+      return r.structuredContent as Record<string, unknown>;
+    };
+    await call("repos_create", { repo: "notes" });
+    await call("repos_list");
+    await call("repos_get", { repo: "notes" });
+    await call("repos_set_path_config", { repo: "notes", config: null });
+    await call("repos_set_link_config", { repo: "notes", config: null });
+    const v1 = (await call("docs_create", {
+      repo: "notes",
+      path: "a.md",
+      body: "see [b](b.md)",
+      frontmatter: { status: "draft" },
+    })) as { version_id: string };
+    await call("docs_get", { repo: "notes", path: "a.md" });
+    await call("docs_get_version", { repo: "notes", version_id: v1.version_id });
+    const v2 = (await call("docs_put", {
+      repo: "notes",
+      path: "a.md",
+      prev_version_id: v1.version_id,
+      body: "two",
+    })) as { version_id: string };
+    await call("docs_history", { repo: "notes", path: "a.md" });
+    await call("docs_diff", {
+      repo: "notes",
+      path: "a.md",
+      from: v1.version_id,
+      to: v2.version_id,
+    });
+    await call("query", { repo: "notes", filter: 'status == "draft"' });
+    await call("query_syntax");
+    await call("links_backfill", { repo: "notes" });
+    await call("links_stale", { repo: "notes" });
+    await call("links_repair", { repo: "notes", dry_run: true });
+    await call("docs_delete", { repo: "notes", prev_version_id: v2.version_id });
+    await call("repos_rename", { repo: "notes", new_repo: "notes2" });
+    await call("repos_delete", { repo: "notes2" });
+  });
+
+  it("error results carry no structuredContent (outputSchema-safe) and still parse from text", async () => {
+    // With outputSchema declared and validators cached, a structuredContent
+    // mirror of the error payload would fail SDK client-side validation —
+    // so errors must travel text-only. (A repo must exist: query resolves
+    // repos before parsing the filter and returns [] on an empty set.)
+    await client.listTools();
+    await client.callTool({ name: "repos_create", arguments: { repo: "notes" } });
+    const r = await client.callTool({ name: "query", arguments: { filter: "status ==" } });
+    expect(r.isError).toBe(true);
+    expect(r.structuredContent).toBeUndefined();
+    const payload = JSON.parse(((r.content as { text: string }[])[0] as { text: string }).text);
+    expect(payload.code).toBe("filter_invalid");
   });
 
   it("query_syntax returns the filter-language reference", async () => {
