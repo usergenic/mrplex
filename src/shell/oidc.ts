@@ -29,6 +29,8 @@ export type OidcConfig = {
 export type VerifiedClaims = {
   sub: string;
   email?: string;
+  /** OIDC `email_verified` — whether the IdP has verified ownership of `email`. */
+  email_verified?: boolean;
   name?: string;
 };
 
@@ -75,6 +77,12 @@ export function createOidcVerifier(config: OidcConfig): OidcVerifier {
       }
       const claims: VerifiedClaims = { sub };
       if (typeof payload.email === "string") claims.email = payload.email;
+      // Some IdPs emit email_verified as the string "true"/"false"; accept both.
+      if (typeof payload.email_verified === "boolean") {
+        claims.email_verified = payload.email_verified;
+      } else if (payload.email_verified === "true" || payload.email_verified === "false") {
+        claims.email_verified = payload.email_verified === "true";
+      }
       if (typeof payload.name === "string") claims.name = payload.name;
       return claims;
     },
@@ -88,19 +96,21 @@ export function createOidcVerifier(config: OidcConfig): OidcVerifier {
  * else derived as `${name} <${email}>` (or just `<email>` when the token
  * carries no display name). Throws `OidcError` when no principal binds or no
  * author can be formed.
+ *
+ * Email binding requires `email_verified === true`: an IdP that lets a user set
+ * an arbitrary unverified `email` (or exposes federated emails without
+ * re-verification) would otherwise let a hostile user claim another principal's
+ * grants. `sub` binding is unaffected — it's issuer-namespaced and IdP-controlled.
  */
 export function resolvePrincipalFromClaims(policy: Policy, claims: VerifiedClaims): OidcResolution {
   let matchBySub: string | undefined;
   let matchByEmail: string | undefined;
+  const emailUsable = claims.email !== undefined && claims.email_verified === true;
   for (const [id, principal] of Object.entries(policy.principals)) {
     const binding = principal.oidc;
     if (!binding) continue;
     if (binding.sub !== undefined && binding.sub === claims.sub) matchBySub = id;
-    if (
-      binding.email !== undefined &&
-      claims.email !== undefined &&
-      binding.email === claims.email
-    ) {
+    if (emailUsable && binding.email !== undefined && binding.email === claims.email) {
       matchByEmail = id;
     }
   }

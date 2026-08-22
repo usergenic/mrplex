@@ -57,8 +57,10 @@ export function classifyRestRequest(
     return { kind: "unknown" };
   }
 
-  // /repos/{repo}/config  and  /repos/{repo}/link-config  (PUT → set_*_config)
-  if (segments.length === 3 && (segments[2] === "config" || segments[2] === "link-config")) {
+  // /repos/{repo}/config  (PUT → set_path_config). There is no REST route for
+  // set_link_config — it's only reachable via the MCP repos_set_link_config
+  // tool, and the proxy refuses /mcp entirely, so no branch for it here.
+  if (segments.length === 3 && segments[2] === "config") {
     if (m === "PUT") return { kind: "destructive" };
     return { kind: "unknown" };
   }

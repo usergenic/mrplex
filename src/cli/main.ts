@@ -14,7 +14,7 @@
  * itself ignores it. serve deliberately bypasses the seam — it IS the server.
  */
 
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import { Command, InvalidArgumentError, Option } from "commander";
 import { parseDocument as parseYamlDocument } from "yaml";
 import type { KernelClient } from "../client/kernel-client.js";
@@ -364,7 +364,14 @@ function appendKeyToPolicy(policyPath: string, principalId: string, hash: string
     }
     keys.add(hash);
   }
-  writeFileSync(policyPath, String(doc));
+  // Atomic write: a tmp file on the same volume + rename, so an interleaved
+  // reader (a SIGHUP reload) or a racing `key mint` sees either the whole old
+  // file or the whole new one, never a torn intermediate. Doesn't prevent two
+  // concurrent mints from losing one key (last rename wins), but eliminates
+  // partial reads/writes.
+  const tmp = `${policyPath}.tmp.${process.pid}`;
+  writeFileSync(tmp, String(doc));
+  renameSync(tmp, policyPath);
 }
 
 /** Human-readable dump of an effective entitlement — the operator's "why can't
@@ -608,28 +615,33 @@ function buildProgram(): Command {
         try {
           assertServeGate(localOpts.policy, localOpts.unsafe);
           const database = resolveDatabase(gopts);
-          const storage = await openStorage(database);
 
           if (localOpts.policy === undefined) {
             // Unsafe: raw kernel, launch-time --author/--scope pin the context.
+            const storage = await openStorage(database);
             const kernel = createKernel(storage);
             const mount = await startMcpStdio({ kernel, context: resolveContext(gopts) });
             wireStdioShutdown(mount.close, storage.close.bind(storage));
             return;
           }
 
+          // Resolve everything fallible (policy parse, credential shape, OIDC
+          // config) BEFORE opening storage, so a malformed policy — a real
+          // operator failure mode — fails without leaking a db connection.
           const policy = loadPolicyFile(localOpts.policy);
-          const kernel = createKernel(storage);
           const credential = resolveStdioCredential(
             localOpts.principal,
             localOpts.key,
             localOpts.token,
           );
+          const oidc = buildOidcVerifier(localOpts);
+          const storage = await openStorage(database);
+          const kernel = createKernel(storage);
           const mount = await startShellStdio({
             kernel,
             policy,
             credential,
-            oidc: buildOidcVerifier(localOpts),
+            oidc,
             auditSinkFor: localOpts.audit
               ? (principal) => fileAuditSink(localOpts.audit as string, principal)
               : undefined,
@@ -650,12 +662,14 @@ function buildProgram(): Command {
     .description("authenticating reverse proxy in front of a raw engine upstream")
     .requiredOption("--policy <file>", "YAML policy file")
     .requiredOption("--upstream <target>", "unix:<socket-path> or http://<loopback:port>")
+    .option("--audit <file>", "append a JSONL audit line per authenticated request")
     .option("--port <n>", "TCP port (default 8321)", parsePositiveInt)
     .option("--host <h>", "bind host (default 127.0.0.1)")
     .action(function (this: Command) {
       const localOpts = this.opts<{
         policy: string;
         upstream: string;
+        audit?: string;
         port?: number;
         host?: string;
       }>();
@@ -666,6 +680,9 @@ function buildProgram(): Command {
             upstream: localOpts.upstream,
             host: localOpts.host,
             port: localOpts.port,
+            auditSinkFor: localOpts.audit
+              ? (principal) => fileAuditSink(localOpts.audit as string, principal)
+              : undefined,
           });
           process.on("SIGHUP", () => handle.reloadPolicy());
           const shutdown = async () => {

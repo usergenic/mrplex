@@ -31,8 +31,11 @@ describe("classifyRestRequest", () => {
     expect(classifyRestRequest("PUT", "/repos/notes/config", undefined)).toEqual({
       kind: "destructive",
     });
+  });
+
+  it("treats /link-config as unknown — no such REST route (MCP-only)", () => {
     expect(classifyRestRequest("PUT", "/repos/notes/link-config", undefined)).toEqual({
-      kind: "destructive",
+      kind: "unknown",
     });
   });
 

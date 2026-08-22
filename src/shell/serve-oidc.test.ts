@@ -108,12 +108,22 @@ describe("OIDC front over the wire", () => {
   });
 
   it("authenticates a valid JWT bound by email", async () => {
-    const jwt = await mintJwt({ sub: "auth0|ann", email: "ann@example.com", name: "Ann" });
+    const jwt = await mintJwt({
+      sub: "auth0|ann",
+      email: "ann@example.com",
+      email_verified: true,
+      name: "Ann",
+    });
     expect((await req("GET", "/repos", jwt)).status).toBe(200);
   });
 
   it("stamps the author derived from the token claims", async () => {
-    const jwt = await mintJwt({ sub: "auth0|ann", email: "ann@example.com", name: "Ann" });
+    const jwt = await mintJwt({
+      sub: "auth0|ann",
+      email: "ann@example.com",
+      email_verified: true,
+      name: "Ann",
+    });
     const r = await req("PUT", "/repos/notes/docs/drafts/x.md", jwt, { body: "hi", create: true });
     expect(r.status).toBe(201);
     const v = (await r.json()) as { author: string };
@@ -121,7 +131,12 @@ describe("OIDC front over the wire", () => {
   });
 
   it("enforces the bound principal's write scope", async () => {
-    const jwt = await mintJwt({ sub: "auth0|ann", email: "ann@example.com", name: "Ann" });
+    const jwt = await mintJwt({
+      sub: "auth0|ann",
+      email: "ann@example.com",
+      email_verified: true,
+      name: "Ann",
+    });
     const r = await req("PUT", "/repos/notes/docs/published/x.md", jwt, {
       body: "hi",
       create: true,

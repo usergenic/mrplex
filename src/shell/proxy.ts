@@ -29,9 +29,18 @@ import {
 } from "node:http";
 import type { AddressInfo } from "node:net";
 import { claimsGrantRead, normalizeClaims } from "../kernel/auth/scope.js";
+import type { AuditSink } from "./guard.js";
 import { bearerToken, principalForKey } from "./keys.js";
 import { type Entitlement, type Policy, compile, loadPolicyFile } from "./policy.js";
-import { classifyRestRequest } from "./proxy-policy.js";
+import { type RouteRequirement, classifyRestRequest } from "./proxy-policy.js";
+
+/**
+ * Request-body cap, mirroring the REST surface's `MAX_BODY_BYTES` (8 MB). The
+ * proxy is the enforcement point: it fronts an engine on a unix socket/loopback
+ * that can't be independently rate-limited, so a hostile client streaming
+ * unbounded bytes must be cut off here.
+ */
+const MAX_BODY_BYTES = 8 * 1024 * 1024;
 
 export type ProxyConfig = {
   policyPath: string;
@@ -39,6 +48,13 @@ export type ProxyConfig = {
   upstream: string;
   host?: string;
   port?: number;
+  /**
+   * Audit-sink factory. When set, every authenticated request appends a record
+   * (principal, op derived from method+route, repo/path, outcome). Proxy mode
+   * bypasses the guard, so this is the accountability trail the guard would
+   * otherwise provide (auth-shell plan decision 8).
+   */
+  auditSinkFor?: (principal: string) => AuditSink;
   log?: (msg: string) => void;
 };
 
@@ -91,13 +107,17 @@ export async function startProxyServer(config: ProxyConfig): Promise<ProxyHandle
     return e;
   }
 
-  function authenticate(req: IncomingMessage): Entitlement | null {
+  function authenticate(
+    req: IncomingMessage,
+  ): { principalId: string; entitlement: Entitlement } | null {
     const key = bearerToken(firstHeader(req.headers.authorization));
     if (key === null) return null;
     const principalId = principalForKey(policy, key);
     if (principalId === null) return null;
-    return entitlementFor(principalId);
+    return { principalId, entitlement: entitlementFor(principalId) };
   }
+
+  const auditSinkFor = config.auditSinkFor;
 
   const server = createServer((req, res) => {
     void handle(req, res).catch((err: unknown) =>
@@ -106,11 +126,14 @@ export async function startProxyServer(config: ProxyConfig): Promise<ProxyHandle
   });
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const entitlement = authenticate(req);
-    if (entitlement === null) {
+    const auth = authenticate(req);
+    if (auth === null) {
       return writeError(res, 401, "unauthorized", "missing or invalid credential");
     }
+    const { principalId, entitlement } = auth;
+    const audit = auditSinkFor?.(principalId);
 
+    const method = req.method ?? "GET";
     const url = req.url ?? "/";
     const pathname = new URL(url, "http://x").pathname;
 
@@ -119,6 +142,7 @@ export async function startProxyServer(config: ProxyConfig): Promise<ProxyHandle
     // body, so /mcp is refused entirely in proxy mode — embedded serve is the
     // supported path for authenticated MCP.
     if (pathname === "/mcp" || pathname.startsWith("/mcp?") || pathname.startsWith("/mcp/")) {
+      audit?.({ op: "mcp", outcome: "forbidden" });
       return writeError(
         res,
         403,
@@ -128,13 +152,14 @@ export async function startProxyServer(config: ProxyConfig): Promise<ProxyHandle
     }
 
     // Enforce REST route policy before forwarding.
-    const requirement = classifyRestRequest(
-      req.method ?? "GET",
-      pathname,
-      firstHeader(req.headers.destination),
-    );
+    const requirement = classifyRestRequest(method, pathname, firstHeader(req.headers.destination));
+    const op = opName(method, requirement);
+    const meta = auditMeta(requirement);
     const denial = policyDenial(requirement, entitlement);
-    if (denial !== null) return writeError(res, denial.status, denial.code, denial.reason);
+    if (denial !== null) {
+      audit?.({ op, ...meta, outcome: "forbidden" });
+      return writeError(res, denial.status, denial.code, denial.reason);
+    }
 
     // Strip inbound identity headers, inject the entitlement's. The engine
     // trusts these unconditionally, which is exactly why the client's own
@@ -143,24 +168,48 @@ export async function startProxyServer(config: ProxyConfig): Promise<ProxyHandle
     headers["x-mrplex-author"] = entitlement.author;
     headers["x-mrplex-scope"] = JSON.stringify(entitlement.read);
 
-    forward(req, res, headers);
+    forward(req, res, headers, (status) => {
+      // The shell allowed the call; the engine's status becomes the outcome's
+      // error tag when it's a 4xx/5xx (mirrors the guard's "ok, engine error").
+      audit?.({
+        op,
+        ...meta,
+        outcome: "ok",
+        ...(status >= 400 ? { error: `http_${status}` } : {}),
+      });
+    });
   }
 
   function forward(
     req: IncomingMessage,
     res: ServerResponse,
     headers: Record<string, string | string[]>,
+    onResponse: (status: number) => void,
   ): void {
     const common = { method: req.method, path: req.url, headers };
     const upstreamReq =
       upstream.kind === "unix"
-        ? request({ socketPath: upstream.socketPath, ...common }, (upRes) =>
-            pipeResponse(upRes, res),
-          )
-        : request({ host: upstream.host, port: upstream.port, ...common }, (upRes) =>
-            pipeResponse(upRes, res),
-          );
+        ? request({ socketPath: upstream.socketPath, ...common }, (upRes) => {
+            onResponse(upRes.statusCode ?? 502);
+            pipeResponse(upRes, res);
+          })
+        : request({ host: upstream.host, port: upstream.port, ...common }, (upRes) => {
+            onResponse(upRes.statusCode ?? 502);
+            pipeResponse(upRes, res);
+          });
     upstreamReq.on("error", (err) => writeError(res, 502, "bad_gateway", err.message));
+
+    // Cap the streamed body — the proxy is the enforcement point in front of an
+    // otherwise-unprotected engine. Past the limit, destroy both ends and 413.
+    let total = 0;
+    req.on("data", (chunk: Buffer) => {
+      total += chunk.length;
+      if (total > MAX_BODY_BYTES) {
+        req.destroy();
+        upstreamReq.destroy();
+        writeError(res, 413, "payload_too_large", `body exceeded ${MAX_BODY_BYTES} bytes`);
+      }
+    });
     req.pipe(upstreamReq);
   }
 
@@ -198,6 +247,24 @@ export async function startProxyServer(config: ProxyConfig): Promise<ProxyHandle
   };
 
   return { server, port: boundPort, host, baseUrl, reloadPolicy, close };
+}
+
+/**
+ * A coarse op label for the audit log, derived from method + route class. The
+ * proxy doesn't parse bodies, so this is method-and-route granularity (e.g.
+ * `write`, `destructive`, `read`) rather than the exact kernel op name the
+ * embedded guard records — enough to answer "who did what where".
+ */
+function opName(method: string, requirement: RouteRequirement): string {
+  return `${method.toUpperCase()} ${requirement.kind}`;
+}
+
+/** repo/path fields for the audit record, when the route carries them. */
+function auditMeta(requirement: RouteRequirement): { repo?: string; path?: string } {
+  if (requirement.kind === "write") {
+    return { repo: requirement.repo, path: requirement.paths.join(" -> ") };
+  }
+  return {};
 }
 
 /** Null = allowed. Otherwise the HTTP denial to write. */

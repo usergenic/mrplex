@@ -52,9 +52,26 @@ afterAll(async () => {
 describe("createOidcVerifier.verify", () => {
   it("verifies a well-formed token and returns its claims", async () => {
     const verifier = createOidcVerifier({ issuer: ISSUER, audience: AUDIENCE, jwksUri });
-    const jwt = await mint({ sub: "abc", email: "a@example.com", name: "Ann" });
+    const jwt = await mint({
+      sub: "abc",
+      email: "a@example.com",
+      email_verified: true,
+      name: "Ann",
+    });
     const claims = await verifier.verify(jwt);
-    expect(claims).toEqual({ sub: "abc", email: "a@example.com", name: "Ann" });
+    expect(claims).toEqual({
+      sub: "abc",
+      email: "a@example.com",
+      email_verified: true,
+      name: "Ann",
+    });
+  });
+
+  it("coerces a string email_verified claim to a boolean", async () => {
+    const verifier = createOidcVerifier({ issuer: ISSUER, audience: AUDIENCE, jwksUri });
+    const jwt = await mint({ sub: "abc", email: "a@example.com", email_verified: "true" });
+    const claims = await verifier.verify(jwt);
+    expect(claims.email_verified).toBe(true);
   });
 
   it("rejects a token with the wrong audience", async () => {
@@ -94,22 +111,47 @@ principals:
     expect(r).toEqual({ principalId: "by-sub", author: "Sub Bound <sub@example.com>" });
   });
 
-  it("binds by email and derives the author from claims", () => {
+  it("binds by verified email and derives the author from claims", () => {
     const r = resolvePrincipalFromClaims(policy, {
       sub: "whatever",
       email: "derive@example.com",
+      email_verified: true,
       name: "Dee",
     });
     expect(r).toEqual({ principalId: "by-email", author: "Dee <derive@example.com>" });
   });
 
   it("derives a name-less author as <email>", () => {
-    const r = resolvePrincipalFromClaims(policy, { sub: "x", email: "derive@example.com" });
+    const r = resolvePrincipalFromClaims(policy, {
+      sub: "x",
+      email: "derive@example.com",
+      email_verified: true,
+    });
     expect(r.author).toBe("<derive@example.com>");
   });
 
+  it("refuses an email match when email_verified is missing", () => {
+    expect(() =>
+      resolvePrincipalFromClaims(policy, { sub: "x", email: "derive@example.com" }),
+    ).toThrow(OidcError);
+  });
+
+  it("refuses an email match when email_verified is false", () => {
+    expect(() =>
+      resolvePrincipalFromClaims(policy, {
+        sub: "x",
+        email: "derive@example.com",
+        email_verified: false,
+      }),
+    ).toThrow(OidcError);
+  });
+
   it("prefers a sub match over an email match", () => {
-    const r = resolvePrincipalFromClaims(policy, { sub: "sub-123", email: "derive@example.com" });
+    const r = resolvePrincipalFromClaims(policy, {
+      sub: "sub-123",
+      email: "derive@example.com",
+      email_verified: true,
+    });
     expect(r.principalId).toBe("by-sub");
   });
 

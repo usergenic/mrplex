@@ -5,15 +5,17 @@
  * through with the entitlement's injected scope.
  */
 
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { type ServeHandle, startServer } from "../server/serve.js";
+import { fileAuditSink } from "./audit.js";
 import { mintKey } from "./keys.js";
 import { type ProxyHandle, startProxyServer } from "./proxy.js";
 
 let dir: string;
+let auditPath: string;
 let engine: ServeHandle;
 let proxy: ProxyHandle;
 let base: string;
@@ -47,6 +49,7 @@ beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "mrplex-proxy-"));
   const dbPath = join(dir, "mrplex.db");
   const policyPath = join(dir, "policy.yaml");
+  auditPath = join(dir, "audit.jsonl");
   writeFileSync(
     policyPath,
     `
@@ -91,6 +94,7 @@ principals:
     upstream: engine.baseUrl,
     host: "127.0.0.1",
     port: 0,
+    auditSinkFor: (principal) => fileAuditSink(auditPath, principal),
     log: () => {},
   });
   base = proxy.baseUrl;
@@ -192,5 +196,45 @@ describe("scope injection", () => {
     // If the client's empty scope had won, this would be []; the injected
     // entitlement scope (** on notes) wins, so both seeded docs are visible.
     expect(rows.length).toBeGreaterThanOrEqual(2);
+  });
+});
+
+describe("audit log", () => {
+  function auditLines(): Record<string, unknown>[] {
+    return readFileSync(auditPath, "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l));
+  }
+
+  it("records an allowed write with principal, op, and path", async () => {
+    await req("PUT", "/repos/notes/docs/drafts/a.md", {
+      key: editorKey.plaintext,
+      body: "x",
+      contentType: "text/markdown",
+      create: true,
+    });
+    const rec = auditLines().find((r) => r.path === "drafts/a.md");
+    expect(rec).toMatchObject({ principal: "ed", outcome: "ok", repo: "notes" });
+    expect(typeof rec?.ts).toBe("string");
+    expect(String(rec?.op)).toContain("write");
+  });
+
+  it("records a forbidden write", async () => {
+    await req("PUT", "/repos/notes/docs/published/b.md", {
+      key: editorKey.plaintext,
+      body: "x",
+      contentType: "text/markdown",
+      create: true,
+    });
+    const rec = auditLines().find((r) => r.path === "published/b.md");
+    expect(rec?.outcome).toBe("forbidden");
+  });
+
+  it("records a refused MCP attempt", async () => {
+    await req("POST", "/mcp", { key: operatorKey.plaintext });
+    const rec = auditLines().find((r) => r.op === "mcp");
+    expect(rec).toMatchObject({ principal: "op", outcome: "forbidden" });
   });
 });
