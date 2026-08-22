@@ -2,7 +2,7 @@
 
 *Markdown Repos, plexed.* A queryable, versioned store for Markdown documents with YAML frontmatter.
 
-Two layers: a **full-trust kernel** (no in-engine auth — whoever reaches it can do anything) and an **access-and-identity shell** that wraps it (API keys / OIDC, per-path write policy, an audit log). See [docs/security.md](docs/security.md) for the trust model and deployment shapes. Prior design docs live in [docs/archive/](docs/archive/) — including the original [design.md](docs/archive/design.md) — and may be out of date where later work supersedes them.
+Two layers: a **full-trust kernel** (no in-engine auth — whoever reaches it can do anything) and an **access-and-identity shell** that wraps it (API keys / OIDC, per-path write policy, an audit log). See [docs/security.md](docs/archive/security.md) for the trust model and deployment shapes. Prior design docs live in [docs/archive/](docs/archive/) — including the original [design.md](docs/archive/design.md) — and may be out of date where later work supersedes them.
 
 ## Features
 
@@ -98,7 +98,7 @@ mrplex query --repo notes --filter 'status == "published"' \
 There are no users, tokens, or per-path write policy in the engine — those are
 the shell's job. For multi-user or networked setups, run the built-in
 authenticating shell instead of the raw kernel — see
-[Authentication](#authentication) below and [docs/security.md](docs/security.md).
+[Authentication](#authentication) below and [docs/security.md](docs/archive/security.md).
 Never expose the raw kernel (`serve --unsafe`) directly to an untrusted network.
 
 Query — CEL filters + FTS + rank composed:
@@ -247,7 +247,7 @@ listener), **launcher** (`mcp-stdio --policy`, a guarded stdio MCP session), and
 **fronting proxy** (`proxy --policy --upstream`, for topologies that must run the
 engine separately). Edit the policy file and `kill -HUP` the server to reload
 grants and key revocations without a restart. Full details, trust boundaries,
-and the header-injection contract are in [docs/security.md](docs/security.md).
+and the header-injection contract are in [docs/security.md](docs/archive/security.md).
 
 ### Walkthrough: OIDC login with Auth0
 
@@ -274,7 +274,7 @@ mrplex serve --policy policy.yaml \
 ```
 
 **3. Bind a principal by claim.** Auth0 puts the user's email in the token; the
-shell only trusts it when `email_verified` is true (see [docs/security.md](docs/security.md)),
+shell only trusts it when `email_verified` is true (see [docs/security.md](docs/archive/security.md)),
 so bind by `email` for verified users, or by the issuer-stable `sub` otherwise:
 
 ```yaml

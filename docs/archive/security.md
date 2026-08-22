@@ -6,7 +6,7 @@ Two layers, one hard boundary between them.
   `CallContext` — an opaque `author` string stamped on writes, and an optional
   `ScopeClaim[]` that narrows *read* visibility. Reachable = permitted. There is
   no identity, no token, no admin bit, and no per-path *write* policy in the
-  engine. This is deliberate (see [archive/noauth-plan.md](archive/noauth-plan.md)):
+  engine. This is deliberate (see [archive/noauth-plan.md](noauth-plan.md)):
   an optional-auth mode is the worst of both worlds — the surface area of auth
   with the guarantees of none.
 - The **shell** (`src/shell/`) is everything the kernel refuses to be:
