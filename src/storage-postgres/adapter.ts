@@ -20,6 +20,7 @@ import { normalizeKey } from "../kernel/casefold.js";
 import { KernelError } from "../kernel/errors.js";
 import type { SearchPlan } from "../storage/search-plan.js";
 import type {
+  AdjacentLink,
   BacklogRow,
   BacklogStatus,
   ChunkRow,
@@ -441,6 +442,71 @@ class PostgresStorage implements Storage {
         [repo_id],
       );
       return res.rows;
+    });
+  }
+
+  async links_adjacent_out(
+    repo_id: number,
+    source_ids: readonly number[],
+  ): Promise<AdjacentLink[]> {
+    if (source_ids.length === 0) return [];
+    // `= ANY($2::bigint[])` binds the whole id batch as one array param, so
+    // there's no per-id placeholder and no Postgres parameter-limit concern.
+    return this.withClient(async (c) => {
+      const res = await c.query<AdjacentLink>(
+        `select distinct source_id, target_id, field
+         from links
+         where repo_id = $1 and target_id is not null and source_id = ANY($2::bigint[])`,
+        [repo_id, source_ids],
+      );
+      return res.rows;
+    });
+  }
+
+  async links_adjacent_in(repo_id: number, target_ids: readonly number[]): Promise<AdjacentLink[]> {
+    if (target_ids.length === 0) return [];
+    return this.withClient(async (c) => {
+      const res = await c.query<AdjacentLink>(
+        `select distinct source_id, target_id, field
+         from links
+         where repo_id = $1 and target_id is not null and target_id = ANY($2::bigint[])`,
+        [repo_id, target_ids],
+      );
+      return res.rows;
+    });
+  }
+
+  async versions_current_by_documents(
+    repo_id: number,
+    document_ids: readonly number[],
+  ): Promise<VersionRow[]> {
+    if (document_ids.length === 0) return [];
+    return this.withClient(async (c) => {
+      const res = await c.query<VersionRawRow>(
+        `select id, document_id, repo_id, prev_id, next_id, path,
+                frontmatter_raw, frontmatter, body, author, created_at
+         from versions
+         where repo_id = $1 and next_id is null and document_id = ANY($2::bigint[])`,
+        [repo_id, document_ids],
+      );
+      return res.rows as VersionRow[];
+    });
+  }
+
+  async versions_live_document_ids_matching(
+    repo_id: number,
+    path_regexes: readonly string[],
+  ): Promise<number[]> {
+    if (path_regexes.length === 0) return [];
+    // `path ~ ANY($2)` matches against the whole regex array in one predicate;
+    // POSIX ARE, same engine the scope-glob compiler uses.
+    return this.withClient(async (c) => {
+      const res = await c.query<{ document_id: number }>(
+        `select document_id from versions
+         where repo_id = $1 and next_id is null and path ~ ANY($2::text[])`,
+        [repo_id, path_regexes],
+      );
+      return res.rows.map((r) => r.document_id);
     });
   }
 

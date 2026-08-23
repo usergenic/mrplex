@@ -43,6 +43,7 @@ import {
   type FrontmatterInput,
   canonicalizeFrontmatter,
 } from "./frontmatter-input.js";
+import { type GraphDeps, runGraph } from "./graph.js";
 import {
   HARDCODED_DEFAULTS,
   type PathConfig,
@@ -55,7 +56,7 @@ import {
 import { type QuerySpec, runQuery } from "./query/query.js";
 import { validatePath, validateSlug } from "./validation.js";
 import { decodeVersionId, encodeVersionId } from "./version-id.js";
-import type { PathWarning, Repo, Version } from "./wire.js";
+import type { GraphResult, GraphSpec, PathWarning, Repo, Version } from "./wire.js";
 
 export type HistoryOptions = { limit?: number; before?: string };
 
@@ -144,6 +145,8 @@ export type Kernel = {
     repair(ctx: CallContext, repo: string, opts?: { dry_run?: boolean }): Promise<RepairResult>;
   };
   query(ctx: CallContext, spec: QuerySpec): Promise<Version[]>;
+  /** Neighborhood expansion over the links index (docs/graph-plan.md). */
+  graph(ctx: CallContext, spec: GraphSpec): Promise<GraphResult>;
 };
 
 export type KernelConfig = {
@@ -683,6 +686,11 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
         toVersionWire,
         queryEmbed,
       });
+    },
+
+    async graph(ctx: CallContext, spec: GraphSpec): Promise<GraphResult> {
+      const deps: GraphDeps = { storage, serverPathConfig };
+      return runGraph(claimsFor(ctx), spec, deps);
     },
   };
   return kernel;

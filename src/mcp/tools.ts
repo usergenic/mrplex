@@ -19,11 +19,17 @@ import { KernelError } from "../kernel/errors.js";
 import type { Kernel } from "../kernel/kernel.js";
 import type { PathConfigOverride } from "../kernel/path-config.js";
 import type { QuerySpec } from "../kernel/query/query.js";
-import type { Version } from "../kernel/wire.js";
+import type { GraphSpec, Version } from "../kernel/wire.js";
 import type { LinkConfigOverride } from "../links/link-config.js";
 import { appendSystemProperty, extractSystemProperties } from "../markdown/frontmatter.js";
 import { QUERY_SYNTAX_DOC } from "./query-syntax.js";
-import { renderJson, renderRepoList, renderVersion, renderVersionList } from "./render.js";
+import {
+  renderGraphSummary,
+  renderJson,
+  renderRepoList,
+  renderVersion,
+  renderVersionList,
+} from "./render.js";
 
 /**
  * A tool's structured payload is always a JSON object — MCP's
@@ -325,6 +331,88 @@ const SET_LINK_CONFIG_RESULT_SCHEMA: JsonSchema = {
     reindexed: LINKS_BACKFILL_SCHEMA,
   },
   required: ["repo", "reindexed"],
+};
+
+const GRAPH_DOCUMENT_SCHEMA: JsonSchemaProp = {
+  type: "object",
+  description:
+    "A reached document. `$`-keys are system intrinsics; any other keys are `select`-projected " +
+    "frontmatter (a missing key is simply absent).",
+  properties: {
+    $path: { type: "string", description: "The document's current path." },
+    $degrees: {
+      type: "integer",
+      description:
+        "Call-relative: minimum hops from the nearest root under THIS call's direction/fields/" +
+        "filter/scope. Not a stable property — do not persist it across calls. Roots are 0.",
+    },
+    $links: {
+      type: "integer",
+      description:
+        "Count of distinct scope-visible documents this document links to — its true visible " +
+        "out-degree, independent of this call's filter/fields/degrees (stable across calls). " +
+        "Useful for ranking frontier docs (hub vs. leaf).",
+    },
+    $backlinks: {
+      type: "integer",
+      description: "Count of distinct scope-visible documents linking TO this document.",
+    },
+  },
+  required: ["$path", "$degrees", "$links", "$backlinks"],
+  // `select`-projected frontmatter keys appear as bare keys alongside the $-intrinsics.
+  additionalProperties: true,
+};
+
+const GRAPH_LINK_SCHEMA: JsonSchemaProp = {
+  type: "object",
+  description:
+    "An induced link: a distinct (source, target, field) triple where both endpoints appear in " +
+    "`documents`. `field` is the relationship type (`$body` = an untyped body link). No " +
+    "occurrence count — a link is a pure statement of relationship.",
+  properties: {
+    source: { type: "string", description: "Linking document's path." },
+    target: { type: "string", description: "Linked-to document's path." },
+    field: { type: "string", description: "Relationship type; `$body` for body links." },
+  },
+  required: ["source", "target", "field"],
+};
+
+const GRAPH_RESULT_SCHEMA: JsonSchema = {
+  type: "object",
+  description: "A graph neighborhood: documents and the links between them (docs/graph-plan.md).",
+  properties: {
+    documents: {
+      type: "array",
+      items: GRAPH_DOCUMENT_SCHEMA,
+      description: "Reached documents, ordered by ($degrees, $path).",
+    },
+    links: {
+      type: "array",
+      items: GRAPH_LINK_SCHEMA,
+      description:
+        "Induced distinct links over the returned documents, ordered (source,target,field).",
+    },
+    frontier: {
+      type: "array",
+      items: { type: "string" },
+      description:
+        "Paths of returned documents whose links were NOT fully enumerated (cut by the degrees " +
+        "cap or by max_documents). The continuation contract: there are no cursors — re-root a " +
+        "follow-up `graph` call at chosen frontier paths and union the results.",
+    },
+    complete_degrees: {
+      type: "integer",
+      description:
+        "Largest d such that every effective-graph document within d hops of a root is present. " +
+        "When truncated is false this equals the requested degrees; when max_documents cut a ring " +
+        'it makes the partial result precise ("the 2-hop ball is exhaustive, the 3-ring is sampled").',
+    },
+    truncated: {
+      type: "boolean",
+      description: "True iff max_documents (or the server links ceiling) elided anything.",
+    },
+  },
+  required: ["documents", "links", "frontier", "complete_degrees", "truncated"],
 };
 
 // -----------------------------------------------------------------------------
@@ -829,6 +917,104 @@ export const TOOL_REGISTRY: ToolEntry[] = [
           throw new KernelError("filter_invalid", {
             ...(err.data as Record<string, unknown>),
             hint: "call the `query_syntax` tool for the full filter-language reference",
+          });
+        }
+        throw err;
+      }
+    },
+  },
+  // ---- graph ----
+  {
+    name: "graph",
+    description:
+      "Explore how documents connect. BFS neighborhood expansion over the link graph: from a set " +
+      "of `roots`, expand outward under a `direction` lens up to `degrees` hops, returning the " +
+      "reached `documents` AND the `links` between them. Where `query` answers *which* documents " +
+      "match, `graph` answers *how* documents connect. `filter` is CEL evaluated as VISIBILITY " +
+      "(not selection): a non-matching document is hidden AND blocks paths through itself — plus " +
+      "the graph-only `$degrees` intrinsic (min hops from the nearest root). Killer pattern: " +
+      '`$degrees <= 1 || type == "person"` — expand everything one hop, but keep following person ' +
+      "docs. Results are deterministic. Continue past the `frontier` by re-rooting a follow-up call " +
+      "at chosen frontier paths (no cursors). See the `query_syntax` tool for the filter language.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string", description: "Repo slug (exactly one; links are repo-local)." },
+        roots: {
+          oneOf: [{ type: "string" }, { type: "array", items: { type: "string" } }],
+          description:
+            "Root document(s): an exact path or gitignore-style glob, or a list of either. Every " +
+            "visible, filter-matching current document matching any pattern enters at $degrees 0. " +
+            "A glob matching nothing yields an empty result (not an error).",
+        },
+        direction: {
+          type: "string",
+          enum: ["out", "in", "both"],
+          description:
+            'Traversal lens (default "both"). "out": follow links source→target (what this doc ' +
+            'references, transitively). "in": target→source (the backlink neighborhood). "both": ' +
+            "undirected (degrees-of-separation; co-citation appears at degrees 2+).",
+        },
+        degrees: {
+          type: "integer",
+          minimum: 0,
+          description: "Max hops from the nearest root (default 1; 0 = roots only). Server-capped.",
+        },
+        fields: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            'Restrict BOTH traversal and output links to these relationship fields. `"$body"` is a ' +
+            "valid member (untyped body links); other members are frontmatter field names.",
+        },
+        filter: {
+          type: "string",
+          description:
+            "CEL boolean expression, same dialect as `query` (frontmatter keys, $-intrinsics, " +
+            "$in/$has/$links()/$backlinks()) PLUS `$degrees` (min hops from the nearest root — " +
+            "legal only here). Semantics: VISIBILITY — a non-matching document is not returned and " +
+            "blocks paths through itself.",
+        },
+        select: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            'Frontmatter keys to project onto result documents as bare keys (default ["title"]). ' +
+            "A missing key on a given doc is simply absent. Bare keys only (no $-intrinsics).",
+        },
+        max_documents: {
+          type: "integer",
+          minimum: 1,
+          description:
+            "Soft budget on documents (incl. roots; default 100, server hard-capped). Links are a " +
+            "consequence, not budgeted. Truncation is deterministic (BFS order, $path tiebreak).",
+        },
+        scope: {
+          type: "array",
+          description:
+            "Read-visibility claims (ScopeClaim[]) narrowing what this call sees. The X-Mrplex-Scope " +
+            "header, if present, wins. An out-of-scope endpoint hides the doc, its links, and paths " +
+            "through it.",
+          items: { type: "object", additionalProperties: true },
+        },
+      },
+      required: ["repo", "roots"],
+    },
+    outputSchema: GRAPH_RESULT_SCHEMA,
+    handler: async (kernel, ctx, args) => {
+      const { scope: _scope, ...specArgs } = args;
+      const spec = specArgs as unknown as GraphSpec;
+      try {
+        const result = await kernel.graph(queryCtx(ctx, args), spec);
+        return {
+          structured: result as unknown as Record<string, unknown>,
+          text: renderGraphSummary(result),
+        };
+      } catch (err) {
+        if (err instanceof KernelError && err.code === "filter_invalid") {
+          throw new KernelError("filter_invalid", {
+            ...(err.data as Record<string, unknown>),
+            hint: "call the `query_syntax` tool for the full filter-language reference ($degrees is graph-only)",
           });
         }
         throw err;

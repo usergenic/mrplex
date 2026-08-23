@@ -27,7 +27,9 @@ import { globToRegexSource } from "../kernel/auth/glob.js";
 import { type CallContext, type ScopeClaim, parseScopeClaims } from "../kernel/context.js";
 import { KernelError } from "../kernel/errors.js";
 import { createKernel } from "../kernel/kernel.js";
+import type { GraphSpec } from "../kernel/wire.js";
 import { extractSystemProperties, split as splitFrontmatter } from "../markdown/frontmatter.js";
+import { renderGraphSummary } from "../mcp/render.js";
 import { startMcpStdio } from "../mcp/server.js";
 import { startServer } from "../server/serve.js";
 import { fileAuditSink } from "../shell/audit.js";
@@ -47,6 +49,8 @@ import { normalizeDatabaseUrl, openStorage } from "../storage/registry.js";
 import { type CliConfig, loadConfig, saveConfig } from "./config.js";
 import { exitCodeForKernelError } from "./exit-codes.js";
 import {
+  renderGraphMermaid,
+  renderGraphYaml,
   renderHistoryTable,
   renderQueryTable,
   renderReposTable,
@@ -86,6 +90,18 @@ function parsePositiveInt(value: string, _prev: unknown): number {
   const n = Number.parseInt(value, 10);
   if (!Number.isSafeInteger(n) || n <= 0) {
     throw new InvalidArgumentError(`expected a positive integer, got "${value}"`);
+  }
+  return n;
+}
+
+/** Like parsePositiveInt but allows 0 (e.g. `graph --degrees 0` = roots only). */
+function parsePositiveIntOrZero(value: string, _prev: unknown): number {
+  if (!/^\d+$/.test(value)) {
+    throw new InvalidArgumentError(`expected a non-negative integer, got "${value}"`);
+  }
+  const n = Number.parseInt(value, 10);
+  if (!Number.isSafeInteger(n) || n < 0) {
+    throw new InvalidArgumentError(`expected a non-negative integer, got "${value}"`);
   }
   return n;
 }
@@ -1207,6 +1223,79 @@ function buildProgram(): Command {
           include_system: localOpts.includeSystem,
         });
         emit(result, opts, renderQueryTable(result));
+      }).catch(reportError);
+    });
+
+  // -------- graph --------
+  program
+    .command("graph")
+    .description("explore how documents connect — BFS over the link graph (docs/graph-plan.md)")
+    .option(
+      "-r, --repo <slug>",
+      "repo slug (exactly one; links are repo-local; default: global -r/MRPLEX_REPO)",
+    )
+    .requiredOption(
+      "--roots <path-or-glob>",
+      "root path/glob; repeat to add more",
+      (value: string, prev: string[] | undefined) => [...(prev ?? []), value],
+    )
+    .option("--direction <lens>", "out | in | both (default both)")
+    .option(
+      "--degrees <n>",
+      "max hops from the nearest root (default 1; 0 = roots only)",
+      parsePositiveIntOrZero,
+    )
+    .option(
+      "--fields <field>",
+      "restrict traversal + output links to this field ($body valid); repeat to add more",
+      (value: string, prev: string[] | undefined) => [...(prev ?? []), value],
+    )
+    .option("--filter <expr>", "CEL visibility filter; supports the graph-only $degrees intrinsic")
+    .option(
+      "--select <key>",
+      "frontmatter key to project onto documents (default title); repeat to add more",
+      (value: string, prev: string[] | undefined) => [...(prev ?? []), value],
+    )
+    .option("--max-documents <n>", "soft budget on documents (default 100)", parsePositiveInt)
+    .option("--render <fmt>", "summary | yaml | mermaid | json (default summary)", "summary")
+    .action(function (this: Command) {
+      const localOpts = this.opts<{
+        repo?: string;
+        roots: string[];
+        direction?: string;
+        degrees?: number;
+        fields?: string[];
+        filter?: string;
+        select?: string[];
+        maxDocuments?: number;
+        render: string;
+      }>();
+      const globals = this.optsWithGlobals<GlobalOpts>();
+      const repo = localOpts.repo ?? resolveRepoSlug(globals);
+      withClient(this, async (client, opts) => {
+        const result = await client.graph({
+          repo,
+          roots: localOpts.roots,
+          direction: localOpts.direction as GraphSpec["direction"],
+          degrees: localOpts.degrees,
+          fields: localOpts.fields,
+          filter: localOpts.filter,
+          select: localOpts.select,
+          max_documents: localOpts.maxDocuments,
+        });
+        // `--render` selects the presentation (its native idiom); `--json` (or
+        // `--render json`) still yields the raw structured payload via emit.
+        if (opts.json || localOpts.render === "json") {
+          emit(result, { ...opts, json: true }, "");
+          return;
+        }
+        const text =
+          localOpts.render === "yaml"
+            ? renderGraphYaml(result)
+            : localOpts.render === "mermaid"
+              ? renderGraphMermaid(result)
+              : renderGraphSummary(result);
+        emit(result, opts, text);
       }).catch(reportError);
     });
 

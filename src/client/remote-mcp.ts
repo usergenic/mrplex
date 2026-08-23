@@ -25,7 +25,7 @@ import type {
 } from "../kernel/kernel.js";
 import type { PathConfigOverride } from "../kernel/path-config.js";
 import type { QuerySpec } from "../kernel/query/query.js";
-import type { PathWarning, Repo, Version } from "../kernel/wire.js";
+import type { GraphResult, GraphSpec, PathWarning, Repo, Version } from "../kernel/wire.js";
 import type { LinkConfigOverride } from "../links/link-config.js";
 import type { HistoryOptions, KernelClient, SetPathConfigResult } from "./kernel-client.js";
 
@@ -189,6 +189,8 @@ function buildRemoteClient(client: Client): KernelClient {
       const wrapped = await call<{ items: Version[] }>("query", spec as Record<string, unknown>);
       return wrapped.items;
     },
+    graph: (spec: GraphSpec) =>
+      call<GraphResult>("graph", spec as unknown as Record<string, unknown>),
     close: async () => {
       if (closed) return;
       closed = true;

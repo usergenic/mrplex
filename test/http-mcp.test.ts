@@ -37,9 +37,9 @@ afterEach(async () => {
 });
 
 describe("MCP lifecycle + tools/list", () => {
-  it("lists 19 tools (no user/token tools after noauth; links_* + set_link_config + query_syntax)", async () => {
+  it("lists 20 tools (no user/token tools after noauth; links_* + set_link_config + query_syntax + graph)", async () => {
     const r = await client.listTools();
-    expect(r.tools.length).toBe(19);
+    expect(r.tools.length).toBe(20);
     // Sample the important names.
     const names = new Set(r.tools.map((t) => t.name));
     for (const name of [
@@ -52,6 +52,7 @@ describe("MCP lifecycle + tools/list", () => {
       "docs_diff",
       "query",
       "query_syntax",
+      "graph",
       "links_backfill",
       "links_stale",
       "links_repair",
@@ -285,7 +286,7 @@ describe("MCP query round-trip", () => {
   it("every tool's structuredContent conforms to its outputSchema (SDK client-side validation)", async () => {
     // listTools caches per-tool output validators in the SDK client; every
     // callTool after this throws if structuredContent violates the schema.
-    // Walking all 19 tools proves the declared shapes match reality.
+    // Walking all 20 tools proves the declared shapes match reality.
     await client.listTools();
     const call = async (name: string, args: Record<string, unknown> = {}) => {
       const r = await client.callTool({ name, arguments: args });
@@ -320,6 +321,7 @@ describe("MCP query round-trip", () => {
     });
     await call("query", { repo: "notes", filter: 'status == "draft"' });
     await call("query_syntax");
+    await call("graph", { repo: "notes", roots: "a.md", degrees: 1 });
     await call("links_backfill", { repo: "notes" });
     await call("links_stale", { repo: "notes" });
     await call("links_repair", { repo: "notes", dry_run: true });
@@ -352,5 +354,88 @@ describe("MCP query round-trip", () => {
     // The text content mirrors the structured form so text-only clients
     // (and models reading tool output as text) get the same doc.
     expect(((r.content as { text: string }[])[0] as { text: string }).text).toBe(reference);
+  });
+
+  it("query_syntax documents the graph-only $degrees intrinsic", async () => {
+    const r = await client.callTool({ name: "query_syntax", arguments: {} });
+    const reference = (r.structuredContent as { reference: string }).reference;
+    expect(reference).toContain("$degrees");
+    expect(reference).toContain("graph mode only");
+  });
+});
+
+describe("MCP graph round-trip", () => {
+  beforeEach(async () => {
+    await client.callTool({ name: "repos_create", arguments: { repo: "notes" } });
+    await client.callTool({
+      name: "docs_create",
+      arguments: { repo: "notes", path: "leaf.md", body: "", frontmatter: { title: "Leaf" } },
+    });
+    await client.callTool({
+      name: "docs_create",
+      arguments: {
+        repo: "notes",
+        path: "root.md",
+        body: "[leaf](leaf.md)",
+        frontmatter: { title: "Root" },
+      },
+    });
+  });
+
+  it("returns documents, induced links, frontier, and truncation metadata", async () => {
+    await client.listTools(); // cache the outputSchema validator
+    const r = await client.callTool({
+      name: "graph",
+      arguments: { repo: "notes", roots: "root.md", direction: "out", degrees: 1 },
+    });
+    expect(r.isError).toBeFalsy();
+    const result = r.structuredContent as {
+      documents: { $path: string; $degrees: number; title?: string }[];
+      links: { source: string; target: string; field: string }[];
+      frontier: string[];
+      complete_degrees: number;
+      truncated: boolean;
+    };
+    expect(result.documents.map((d) => d.$path)).toEqual(["root.md", "leaf.md"]);
+    expect(result.documents[0]?.title).toBe("Root");
+    expect(result.links).toEqual([{ source: "root.md", target: "leaf.md", field: "$body" }]);
+    expect(result.complete_degrees).toBe(1);
+    expect(result.truncated).toBe(false);
+  });
+
+  it("the text half is the adjacency summary", async () => {
+    const r = await client.callTool({
+      name: "graph",
+      arguments: { repo: "notes", roots: "root.md", direction: "out", degrees: 1 },
+    });
+    const text = ((r.content as { text: string }[])[0] as { text: string }).text;
+    expect(text).toContain("root.md (0)");
+    expect(text).toContain("→($body) leaf.md");
+    expect(text).toContain("complete through 1 degree");
+  });
+
+  it("a $degrees filter is accepted (graph-only intrinsic)", async () => {
+    const r = await client.callTool({
+      name: "graph",
+      arguments: {
+        repo: "notes",
+        roots: "root.md",
+        direction: "out",
+        degrees: 3,
+        filter: "$degrees <= 1",
+      },
+    });
+    expect(r.isError).toBeFalsy();
+  });
+
+  it("a bad filter surfaces filter_invalid with the query_syntax hint", async () => {
+    const r = await client.callTool({
+      name: "graph",
+      arguments: { repo: "notes", roots: "root.md", filter: "status ==" },
+    });
+    expect(r.isError).toBe(true);
+    const payload = JSON.parse(((r.content as { text: string }[])[0] as { text: string }).text);
+    expect(payload.code).toBe("filter_invalid");
+    expect(payload.data.hint).toContain("query_syntax");
   });
 });

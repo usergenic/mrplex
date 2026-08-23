@@ -32,3 +32,67 @@ export type PathWarning = {
   path: string;
   reason: string;
 };
+
+// -----------------------------------------------------------------------------
+// Graph read surface (docs/graph-plan.md). The API transacts in documents and
+// links — no "nodes"/"edges" anywhere on the wire.
+// -----------------------------------------------------------------------------
+
+/** Direction lens for a graph expansion (§2.1). */
+export type GraphDirection = "out" | "in" | "both";
+
+/**
+ * Input to `kernel.graph` (§2.1). `roots` is a path or gitignore-style glob,
+ * string or array. `filter` is CEL, evaluated as *visibility* (not selection);
+ * `$degrees` is legal only here. `fields` restricts both traversal and the
+ * output `links`. `select` names bare frontmatter keys projected onto result
+ * documents (default `["title"]`).
+ */
+export type GraphSpec = {
+  repo: string;
+  roots: string | string[];
+  direction?: GraphDirection;
+  degrees?: number;
+  fields?: string[];
+  filter?: string;
+  select?: string[];
+  max_documents?: number;
+};
+
+/**
+ * A result document (§2.2): the filter language's data model reified. Bare
+ * keys are `select`-projected frontmatter; `$`-keys are system intrinsics, so
+ * no user frontmatter key can collide. `$degrees` is call-relative (minimum
+ * hops from the nearest root under this call's lens) and must not be persisted
+ * across calls. `$links`/`$backlinks` are counts of distinct scope-visible
+ * documents, independent of this call's filter/fields/degrees.
+ */
+export type GraphDocument = {
+  $path: string;
+  $degrees: number;
+  $links: number;
+  $backlinks: number;
+  [frontmatterKey: string]: unknown;
+};
+
+/** An induced link on the wire (§2.2): a distinct (source, target, field)
+ * triple, both endpoints present in `documents`. No `ord`, no counts. */
+export type GraphLink = {
+  source: string;
+  target: string;
+  field: string;
+};
+
+/** Structured result of `kernel.graph` (§2.2). */
+export type GraphResult = {
+  documents: GraphDocument[];
+  links: GraphLink[];
+  /** Paths of returned documents whose links were not fully enumerated —
+   * the continuation contract (§2.2, decision 10). Sorted by path. */
+  frontier: string[];
+  /** Largest d such that every effective-graph document within d hops of a
+   * root is present (§2.2). Equals `degrees` when `truncated` is false. */
+  complete_degrees: number;
+  /** True iff `max_documents` or the links ceiling elided anything. */
+  truncated: boolean;
+};

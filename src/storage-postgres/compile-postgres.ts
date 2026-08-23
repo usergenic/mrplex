@@ -87,6 +87,12 @@ export function compileSearchPlan(plan: SearchPlan): CompiledSql {
     clauses.push(`versions.id = ANY(${b.push(plan.candidate_ids)}::bigint[])`);
   }
 
+  // Candidate DOCUMENT-id whitelist (graph read surface). Restricts to live
+  // versions of these documents so a BFS round's visibility check is one pass.
+  if (plan.candidate_document_ids && plan.candidate_document_ids.length > 0) {
+    clauses.push(`versions.document_id = ANY(${b.push(plan.candidate_document_ids)}::bigint[])`);
+  }
+
   const cols = `versions.id, versions.document_id, versions.repo_id,
                 versions.prev_id, versions.next_id, versions.path,
                 versions.frontmatter_raw, versions.frontmatter,

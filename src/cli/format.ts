@@ -1,4 +1,4 @@
-import type { Repo, Version } from "../kernel/wire.js";
+import type { GraphResult, Repo, Version } from "../kernel/wire.js";
 import { join as joinFrontmatter } from "../markdown/frontmatter.js";
 
 /**
@@ -44,4 +44,87 @@ function renderTable(headers: string[], rows: string[][]): string {
     line(headers.map((_, i) => "-".repeat(widths[i] ?? 0))),
     ...rows.map(line),
   ].join("\n");
+}
+
+// -----------------------------------------------------------------------------
+// Graph renders (docs/graph-plan.md §2.3). CLI-only presentations of the
+// structured GraphResult; the `summary` render is shared with the MCP text
+// half (mcp/render.ts renderGraphSummary). These are pure functions of the
+// result — presentation is a surface concern, never a call parameter.
+// -----------------------------------------------------------------------------
+
+/**
+ * YAML dump of the structured payload — a better *reading* format than JSON
+ * for a human or LLM skimming a subgraph. Hand-rolled (the shape is flat and
+ * known) rather than pulling in a YAML serializer.
+ */
+export function renderGraphYaml(result: GraphResult): string {
+  const lines: string[] = [];
+  lines.push("documents:");
+  if (result.documents.length === 0) lines.push("  []");
+  for (const doc of result.documents) {
+    lines.push(`  - $path: ${yamlScalar(doc.$path)}`);
+    lines.push(`    $degrees: ${doc.$degrees}`);
+    lines.push(`    $links: ${doc.$links}`);
+    lines.push(`    $backlinks: ${doc.$backlinks}`);
+    for (const [key, value] of Object.entries(doc)) {
+      if (key === "$path" || key === "$degrees" || key === "$links" || key === "$backlinks") {
+        continue;
+      }
+      lines.push(`    ${key}: ${yamlScalar(value)}`);
+    }
+  }
+  lines.push("links:");
+  if (result.links.length === 0) lines.push("  []");
+  for (const l of result.links) {
+    lines.push(`  - source: ${yamlScalar(l.source)}`);
+    lines.push(`    target: ${yamlScalar(l.target)}`);
+    lines.push(`    field: ${yamlScalar(l.field)}`);
+  }
+  lines.push(`frontier: [${result.frontier.map(yamlScalar).join(", ")}]`);
+  lines.push(`complete_degrees: ${result.complete_degrees}`);
+  lines.push(`truncated: ${result.truncated}`);
+  return lines.join("\n");
+}
+
+/** Quote a scalar for YAML when it isn't a safe bare token. */
+function yamlScalar(v: unknown): string {
+  if (typeof v === "number" || typeof v === "boolean") return String(v);
+  const s = String(v);
+  if (s === "" || /[:#\-?\[\]{},&*!|>'"%@`]/.test(s) || /^\s|\s$/.test(s)) {
+    return JSON.stringify(s);
+  }
+  return s;
+}
+
+/**
+ * Mermaid flowchart — passthrough-renderable by most chat/markdown surfaces.
+ * The id-sanitization rule is load-bearing: generated ids (`d0`, `d1`, …) with
+ * the path only ever as a quoted label — a path as a mermaid id would break on
+ * slashes, dots, and colons. Roots (degrees 0) get a classDef; a trailing `%%`
+ * comment echoes truncation.
+ */
+export function renderGraphMermaid(result: GraphResult): string {
+  const lines: string[] = ["flowchart LR"];
+  const idByPath = new Map<string, string>();
+  result.documents.forEach((doc, i) => {
+    const id = `d${i}`;
+    idByPath.set(doc.$path, id);
+    const rootClass = doc.$degrees === 0 ? ":::root" : "";
+    lines.push(`  ${id}[${JSON.stringify(doc.$path)}]${rootClass}`);
+  });
+  for (const l of result.links) {
+    const s = idByPath.get(l.source);
+    const t = idByPath.get(l.target);
+    if (s === undefined || t === undefined) continue;
+    lines.push(`  ${s} -->|${JSON.stringify(l.field)}| ${t}`);
+  }
+  if (result.documents.some((d) => d.$degrees === 0)) {
+    lines.push("  classDef root stroke-width:3px");
+  }
+  const note = `complete through ${result.complete_degrees} degree${
+    result.complete_degrees === 1 ? "" : "s"
+  }${result.truncated ? " · truncated" : ""}`;
+  lines.push(`  %% ${note}`);
+  return lines.join("\n");
 }

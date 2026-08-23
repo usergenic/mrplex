@@ -157,3 +157,115 @@ describe("links_by_repo", () => {
     expect(await storage.links_by_repo(repoId)).toEqual([]);
   });
 });
+
+describe("adjacency reads (graph read surface, docs/graph-plan.md WS1)", () => {
+  // docA → docB (resolved) and docA → dangling; docB → docA (resolved).
+  beforeEach(async () => {
+    await storage.links_replace(repoId, docA, [
+      edge({ ord: 0, field: "$body", target_norm: "b.md", target_id: docB }),
+      edge({ ord: 1, field: "$body", target_norm: "b.md", target_id: docB }), // duplicate triple
+      edge({ ord: 2, field: "parent", target_norm: "b.md", target_id: docB }), // distinct field
+      edge({ ord: 3, field: "$body", target_norm: "gone.md", target_id: null }), // dangling
+    ]);
+    await storage.links_replace(repoId, docB, [
+      edge({ ord: 0, field: "$body", target_norm: "a.md", target_id: docA }),
+    ]);
+  });
+
+  it("links_adjacent_out returns distinct (source,target,field), dangling excluded", async () => {
+    const rows = await storage.links_adjacent_out(repoId, [docA]);
+    const norm = rows.map((r) => `${r.source_id}:${r.target_id}:${r.field}`).sort();
+    // Two duplicate $body edges collapse to one; the parent edge is distinct;
+    // the dangling edge is excluded.
+    expect(norm).toEqual([`${docA}:${docB}:$body`, `${docA}:${docB}:parent`]);
+  });
+
+  it("links_adjacent_in returns distinct inbound triples", async () => {
+    const rows = await storage.links_adjacent_in(repoId, [docB]);
+    expect(rows.map((r) => `${r.source_id}:${r.target_id}:${r.field}`).sort()).toEqual([
+      `${docA}:${docB}:$body`,
+      `${docA}:${docB}:parent`,
+    ]);
+  });
+
+  it("adjacency reads are batched over the id list", async () => {
+    const out = await storage.links_adjacent_out(repoId, [docA, docB]);
+    // docA→docB ($body, parent) + docB→docA ($body) = three distinct triples.
+    expect(out.length).toBe(3);
+  });
+
+  it("empty id lists short-circuit to []", async () => {
+    expect(await storage.links_adjacent_out(repoId, [])).toEqual([]);
+    expect(await storage.links_adjacent_in(repoId, [])).toEqual([]);
+    expect(await storage.versions_current_by_documents(repoId, [])).toEqual([]);
+  });
+});
+
+describe("versions_live_document_ids_matching (SQL-side root matching)", () => {
+  // Anchored regex sources are what the glob compiler emits; the method takes
+  // them verbatim and matches live paths in SQL.
+  const seedVersion = async (docId: number, path: string, clock: number): Promise<void> => {
+    await storage.version_insert({
+      document_id: docId,
+      repo_id: repoId,
+      prev_id: null,
+      path,
+      frontmatter_raw: "",
+      frontmatter: {},
+      body: "",
+      author: "a",
+      created_at: new Date(Date.UTC(2026, 7, 14, 0, 0, clock)).toISOString(),
+    });
+  };
+
+  it("matches live docs whose path matches any regex; excludes non-matches", async () => {
+    await seedVersion(docA, "moc/a.md", 0);
+    await seedVersion(docB, "other.md", 1);
+    const ids = await storage.versions_live_document_ids_matching(repoId, ["^moc/.*$"]);
+    expect(ids).toEqual([docA]);
+  });
+
+  it("ORs multiple regexes", async () => {
+    await seedVersion(docA, "moc/a.md", 0);
+    await seedVersion(docB, "people/sam.md", 1);
+    const ids = await storage
+      .versions_live_document_ids_matching(repoId, ["^moc/.*$", "^people/sam\\.md$"])
+      .then((r) => [...r].sort((x, y) => x - y));
+    expect(ids).toEqual([docA, docB].sort((x, y) => x - y));
+  });
+
+  it("excludes superseded (non-live) versions", async () => {
+    const v1 = await storage.version_insert({
+      document_id: docA,
+      repo_id: repoId,
+      prev_id: null,
+      path: "old.md",
+      frontmatter_raw: "",
+      frontmatter: {},
+      body: "",
+      author: "a",
+      created_at: new Date(Date.UTC(2026, 7, 14, 0, 0, 0)).toISOString(),
+    });
+    // Move docA to a new path; old.md is no longer live.
+    await storage.version_insert({
+      document_id: docA,
+      repo_id: repoId,
+      prev_id: v1.id,
+      path: "new.md",
+      frontmatter_raw: "",
+      frontmatter: {},
+      body: "",
+      author: "a",
+      created_at: new Date(Date.UTC(2026, 7, 14, 0, 0, 1)).toISOString(),
+    });
+    expect(await storage.versions_live_document_ids_matching(repoId, ["^old\\.md$"])).toEqual([]);
+    expect(await storage.versions_live_document_ids_matching(repoId, ["^new\\.md$"])).toEqual([
+      docA,
+    ]);
+  });
+
+  it("empty regex list short-circuits to []", async () => {
+    await seedVersion(docA, "a.md", 0);
+    expect(await storage.versions_live_document_ids_matching(repoId, [])).toEqual([]);
+  });
+});
