@@ -27,7 +27,9 @@ import {
 import { bindDanglingToPath, reindexOutboundLinks } from "../links/maintain.js";
 import { planRepairs } from "../links/repair.js";
 import { findStaleLinks } from "../links/stale.js";
+import { contentHash } from "../markdown/content-hash.js";
 import type { RepoRow, Storage, VersionRow } from "../storage/types.js";
+import { globToRegexSource } from "./auth/glob.js";
 import {
   type ClaimMatcher,
   claimsGrantRead,
@@ -45,6 +47,15 @@ import {
 } from "./frontmatter-input.js";
 import { type GraphDeps, runGraph } from "./graph.js";
 import {
+  HISTORY_INDEX_DEFAULT_LIMIT,
+  HISTORY_SAFETY_WINDOW_MS,
+  HISTORY_SINCE_DEFAULT_LIMIT,
+  type HistoryIndexDeps,
+  type HistorySinceDeps,
+  runHistoryIndex,
+  runHistorySince,
+} from "./history.js";
+import {
   HARDCODED_DEFAULTS,
   type PathConfig,
   type PathConfigOverride,
@@ -56,7 +67,16 @@ import {
 import { type QuerySpec, runQuery } from "./query/query.js";
 import { validatePath, validateSlug } from "./validation.js";
 import { decodeVersionId, encodeVersionId } from "./version-id.js";
-import type { GraphResult, GraphSpec, PathWarning, QueryHit, Repo, Version } from "./wire.js";
+import type {
+  GraphResult,
+  GraphSpec,
+  HistoryIndexPage,
+  HistorySincePage,
+  PathWarning,
+  QueryHit,
+  Repo,
+  Version,
+} from "./wire.js";
 
 export type HistoryOptions = { limit?: number; before?: string };
 
@@ -147,6 +167,46 @@ export type Kernel = {
   query(ctx: CallContext, spec: QuerySpec): Promise<QueryHit[]>;
   /** Neighborhood expansion over the links index (docs/graph-plan.md). */
   graph(ctx: CallContext, spec: GraphSpec): Promise<GraphResult>;
+  /** Change-log read surface keyed by version-log position (sync/history §3). */
+  history: {
+    /** The global change feed — the longest gap-free run after the cursor. */
+    since(ctx: CallContext, input: HistorySinceQuery): Promise<HistorySincePage>;
+    /** Page the live set as of a safe head R (startup reconciliation). */
+    index(ctx: CallContext, input: HistoryIndexQuery): Promise<HistoryIndexPage>;
+    /** Scoped, document-spanning history walk — subsumes docs.history (§3.5). */
+    list(ctx: CallContext, input: HistoryListQuery): Promise<Version[]>;
+  };
+};
+
+/** Public input to `history.since` (§3.3). `repo` is an optional slug filter. */
+export type HistorySinceQuery = {
+  after_version: string;
+  repo?: string;
+  limit?: number;
+};
+
+/** Public input to `history.index` (§3.4). `repo` is required (per-repo scan). */
+export type HistoryIndexQuery = {
+  repo: string;
+  through_version?: string;
+  after_version?: string;
+  limit?: number;
+};
+
+/**
+ * Public input to `history.list` (§3.5). `path` is a glob (a single literal
+ * path is the old `docs.history`); omitted = the whole repo. `ever` includes
+ * documents that once matched (moved-away / deleted). `since`/`until` are
+ * opaque version-id bounds; `order` defaults to newest-first (presentation).
+ */
+export type HistoryListQuery = {
+  repo: string;
+  path?: string;
+  ever?: boolean;
+  since?: string;
+  until?: string;
+  order?: "asc" | "desc";
+  limit?: number;
 };
 
 export type KernelConfig = {
@@ -194,6 +254,9 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
       body: row.body,
       author: row.author,
       created_at: row.created_at,
+      // Pre-backfill rows (written before migration 0002) carry a null
+      // column; compute on the fly during the transition (§2.6).
+      content_hash: row.content_hash ?? contentHash(row.frontmatter_raw, row.body),
     };
   }
 
@@ -692,6 +755,102 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
       const deps: GraphDeps = { storage, serverPathConfig };
       return runGraph(claimsFor(ctx), spec, deps);
     },
+
+    history: {
+      async since(ctx, input) {
+        // Resolve the optional repo filter to an id (and gate its existence
+        // through the caller's scope, same as resolveRepo).
+        let repoId: number | undefined;
+        if (input.repo !== undefined) {
+          const repo = await resolveRepo(ctx, input.repo);
+          repoId = repo.id;
+        }
+        // Build id→slug once per call.
+        const repos = await storage.repos_list();
+        const slugById = new Map(repos.map((r) => [r.id, r.slug]));
+        const claims = claimsFor(ctx);
+        const deps: HistorySinceDeps = {
+          storage,
+          repoSlug: (id) => slugById.get(id) ?? "",
+          // Delete tombstones live under the server's system sigils (`:deleted/`
+          // etc.); these are server-wide, so the server config is authoritative.
+          isSystemPath: (path) => pathIsInSystemNamespace(path, serverPathConfig.system_sigils),
+          canRead: (id, path) => {
+            if (claims === null) return true;
+            const slug = slugById.get(id);
+            return slug !== undefined && claimsGrantRead(claims, slug, path);
+          },
+        };
+        return runHistorySince(
+          {
+            after_version: input.after_version,
+            repo_id: repoId,
+            limit: input.limit ?? HISTORY_SINCE_DEFAULT_LIMIT,
+            now_ms: Date.now(),
+            window_ms: HISTORY_SAFETY_WINDOW_MS,
+          },
+          deps,
+        );
+      },
+
+      async index(ctx, input) {
+        const repo = await resolveRepo(ctx, input.repo);
+        const cfg = repoEffectiveConfig(repo);
+        // Exclude system (`:deleted/`) and hidden (`.`) namespaces, as `query`
+        // defaults do — the sync live set is the visible, current corpus.
+        const excludedSigils = [...cfg.system_sigils, ...cfg.hidden_sigils];
+        const claims = claimsFor(ctx);
+        const deps: HistoryIndexDeps = {
+          storage,
+          isExcluded: (path) => pathIsInSystemNamespace(path, excludedSigils),
+          canRead: (path) => claims === null || claimsGrantRead(claims, repo.slug, path),
+        };
+        return runHistoryIndex(
+          {
+            repo_id: repo.id,
+            through_version: input.through_version,
+            after_version: input.after_version,
+            limit: input.limit ?? HISTORY_INDEX_DEFAULT_LIMIT,
+            now_ms: Date.now(),
+            window_ms: HISTORY_SAFETY_WINDOW_MS,
+          },
+          deps,
+        );
+      },
+
+      async list(ctx, input) {
+        const repo = await resolveRepo(ctx, input.repo);
+        const claims = claimsFor(ctx);
+        // Compile the path glob to an anchored regex source (the same dialect
+        // scope + graph use). Omitted glob = every document in the repo.
+        const pathRegexes = input.path === undefined ? [] : [`^${globToRegexSource(input.path)}$`];
+        // Reject an unparseable bound rather than coercing to 0 — for `until`
+        // that would silently mean `id <= 0` (empty result), inverting intent.
+        const decodeBound = (kind: "since" | "until", value: string): number => {
+          const id = decodeVersionId(value);
+          if (id === null) {
+            throw new KernelError("version_not_found", { version_id: value, bound: kind });
+          }
+          return id;
+        };
+        const rows = await storage.versions_list({
+          repo_id: repo.id,
+          path_regexes: pathRegexes,
+          ever: input.ever ?? false,
+          after_id: input.since !== undefined ? decodeBound("since", input.since) : undefined,
+          until_id: input.until !== undefined ? decodeBound("until", input.until) : undefined,
+          order: input.order ?? "desc",
+          limit: input.limit ?? HISTORY_LIST_DEFAULT_LIMIT,
+        });
+        // Scope: a version is visible only if the caller can read its path.
+        return rows
+          .filter((r) => claims === null || claimsGrantRead(claims, repo.slug, r.path))
+          .map((r) => toVersionWire(r, repo.slug));
+      },
+    },
   };
   return kernel;
 }
+
+/** Default `history.list` page size when a caller omits `limit` (§3.5). */
+const HISTORY_LIST_DEFAULT_LIMIT = 100;

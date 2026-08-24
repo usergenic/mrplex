@@ -13,7 +13,7 @@
  */
 
 /** Kernel intrinsics, without the `$` sigil. Mirrors INTRINSIC_COLUMNS. */
-export const DOCUMENTED_INTRINSICS = ["path", "updated_at", "body"] as const;
+export const DOCUMENTED_INTRINSICS = ["path", "updated_at", "body", "content_hash"] as const;
 
 /** Graph membership predicates, without the `$` sigil. */
 export const DOCUMENTED_GRAPH_MEMBERSHIP = ["in", "has", "in_static", "has_static"] as const;
@@ -90,6 +90,9 @@ with a frontmatter key literally named \`path\` stays queryable as bare
 - \`$updated_at\` — when the document was last written, an ISO-8601 UTC
   string; compare lexicographically: \`$updated_at >= "2026-08-01"\`
 - \`$body\` — the markdown body text: \`contains($body, "pricing")\`
+- \`$content_hash\` — the SHA-256 (bare hex) of the document's canonical
+  content, the same fingerprint injected into materialized files;
+  \`$content_hash == "1a2b…"\` matches an exact known version's content
 
 Intrinsics have no subfields. There is no separate path-glob query
 argument; express path matching in the filter via \`$path\`.

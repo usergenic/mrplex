@@ -1,6 +1,7 @@
 import { RE2JS } from "@bufbuild/re2";
 import Database from "better-sqlite3";
 import { normalizeKey } from "../kernel/casefold.js";
+import { contentHash } from "../markdown/content-hash.js";
 import type { SearchPlan } from "../storage/search-plan.js";
 import type {
   AdjacentLink,
@@ -20,7 +21,16 @@ import type {
   VectorSearchHit,
   VersionInsertInput,
   VersionRow,
+  VersionsListOptions,
+  VersionsSinceOptions,
+  VersionsSinceResult,
 } from "../storage/types.js";
+import {
+  GLOBAL_SCAN_CAP,
+  SAFE_HEAD_TAIL,
+  safeFrontier,
+  safeHeadFromTail,
+} from "../storage/versions-since.js";
 import { compileSearchPlan } from "./compile-sqlite.js";
 import { migrate } from "./migrations/index.js";
 import { decodeVectorBlob, encodeVectorBlob, loadSqliteVec } from "./vec.js";
@@ -37,6 +47,7 @@ type VersionRawRow = {
   body: string;
   author: string;
   created_at: string;
+  content_hash: string | null;
 };
 
 const hydrateVersion = (row: VersionRawRow): VersionRow => ({
@@ -265,10 +276,10 @@ class SqliteStorage implements Storage {
         .prepare(
           `insert into versions
             (document_id, repo_id, prev_id, next_id, path, path_norm,
-             frontmatter_raw, frontmatter, body, author, created_at)
-           values (?, ?, ?, null, ?, ?, ?, ?, ?, ?, ?)
+             frontmatter_raw, frontmatter, body, author, created_at, content_hash)
+           values (?, ?, ?, null, ?, ?, ?, ?, ?, ?, ?, ?)
            returning id, document_id, repo_id, prev_id, next_id, path,
-                     frontmatter_raw, frontmatter, body, author, created_at`,
+                     frontmatter_raw, frontmatter, body, author, created_at, content_hash`,
         )
         .get(
           input.document_id,
@@ -281,6 +292,7 @@ class SqliteStorage implements Storage {
           input.body,
           input.author,
           input.created_at,
+          contentHash(input.frontmatter_raw, input.body),
         ) as VersionRawRow;
 
       if (input.prev_id !== null) {
@@ -297,7 +309,7 @@ class SqliteStorage implements Storage {
     const row = this.db
       .prepare(
         `select id, document_id, repo_id, prev_id, next_id, path,
-                frontmatter_raw, frontmatter, body, author, created_at
+                frontmatter_raw, frontmatter, body, author, created_at, content_hash
          from versions where id = ?`,
       )
       .get(id) as VersionRawRow | undefined;
@@ -309,7 +321,7 @@ class SqliteStorage implements Storage {
     const row = this.db
       .prepare(
         `select id, document_id, repo_id, prev_id, next_id, path,
-                frontmatter_raw, frontmatter, body, author, created_at
+                frontmatter_raw, frontmatter, body, author, created_at, content_hash
          from versions where repo_id = ? and path_norm = ? and next_id is null`,
       )
       .get(repo_id, normalizeKey(path)) as VersionRawRow | undefined;
@@ -320,7 +332,7 @@ class SqliteStorage implements Storage {
     const rows = this.db
       .prepare(
         `select id, document_id, repo_id, prev_id, next_id, path,
-                frontmatter_raw, frontmatter, body, author, created_at
+                frontmatter_raw, frontmatter, body, author, created_at, content_hash
          from versions
          where repo_id = ? and next_id is null
          order by path`,
@@ -437,7 +449,7 @@ class SqliteStorage implements Storage {
         this.db
           .prepare(
             `select id, document_id, repo_id, prev_id, next_id, path,
-                  frontmatter_raw, frontmatter, body, author, created_at
+                  frontmatter_raw, frontmatter, body, author, created_at, content_hash
            from versions
            where repo_id = ? and next_id is null and document_id in (${ph})`,
           )
@@ -487,26 +499,206 @@ class SqliteStorage implements Storage {
       .prepare(
         `with recursive chain(
            id, document_id, repo_id, prev_id, next_id, path,
-           frontmatter_raw, frontmatter, body, author, created_at, depth
+           frontmatter_raw, frontmatter, body, author, created_at, content_hash, depth
          ) as (
            select id, document_id, repo_id, prev_id, next_id, path,
-                  frontmatter_raw, frontmatter, body, author, created_at, 0
+                  frontmatter_raw, frontmatter, body, author, created_at, content_hash, 0
              from versions
              where document_id = ? and next_id is null
            union all
            select v.id, v.document_id, v.repo_id, v.prev_id, v.next_id, v.path,
                   v.frontmatter_raw, v.frontmatter, v.body, v.author, v.created_at,
-                  c.depth + 1
+                  v.content_hash, c.depth + 1
              from versions v
              join chain c on v.id = c.prev_id
          )
          select id, document_id, repo_id, prev_id, next_id, path,
-                frontmatter_raw, frontmatter, body, author, created_at
+                frontmatter_raw, frontmatter, body, author, created_at, content_hash
          from chain${where}
          order by depth asc${limitClause}`,
       )
       .all(...params) as VersionRawRow[];
     return rows.map(hydrateVersion);
+  }
+
+  async versions_list(opts: VersionsListOptions): Promise<VersionRow[]> {
+    // 1. Select the document ids in scope. Empty path_regexes → every doc in
+    //    the repo; otherwise match paths via the regexp() UDF (same engine the
+    //    scope-glob compiler uses). `ever` decides whether a match on ANY
+    //    version counts, or only the current one.
+    const hasGlob = opts.path_regexes.length > 0;
+    const ors = opts.path_regexes.map(() => "regexp(?, path)").join(" OR ");
+    let docIds: number[];
+    if (!hasGlob) {
+      docIds = (
+        this.db
+          .prepare("select distinct document_id from versions where repo_id = ?")
+          .all(opts.repo_id) as { document_id: number }[]
+      ).map((r) => r.document_id);
+    } else {
+      const liveClause = opts.ever ? "" : " and next_id is null";
+      docIds = (
+        this.db
+          .prepare(
+            `select distinct document_id from versions
+             where repo_id = ?${liveClause} and (${ors})`,
+          )
+          .all(opts.repo_id, ...opts.path_regexes) as { document_id: number }[]
+      ).map((r) => r.document_id);
+    }
+    if (docIds.length === 0) return [];
+
+    // 2. Walk those documents' versions, interleaved by id, within the cursor
+    //    bounds. `ever: false` still returns the WHOLE chain of a selected live
+    //    document (history of what lives here now); the path filter only chose
+    //    the documents, not which of their versions to include.
+    const clauses: string[] = [];
+    const params: (string | number)[] = [];
+    if (opts.after_id !== undefined) {
+      clauses.push("id > ?");
+      params.push(opts.after_id);
+    }
+    if (opts.until_id !== undefined) {
+      clauses.push("id <= ?");
+      params.push(opts.until_id);
+    }
+    const rows = chunkedInList<VersionRawRow>(docIds, (ph, chunk) => {
+      const where = [`document_id in (${ph})`, ...clauses].join(" and ");
+      return this.db
+        .prepare(
+          `select id, document_id, repo_id, prev_id, next_id, path,
+                  frontmatter_raw, frontmatter, body, author, created_at, content_hash
+           from versions where ${where}
+           order by id ${opts.order === "desc" ? "desc" : "asc"}
+           limit ?`,
+        )
+        .all(...chunk, ...params, opts.limit) as VersionRawRow[];
+    });
+    // chunkedInList concatenates per-chunk results; re-sort + re-limit so the
+    // global ordering/limit holds when docIds span multiple chunks.
+    rows.sort((a, b) => (opts.order === "desc" ? b.id - a.id : a.id - b.id));
+    return rows.slice(0, opts.limit).map(hydrateVersion);
+  }
+
+  async versions_since(opts: VersionsSinceOptions): Promise<VersionsSinceResult> {
+    // Gaps are global, so scan the global id sequence (id, repo, age) — the
+    // repo filter never affects gap detection, only the delivered rows. A
+    // bounded scan keeps each poll cheap; truncating early only under-delivers
+    // (the next poll continues), never crosses a hole.
+    const light = this.db
+      .prepare(
+        `select id, repo_id, created_at from versions
+         where id > ? order by id asc limit ?`,
+      )
+      .all(opts.after_id, GLOBAL_SCAN_CAP) as {
+      id: number;
+      repo_id: number;
+      created_at: string;
+    }[];
+    const { upper_id } = safeFrontier(
+      light.map((r) => ({
+        id: r.id,
+        repo_id: r.repo_id,
+        created_at_ms: Date.parse(r.created_at),
+      })),
+      opts.after_id,
+      opts.repo_id,
+      opts.limit,
+      opts.now_ms,
+      opts.window_ms,
+    );
+    if (upper_id <= opts.after_id) return { rows: [], next_id: opts.after_id };
+    const repoClause = opts.repo_id === undefined ? "" : " and repo_id = ?";
+    const params: number[] =
+      opts.repo_id === undefined
+        ? [opts.after_id, upper_id]
+        : [opts.after_id, upper_id, opts.repo_id];
+    const rows = this.db
+      .prepare(
+        `select id, document_id, repo_id, prev_id, next_id, path,
+                frontmatter_raw, frontmatter, body, author, created_at, content_hash
+         from versions
+         where id > ? and id <= ?${repoClause}
+         order by id asc`,
+      )
+      .all(...params) as VersionRawRow[];
+    return { rows: rows.map(hydrateVersion), next_id: upper_id };
+  }
+
+  async versions_paths_by_ids(ids: readonly number[]): Promise<Map<number, string>> {
+    const map = new Map<number, string>();
+    const rows = chunkedInList<{ id: number; path: string }>(
+      ids,
+      (ph, chunk) =>
+        this.db.prepare(`select id, path from versions where id in (${ph})`).all(...chunk) as {
+          id: number;
+          path: string;
+        }[],
+    );
+    for (const r of rows) map.set(r.id, r.path);
+    return map;
+  }
+
+  async versions_safe_head(now_ms: number, window_ms: number): Promise<number> {
+    // The recent tail is all that can hold a hot (unsettled) gap; older gaps
+    // are burned and settled by construction.
+    const tail = this.db
+      .prepare("select id, created_at from versions order by id desc limit ?")
+      .all(SAFE_HEAD_TAIL) as { id: number; created_at: string }[];
+    tail.reverse(); // ascending by id
+    return safeHeadFromTail(
+      tail.map((r) => ({ id: r.id, repo_id: 0, created_at_ms: Date.parse(r.created_at) })),
+      now_ms,
+      window_ms,
+    );
+  }
+
+  async versions_live_index(opts: {
+    repo_id: number;
+    through_id: number;
+    after_id: number;
+    limit: number;
+  }): Promise<{ id: number; path: string; content_hash: string | null }[]> {
+    return this.db
+      .prepare(
+        `select id, path, content_hash from versions
+         where repo_id = ? and next_id is null and id > ? and id <= ?
+         order by id asc limit ?`,
+      )
+      .all(opts.repo_id, opts.after_id, opts.through_id, opts.limit) as {
+      id: number;
+      path: string;
+      content_hash: string | null;
+    }[];
+  }
+
+  async versions_missing_content_hash(opts: {
+    repo_id?: number;
+    after_id: number;
+    limit: number;
+  }): Promise<{ id: number; frontmatter_raw: string; body: string }[]> {
+    const repoClause = opts.repo_id === undefined ? "" : " and repo_id = ?";
+    const params =
+      opts.repo_id === undefined
+        ? [opts.after_id, opts.limit]
+        : [opts.after_id, opts.repo_id, opts.limit];
+    return this.db
+      .prepare(
+        `select id, frontmatter_raw, body from versions
+         where content_hash is null and id > ?${repoClause}
+         order by id asc limit ?`,
+      )
+      .all(...params) as { id: number; frontmatter_raw: string; body: string }[];
+  }
+
+  async versions_set_content_hash(
+    updates: readonly { id: number; content_hash: string }[],
+  ): Promise<void> {
+    if (updates.length === 0) return;
+    return this.tx(async () => {
+      const stmt = this.db.prepare("update versions set content_hash = ? where id = ?");
+      for (const u of updates) stmt.run(u.content_hash, u.id);
+    });
   }
 
   async chunks_upsert(

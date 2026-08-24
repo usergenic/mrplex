@@ -18,6 +18,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import pg, { Pool, type PoolClient } from "pg";
 import { normalizeKey } from "../kernel/casefold.js";
 import { KernelError } from "../kernel/errors.js";
+import { contentHash } from "../markdown/content-hash.js";
 import type { SearchPlan } from "../storage/search-plan.js";
 import type {
   AdjacentLink,
@@ -36,7 +37,16 @@ import type {
   VectorSearchHit,
   VersionInsertInput,
   VersionRow,
+  VersionsListOptions,
+  VersionsSinceOptions,
+  VersionsSinceResult,
 } from "../storage/types.js";
+import {
+  GLOBAL_SCAN_CAP,
+  SAFE_HEAD_TAIL,
+  safeFrontier,
+  safeHeadFromTail,
+} from "../storage/versions-since.js";
 import { compileSearchPlan } from "./compile-postgres.js";
 import { isRegexInvalid, isSerializationRetryable, isVersionRaceViolation } from "./errors.js";
 import { migrate } from "./migrations/index.js";
@@ -106,6 +116,7 @@ type VersionRawRow = {
   body: string;
   author: string;
   created_at: string;
+  content_hash: string | null;
 };
 
 class PostgresStorage implements Storage {
@@ -307,10 +318,10 @@ class PostgresStorage implements Storage {
         const ins = await c.query<VersionRawRow>(
           `insert into versions
              (document_id, repo_id, prev_id, next_id, path, path_norm,
-              frontmatter_raw, frontmatter, body, author, created_at)
-           values ($1, $2, $3, null, $4, $5, $6, $7::jsonb, $8, $9, $10)
+              frontmatter_raw, frontmatter, body, author, created_at, content_hash)
+           values ($1, $2, $3, null, $4, $5, $6, $7::jsonb, $8, $9, $10, $11)
            returning id, document_id, repo_id, prev_id, next_id, path,
-                     frontmatter_raw, frontmatter, body, author, created_at`,
+                     frontmatter_raw, frontmatter, body, author, created_at, content_hash`,
           [
             input.document_id,
             input.repo_id,
@@ -322,6 +333,7 @@ class PostgresStorage implements Storage {
             input.body,
             input.author,
             input.created_at,
+            contentHash(input.frontmatter_raw, input.body),
           ],
         );
         const inserted = ins.rows[0] as VersionRawRow;
@@ -340,7 +352,7 @@ class PostgresStorage implements Storage {
     return this.withClient(async (c) => {
       const res = await c.query<VersionRawRow>(
         `select id, document_id, repo_id, prev_id, next_id, path,
-                frontmatter_raw, frontmatter, body, author, created_at
+                frontmatter_raw, frontmatter, body, author, created_at, content_hash
          from versions where id = $1`,
         [id],
       );
@@ -353,7 +365,7 @@ class PostgresStorage implements Storage {
       // Case-insensitive identity: fold the query key to path_norm (§3.5.1).
       const res = await c.query<VersionRawRow>(
         `select id, document_id, repo_id, prev_id, next_id, path,
-                frontmatter_raw, frontmatter, body, author, created_at
+                frontmatter_raw, frontmatter, body, author, created_at, content_hash
          from versions where repo_id = $1 and path_norm = $2 and next_id is null`,
         [repo_id, normalizeKey(path)],
       );
@@ -365,7 +377,7 @@ class PostgresStorage implements Storage {
     return this.withClient(async (c) => {
       const res = await c.query<VersionRawRow>(
         `select id, document_id, repo_id, prev_id, next_id, path,
-                frontmatter_raw, frontmatter, body, author, created_at
+                frontmatter_raw, frontmatter, body, author, created_at, content_hash
          from versions
          where repo_id = $1 and next_id is null
          order by path`,
@@ -484,7 +496,7 @@ class PostgresStorage implements Storage {
     return this.withClient(async (c) => {
       const res = await c.query<VersionRawRow>(
         `select id, document_id, repo_id, prev_id, next_id, path,
-                frontmatter_raw, frontmatter, body, author, created_at
+                frontmatter_raw, frontmatter, body, author, created_at, content_hash
          from versions
          where repo_id = $1 and next_id is null and document_id = ANY($2::bigint[])`,
         [repo_id, document_ids],
@@ -551,23 +563,194 @@ class PostgresStorage implements Storage {
       const res = await c.query<VersionRawRow>(
         `with recursive chain as (
            select id, document_id, repo_id, prev_id, next_id, path,
-                  frontmatter_raw, frontmatter, body, author, created_at, 0 as depth
+                  frontmatter_raw, frontmatter, body, author, created_at, content_hash, 0 as depth
              from versions
              where document_id = $1 and next_id is null
            union all
            select v.id, v.document_id, v.repo_id, v.prev_id, v.next_id, v.path,
                   v.frontmatter_raw, v.frontmatter, v.body, v.author, v.created_at,
-                  c.depth + 1
+                  v.content_hash, c.depth + 1
              from versions v
              join chain c on v.id = c.prev_id
          )
          select id, document_id, repo_id, prev_id, next_id, path,
-                frontmatter_raw, frontmatter, body, author, created_at
+                frontmatter_raw, frontmatter, body, author, created_at, content_hash
          from chain${where}
          order by depth asc${limitClause}`,
         params,
       );
       return res.rows as VersionRow[];
+    });
+  }
+
+  async versions_list(opts: VersionsListOptions): Promise<VersionRow[]> {
+    return this.withClient(async (c) => {
+      // 1. Document ids in scope. Empty globs → all docs; else match by path
+      //    regex (POSIX ARE, `path ~ ANY`), with `ever` gating live-only.
+      const hasGlob = opts.path_regexes.length > 0;
+      let docIds: number[];
+      if (!hasGlob) {
+        const res = await c.query<{ document_id: number }>(
+          "select distinct document_id from versions where repo_id = $1",
+          [opts.repo_id],
+        );
+        docIds = res.rows.map((r) => Number(r.document_id));
+      } else {
+        const liveClause = opts.ever ? "" : " and next_id is null";
+        const res = await c.query<{ document_id: number }>(
+          `select distinct document_id from versions
+           where repo_id = $1${liveClause} and path ~ ANY($2::text[])`,
+          [opts.repo_id, opts.path_regexes as string[]],
+        );
+        docIds = res.rows.map((r) => Number(r.document_id));
+      }
+      if (docIds.length === 0) return [];
+
+      // 2. Their versions, interleaved by id, within cursor bounds.
+      const params: (number | number[])[] = [docIds];
+      let sql = `select id, document_id, repo_id, prev_id, next_id, path,
+                        frontmatter_raw, frontmatter, body, author, created_at, content_hash
+                 from versions where document_id = ANY($1::bigint[])`;
+      if (opts.after_id !== undefined) {
+        params.push(opts.after_id);
+        sql += ` and id > $${params.length}`;
+      }
+      if (opts.until_id !== undefined) {
+        params.push(opts.until_id);
+        sql += ` and id <= $${params.length}`;
+      }
+      params.push(opts.limit);
+      sql += ` order by id ${opts.order === "desc" ? "desc" : "asc"} limit $${params.length}`;
+      const res = await c.query<VersionRawRow>(sql, params);
+      return res.rows as VersionRow[];
+    });
+  }
+
+  async versions_since(opts: VersionsSinceOptions): Promise<VersionsSinceResult> {
+    return this.withClient(async (c) => {
+      // Global scan (id, repo, age) — gaps are only meaningful on the global
+      // id sequence; the repo filter narrows the delivered rows only. On PG
+      // burned ids (rolled-back nextval) and commit-visibility skew make gaps
+      // routine, which is exactly what the safety window handles.
+      const lightRes = await c.query<{ id: number; repo_id: number; created_at: string }>(
+        "select id, repo_id, created_at from versions where id > $1 order by id asc limit $2",
+        [opts.after_id, GLOBAL_SCAN_CAP],
+      );
+      const { upper_id } = safeFrontier(
+        lightRes.rows.map((r) => ({
+          id: Number(r.id),
+          repo_id: Number(r.repo_id),
+          created_at_ms: Date.parse(r.created_at),
+        })),
+        opts.after_id,
+        opts.repo_id,
+        opts.limit,
+        opts.now_ms,
+        opts.window_ms,
+      );
+      if (upper_id <= opts.after_id) return { rows: [], next_id: opts.after_id };
+      const repoClause = opts.repo_id === undefined ? "" : " and repo_id = $3";
+      const params: number[] =
+        opts.repo_id === undefined
+          ? [opts.after_id, upper_id]
+          : [opts.after_id, upper_id, opts.repo_id];
+      const res = await c.query<VersionRawRow>(
+        `select id, document_id, repo_id, prev_id, next_id, path,
+                frontmatter_raw, frontmatter, body, author, created_at, content_hash
+         from versions
+         where id > $1 and id <= $2${repoClause}
+         order by id asc`,
+        params,
+      );
+      return { rows: res.rows as VersionRow[], next_id: upper_id };
+    });
+  }
+
+  async versions_paths_by_ids(ids: readonly number[]): Promise<Map<number, string>> {
+    const map = new Map<number, string>();
+    if (ids.length === 0) return map;
+    return this.withClient(async (c) => {
+      const res = await c.query<{ id: number; path: string }>(
+        "select id, path from versions where id = any($1)",
+        [ids as number[]],
+      );
+      for (const r of res.rows) map.set(Number(r.id), r.path);
+      return map;
+    });
+  }
+
+  async versions_safe_head(now_ms: number, window_ms: number): Promise<number> {
+    return this.withClient(async (c) => {
+      const res = await c.query<{ id: number; created_at: string }>(
+        "select id, created_at from versions order by id desc limit $1",
+        [SAFE_HEAD_TAIL],
+      );
+      const tail = res.rows
+        .map((r) => ({ id: Number(r.id), repo_id: 0, created_at_ms: Date.parse(r.created_at) }))
+        .reverse(); // ascending by id
+      return safeHeadFromTail(tail, now_ms, window_ms);
+    });
+  }
+
+  async versions_live_index(opts: {
+    repo_id: number;
+    through_id: number;
+    after_id: number;
+    limit: number;
+  }): Promise<{ id: number; path: string; content_hash: string | null }[]> {
+    return this.withClient(async (c) => {
+      const res = await c.query<{ id: number; path: string; content_hash: string | null }>(
+        `select id, path, content_hash from versions
+         where repo_id = $1 and next_id is null and id > $2 and id <= $3
+         order by id asc limit $4`,
+        [opts.repo_id, opts.after_id, opts.through_id, opts.limit],
+      );
+      return res.rows.map((r) => ({
+        id: Number(r.id),
+        path: r.path,
+        content_hash: r.content_hash,
+      }));
+    });
+  }
+
+  async versions_missing_content_hash(opts: {
+    repo_id?: number;
+    after_id: number;
+    limit: number;
+  }): Promise<{ id: number; frontmatter_raw: string; body: string }[]> {
+    return this.withClient(async (c) => {
+      const repoClause = opts.repo_id === undefined ? "" : " and repo_id = $3";
+      const params =
+        opts.repo_id === undefined
+          ? [opts.after_id, opts.limit]
+          : [opts.after_id, opts.limit, opts.repo_id];
+      const res = await c.query<{ id: number; frontmatter_raw: string; body: string }>(
+        `select id, frontmatter_raw, body from versions
+         where content_hash is null and id > $1${repoClause}
+         order by id asc limit $2`,
+        params,
+      );
+      return res.rows.map((r) => ({
+        id: Number(r.id),
+        frontmatter_raw: r.frontmatter_raw,
+        body: r.body,
+      }));
+    });
+  }
+
+  async versions_set_content_hash(
+    updates: readonly { id: number; content_hash: string }[],
+  ): Promise<void> {
+    if (updates.length === 0) return;
+    return this.tx(async () => {
+      await this.withClient(async (c) => {
+        for (const u of updates) {
+          await c.query("update versions set content_hash = $1 where id = $2", [
+            u.content_hash,
+            u.id,
+          ]);
+        }
+      });
     });
   }
 

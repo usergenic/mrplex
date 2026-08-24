@@ -88,6 +88,11 @@ function buildClient(
     },
     query: (spec) => kernel.query(ctx, spec),
     graph: (spec) => kernel.graph(ctx, spec),
+    history: {
+      since: (input) => kernel.history.since(ctx, input),
+      index: (input) => kernel.history.index(ctx, input),
+      list: (input) => kernel.history.list(ctx, input),
+    },
     close: async () => {
       if (closed) return;
       closed = true;
@@ -105,8 +110,8 @@ function buildClient(
 
 function maybeInjectVersion(v: Version, opts: DocGetOptions | undefined): Version {
   if (opts?.raw) return v;
-  return {
-    ...v,
-    frontmatter_raw: appendSystemProperty(v.frontmatter_raw, "version", v.version_id),
-  };
+  // Fixed order: $version then $content_hash (sync/history plan §2.4).
+  let frontmatter_raw = appendSystemProperty(v.frontmatter_raw, "version", v.version_id);
+  frontmatter_raw = appendSystemProperty(frontmatter_raw, "content_hash", v.content_hash);
+  return { ...v, frontmatter_raw };
 }

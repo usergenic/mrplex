@@ -96,6 +96,10 @@ const INTRINSIC_COLUMNS: Record<string, string> = {
   // consistency of the $-prefixed convention. Design §5.1's example
   // `contains(body, "pricing")` is updated to `$body`.
   body: "versions.body",
+  // Canonical content fingerprint (sync/history plan §2.5). Reads the
+  // persisted column; pre-backfill rows carry null and simply don't match
+  // a hash filter until `mrplex hash backfill` populates them (§2.6).
+  content_hash: "versions.content_hash",
 };
 
 function compileIntrinsic(mangledName: string): string {

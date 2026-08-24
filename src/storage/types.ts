@@ -41,6 +41,12 @@ export type VersionRow = {
   body: string;
   author: string;
   created_at: string;
+  /**
+   * SHA-256 (bare hex) of canonical content (sync/history plan §2). Derived and
+   * server-owned — computed in-tx by `version_insert`, never part of the insert
+   * input. Null only on pre-backfill rows written before migration 0002.
+   */
+  content_hash: string | null;
 };
 
 export type VersionInsertInput = {
@@ -58,6 +64,54 @@ export type VersionInsertInput = {
 export type HistoryOptions = {
   limit?: number;
   before?: string; // ISO 8601 UTC
+};
+
+/**
+ * Options for the scoped history walk (sync/history plan §3.5). A forward
+ * id-ordered walk over the versions of documents selected by a path glob,
+ * bounded by version-id cursors. `path_regexes` are anchored regex sources
+ * (the gitignore-glob compilation used everywhere); empty = every document in
+ * the repo. `ever: false` anchors on the *live* set (docs whose CURRENT path
+ * matches); `ever: true` includes any document that *ever* had a matching path
+ * (whole chains). `after_id`/`until_id` are version-id bounds (exclusive lower,
+ * inclusive upper). `order` picks id ascending (oldest-first) or descending.
+ */
+export type VersionsListOptions = {
+  repo_id: number;
+  path_regexes: readonly string[];
+  ever: boolean;
+  after_id?: number;
+  until_id?: number;
+  order: "asc" | "desc";
+  limit: number;
+};
+
+/**
+ * Options for the gap-aware forward feed walk (sync/history plan §3.2–3.3).
+ * `after_id` is the resume cursor (0 = from the beginning); `repo_id` filters
+ * the output without affecting gap detection (gaps are global). `now_ms` and
+ * `window_ms` drive the safety window — the adapter supplies wall-clock now;
+ * `window_ms` is the caller's tolerance for treating a gap's successor as
+ * "settled long enough that the hole is burned, not pending."
+ */
+export type VersionsSinceOptions = {
+  after_id: number;
+  repo_id?: number;
+  limit: number;
+  now_ms: number;
+  window_ms: number;
+};
+
+/**
+ * Result of `versions_since`: the settled rows in `(after_id, next_id]`
+ * (repo-filtered, ascending by id) and the resume cursor `next_id`. Every id
+ * ≤ `next_id` is final and gap-free; `next_id === after_id` means nothing is
+ * safe to deliver yet (caught up, or stalled at a hot gap — the client just
+ * polls again).
+ */
+export type VersionsSinceResult = {
+  rows: VersionRow[];
+  next_id: number;
 };
 
 /**
@@ -201,6 +255,71 @@ export type Storage = {
   version_by_id(id: number): Promise<VersionRow | null>;
   version_current(repo_id: number, path: string): Promise<VersionRow | null>;
   version_history(document_id: number, opts?: HistoryOptions): Promise<VersionRow[]>;
+
+  /**
+   * Scoped, document-spanning history walk (sync/history plan §3.5). Selects
+   * documents by path glob (via `path_regexes`), then returns their version
+   * rows interleaved by id, bounded by `after_id`/`until_id` cursors. See
+   * `VersionsListOptions` for the `ever` (live vs. whole-corpus) distinction.
+   */
+  versions_list(opts: VersionsListOptions): Promise<VersionRow[]>;
+
+  /**
+   * The gap-aware forward feed walk (sync/history plan §3.2–3.3): the longest
+   * safe contiguous run of version rows after `opts.after_id`, filtered to
+   * `opts.repo_id` when given. Returns settled rows only (never crosses a hot
+   * gap) plus the resume cursor `next_id`. See `versions-since.ts` for the
+   * safety-window logic both adapters share.
+   */
+  versions_since(opts: VersionsSinceOptions): Promise<VersionsSinceResult>;
+
+  /**
+   * Batch id → path lookup (sync/history plan §3.3): the feed derives each
+   * ref's `prev_path` (both ends of a move/delete) from its `prev_id` without
+   * hydrating whole prev rows. Ids not present are simply absent from the map.
+   */
+  versions_paths_by_ids(ids: readonly number[]): Promise<Map<number, string>>;
+
+  /**
+   * The safe head `R` (sync/history plan §3.4): the raw version id the feed
+   * would hand out as `next_since` at the live tip — everything ≤ R is visible
+   * and final. Computed with the same safety-window machinery as the feed, but
+   * anchored at the tip rather than a cursor, so `history.index` scans through
+   * a settled boundary while `history.since(R)` covers the rest with no gaps.
+   * Returns 0 when the log is empty.
+   */
+  versions_safe_head(now_ms: number, window_ms: number): Promise<number>;
+
+  /**
+   * One keyset page of the live set for `history.index` (§3.4): live rows
+   * (`next_id IS NULL`) in `repo_id` whose current version id is in
+   * `(after_id, through_id]`, ascending by id, capped at `limit`. Lightweight
+   * tuples only — the kernel applies system/hidden exclusion and scope.
+   */
+  versions_live_index(opts: {
+    repo_id: number;
+    through_id: number;
+    after_id: number;
+    limit: number;
+  }): Promise<{ id: number; path: string; content_hash: string | null }[]>;
+
+  /**
+   * Content-hash backfill (sync/history plan §2.6). Fetch one batch of rows
+   * with `content_hash IS NULL` (id-ascending, id > `after_id`, capped at
+   * `limit`), optionally scoped to `repo_id`. Returns the raw fields the shared
+   * hash function needs; the kernel computes hashes and writes them via
+   * `versions_set_content_hash`. Keyset by id so batches don't re-scan.
+   */
+  versions_missing_content_hash(opts: {
+    repo_id?: number;
+    after_id: number;
+    limit: number;
+  }): Promise<{ id: number; frontmatter_raw: string; body: string }[]>;
+
+  /** Set `content_hash` for a batch of version ids (backfill writer, §2.6). */
+  versions_set_content_hash(
+    updates: readonly { id: number; content_hash: string }[],
+  ): Promise<void>;
 
   /**
    * All currently-live versions in a repo (i.e. rows where next_id IS NULL).

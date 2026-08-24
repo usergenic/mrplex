@@ -29,6 +29,7 @@ import { KernelError } from "../kernel/errors.js";
 import { createKernel } from "../kernel/kernel.js";
 import type { GraphSpec } from "../kernel/wire.js";
 import { extractSystemProperties, split as splitFrontmatter } from "../markdown/frontmatter.js";
+import { backfillContentHashes } from "../markdown/hash-backfill.js";
 import { renderGraphSummary } from "../mcp/render.js";
 import { startMcpStdio } from "../mcp/server.js";
 import { startServer } from "../server/serve.js";
@@ -46,6 +47,8 @@ import { startProxyServer } from "../shell/proxy.js";
 import { startShellServer } from "../shell/serve.js";
 import { type StdioCredential, startShellStdio } from "../shell/stdio.js";
 import { normalizeDatabaseUrl, openStorage } from "../storage/registry.js";
+import { startDaemon } from "../sync/daemon.js";
+import { syncOnce } from "../sync/run.js";
 import { type CliConfig, loadConfig, saveConfig } from "./config.js";
 import { exitCodeForKernelError } from "./exit-codes.js";
 import {
@@ -318,6 +321,10 @@ async function withClient<T>(
   } finally {
     await client.close();
   }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function emit(result: unknown, opts: GlobalOpts, prettyText: string): void {
@@ -1036,11 +1043,10 @@ function buildProgram(): Command {
 
   docs
     .command("history <path>")
-    .description("list versions of a document newest-first")
+    .description("list versions of a document newest-first (subsumed by `mrplex history`)")
     .option("--limit <n>", "limit to N most-recent (positive integer)", parsePositiveInt)
-    .option("--before <ts>", "only versions with created_at < <ts>")
     .action(function (this: Command, path: string) {
-      const localOpts = this.opts<{ limit?: number; before?: string }>();
+      const localOpts = this.opts<{ limit?: number }>();
       const globals = this.optsWithGlobals<GlobalOpts>();
       let repo: string;
       try {
@@ -1049,10 +1055,9 @@ function buildProgram(): Command {
         reportError(err);
       }
       withClient(this, async (client, opts) => {
-        const result = await client.docs.history(repo, path, {
-          limit: localOpts.limit,
-          before: localOpts.before,
-        });
+        // A single literal path is the old docs.history; route through the
+        // unified scoped walk (§3.5).
+        const result = await client.history.list({ repo, path, limit: localOpts.limit });
         emit(result, opts, renderHistoryTable(result));
       }).catch(reportError);
     });
@@ -1307,6 +1312,99 @@ function buildProgram(): Command {
       }).catch(reportError);
     });
 
+  // -------- tail (sync/history plan §3.6) --------
+  // The reference change-feed consumer: one VersionRef per line as NDJSON.
+  // Crash-resume is `tail --since <last-line-version_id>`. `--follow N` sits at
+  // the live tip, re-polling every N seconds on a short/empty page — the proving
+  // ground for the leading-gap heal path.
+  program
+    .command("tail")
+    .description("stream the global change feed as NDJSON (sync/history plan §3.6)")
+    .option("--since <version-id>", 'resume cursor; omitted or "" starts from the beginning')
+    .option(
+      "--follow <seconds>",
+      "poll interval in seconds; stay at the live tip re-polling on empty pages",
+      parsePositiveInt,
+    )
+    .option("--limit <n>", "max refs per page (positive integer)", parsePositiveInt)
+    .action(function (this: Command) {
+      const localOpts = this.opts<{
+        since?: string;
+        follow?: number;
+        limit?: number;
+      }>();
+      // The optional repo filter rides the global -r/--repo (or MRPLEX_REPO /
+      // config); an unset repo tails every repo in scope.
+      const globals = this.optsWithGlobals<GlobalOpts>();
+      withClient(this, async (client) => {
+        let cursor = localOpts.since ?? "";
+        const pollOnce = async (): Promise<number> => {
+          const page = await client.history.since({
+            after_version: cursor,
+            repo: globals.repo,
+            limit: localOpts.limit,
+          });
+          for (const ref of page.refs) {
+            process.stdout.write(`${JSON.stringify(ref)}\n`);
+          }
+          cursor = page.next_since;
+          return page.refs.length;
+        };
+        if (localOpts.follow === undefined) {
+          // One-shot: drain the currently-safe feed in pages, then stop.
+          let n = await pollOnce();
+          while (n > 0) n = await pollOnce();
+          return;
+        }
+        // Follow: never terminate; sleep between polls (including empty ones).
+        const intervalMs = localOpts.follow * 1000;
+        for (;;) {
+          const n = await pollOnce();
+          if (n === 0) await sleep(intervalMs);
+        }
+      }).catch(reportError);
+    });
+
+  // -------- history (sync/history plan §3.5) --------
+  program
+    .command("history [path-glob]")
+    .description("scoped, document-spanning version history — glob + --ever (§3.5)")
+    .option("--ever", "include documents that moved away or were deleted", false)
+    .option("--since <version-id>", "exclusive lower version-id bound")
+    .option("--until <version-id>", "inclusive upper version-id bound")
+    .option("--order <dir>", "asc (oldest-first) | desc (newest-first, default)")
+    .option("--limit <n>", "max versions (positive integer)", parsePositiveInt)
+    .action(function (this: Command, pathGlob: string | undefined) {
+      const localOpts = this.opts<{
+        ever: boolean;
+        since?: string;
+        until?: string;
+        order?: string;
+        limit?: number;
+      }>();
+      const globals = this.optsWithGlobals<GlobalOpts>();
+      let repo: string;
+      try {
+        repo = resolveRepoSlug(globals);
+      } catch (err) {
+        reportError(err);
+      }
+      const order =
+        localOpts.order === "asc" ? "asc" : localOpts.order === "desc" ? "desc" : undefined;
+      withClient(this, async (client, opts) => {
+        const result = await client.history.list({
+          repo,
+          path: pathGlob,
+          ever: localOpts.ever,
+          since: localOpts.since,
+          until: localOpts.until,
+          order,
+          limit: localOpts.limit,
+        });
+        emit(result, opts, renderHistoryTable(result));
+      }).catch(reportError);
+    });
+
   // -------- links (§11.2) --------
   const links = program.command("links").description("link index — backfill / stale / repair");
 
@@ -1456,6 +1554,148 @@ function buildProgram(): Command {
           }
         } catch (err) {
           reportError(err);
+        }
+      })();
+    });
+
+  // -------- sync (sync/history plan §4) --------
+  program
+    .command("sync <root>")
+    .description("two-way sync between a local vault and a mrplex repo (§4)")
+    .addHelpText(
+      "after",
+      "\nNote: on a repo created before migration 0002, run `mrplex hash backfill` first.\n" +
+        "Until every version has a stored $content_hash, a clean local copy that lacks\n" +
+        "sync intrinsics can be parked as a conflict instead of adopted (§2.6).",
+    )
+    .option("--once", "run startup reconciliation once, then exit (no watcher)", false)
+    .option("--interval <ms>", "feed poll interval in ms (daemon; default 5000)", parsePositiveInt)
+    .option("--debounce <ms>", "per-path debounce in ms (daemon; default 500)", parsePositiveInt)
+    .option(
+      "--settle <ms>",
+      "skip files younger than this many ms (partial saves)",
+      parsePositiveInt,
+    )
+    .option(
+      "--include <glob>",
+      "include glob (default **/*.md); repeat to add more",
+      (value: string, prev: string[] | undefined) => [...(prev ?? []), value],
+    )
+    .option(
+      "--exclude <glob>",
+      "exclude glob (wins over include); repeat to add more",
+      (value: string, prev: string[] | undefined) => [...(prev ?? []), value],
+    )
+    .option("--dry-run", "report the actions a reconciliation would take, changing nothing", false)
+    .option("-v, --verbose", "log each action to stderr", false)
+    .action(function (this: Command, root: string) {
+      const localOpts = this.opts<{
+        once: boolean;
+        interval?: number;
+        debounce?: number;
+        settle?: number;
+        include?: string[];
+        exclude?: string[];
+        dryRun: boolean;
+        verbose: boolean;
+      }>();
+      const globals = this.optsWithGlobals<GlobalOpts>();
+      let repo: string;
+      try {
+        repo = resolveRepoSlug(globals);
+      } catch (err) {
+        reportError(err);
+      }
+      const verboseLog = localOpts.verbose
+        ? (m: string) => process.stderr.write(`${m}\n`)
+        : undefined;
+
+      if (localOpts.once) {
+        withClient(this, async (client, opts) => {
+          const report = await syncOnce(client, {
+            root,
+            repo,
+            server: resolveServer(globals),
+            include: localOpts.include,
+            exclude: localOpts.exclude,
+            dryRun: localOpts.dryRun,
+            log: verboseLog,
+          });
+          const changed = report.actions.filter(
+            (a) => a.verdict !== "clean" && a.verdict !== "skip",
+          ).length;
+          emit(
+            report,
+            opts,
+            `sync ${repo} @ ${root}: through=${report.through_version} ` +
+              `actions=${changed} feed=${report.feed_applied}${localOpts.dryRun ? " (dry-run)" : ""}`,
+          );
+        }).catch(reportError);
+        return;
+      }
+
+      // Daemon: run until interrupted (Ctrl-C). The client stays open; SIGINT/
+      // SIGTERM stop the daemon and close the transport cleanly.
+      (async () => {
+        const client = await openClient(globals);
+        const daemon = startDaemon(client, {
+          root,
+          repo,
+          server: resolveServer(globals),
+          include: localOpts.include,
+          exclude: localOpts.exclude,
+          intervalMs: localOpts.interval,
+          debounceMs: localOpts.debounce,
+          settleMs: localOpts.settle,
+          log: verboseLog,
+        });
+        const shutdown = async () => {
+          await daemon.stop();
+          await client.close();
+          process.exit(0);
+        };
+        process.on("SIGINT", shutdown);
+        process.on("SIGTERM", shutdown);
+        try {
+          await daemon.ready;
+          process.stderr.write(`sync ${repo} @ ${root}: watching (Ctrl-C to stop)\n`);
+        } catch (err) {
+          await daemon.stop();
+          await client.close();
+          reportError(err);
+        }
+      })();
+    });
+
+  // -------- hash (sync/history plan §2.6) --------
+  const hash = program.command("hash").description("content-hash maintenance");
+  hash
+    .command("backfill")
+    .description("compute $content_hash for versions written before migration 0002")
+    .action(function (this: Command) {
+      // The optional repo filter rides the global -r/--repo (or MRPLEX_REPO /
+      // config); an unset repo backfills every repo.
+      const gopts = this.optsWithGlobals<GlobalOpts>();
+      (async () => {
+        const storage = await openStorage(resolveDatabase(gopts));
+        try {
+          let repoId: number | undefined;
+          if (gopts.repo !== undefined) {
+            const repo = await storage.repos_by_slug(gopts.repo);
+            if (!repo) throw new KernelError("repo_not_found", { repo: gopts.repo });
+            repoId = repo.id;
+          }
+          const report = await backfillContentHashes(storage, { repo_id: repoId });
+          if (gopts.json) {
+            process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+          } else {
+            const scope = gopts.repo ?? "all repos";
+            process.stdout.write(`hash backfill ${scope}: hashed=${report.hashed}\n`);
+          }
+        } catch (err) {
+          reportError(err);
+        } finally {
+          await storage.close();
         }
       })();
     });

@@ -96,7 +96,8 @@ export function compileSearchPlan(plan: SearchPlan): CompiledSql {
   const cols = `versions.id, versions.document_id, versions.repo_id,
                 versions.prev_id, versions.next_id, versions.path,
                 versions.frontmatter_raw, versions.frontmatter,
-                versions.body, versions.author, versions.created_at`;
+                versions.body, versions.author, versions.created_at,
+                versions.content_hash`;
 
   let sql: string;
   if (plan.text !== undefined) {
@@ -229,6 +230,8 @@ const INTRINSIC_COLUMNS: Record<string, string> = {
   // See compile-filter.ts for the $updated_at naming rationale.
   updated_at: "versions.created_at",
   body: "versions.body",
+  // Canonical content fingerprint (sync/history plan §2.5).
+  content_hash: "versions.content_hash",
 };
 
 function compileIntrinsic(mangledName: string): string {

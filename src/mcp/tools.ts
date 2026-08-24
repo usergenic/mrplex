@@ -161,15 +161,17 @@ function queryCtx(ctx: CallContext, args: Record<string, unknown>): CallContext 
 }
 
 /**
- * Add `$version: <version_id>` to `frontmatter_raw` unless the caller asked
- * for raw output. Non-destructive — plain text append, no YAML round-trip.
+ * Append the injected system properties — `$version` then `$content_hash`, in
+ * fixed order (sync/history plan §2.4) — to `frontmatter_raw` unless the caller
+ * asked for raw output. Non-destructive — plain text append, no YAML round-trip.
+ * This is the linchpin of sync: a materialized file carries its own ancestry
+ * (`$version`) and clean-state fingerprint (`$content_hash`).
  */
-function withInjectedVersion(v: Version, raw: boolean): Version {
+function withInjectedSystemProps(v: Version, raw: boolean): Version {
   if (raw) return v;
-  return {
-    ...v,
-    frontmatter_raw: appendSystemProperty(v.frontmatter_raw, "version", v.version_id),
-  };
+  let frontmatter_raw = appendSystemProperty(v.frontmatter_raw, "version", v.version_id);
+  frontmatter_raw = appendSystemProperty(frontmatter_raw, "content_hash", v.content_hash);
+  return { ...v, frontmatter_raw };
 }
 
 // -----------------------------------------------------------------------------
@@ -344,6 +346,43 @@ const QUERY_HIT_SCHEMA: JsonSchemaProp = {
   // Which keys appear depends entirely on `select`, so none are required and
   // both intrinsics and bare frontmatter keys ride additionalProperties.
   additionalProperties: true,
+};
+
+const VERSION_REF_SCHEMA: JsonSchemaProp = {
+  type: "object",
+  description:
+    "A change-feed pointer (sync/history plan §3.3). Consumers fetch bodies via docs_get_version " +
+    "only when needed; content_hash lets them skip no-op materializations.",
+  properties: {
+    version_id: { type: "string", description: "Opaque id of this version." },
+    prev_version_id: {
+      anyOf: [{ type: "string" }, { type: "null" }],
+      description: "Prior version id, or null for a create.",
+    },
+    repo: { type: "string", description: "Repo slug." },
+    path: { type: "string", description: "This version's path." },
+    prev_path: {
+      anyOf: [{ type: "string" }, { type: "null" }],
+      description: "Path of the prior version (both ends of a move/delete), or null.",
+    },
+    content_hash: { type: "string", description: "SHA-256 (bare hex) of canonical content." },
+    op: {
+      type: "string",
+      enum: ["create", "update", "move", "delete"],
+      description: "Server-derived operation.",
+    },
+    created_at: { type: "string", description: "ISO-8601 UTC timestamp." },
+  },
+  required: [
+    "version_id",
+    "prev_version_id",
+    "repo",
+    "path",
+    "prev_path",
+    "content_hash",
+    "op",
+    "created_at",
+  ],
 };
 
 const GRAPH_DOCUMENT_SCHEMA: JsonSchemaProp = {
@@ -593,7 +632,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
     outputSchema: VERSION_SCHEMA,
     handler: async (kernel, ctx, args) => {
       const v = await kernel.docs.get(ctx, argStr(args, "repo"), argStr(args, "path"));
-      const out = withInjectedVersion(v, args.raw === true);
+      const out = withInjectedSystemProps(v, args.raw === true);
       return { structured: out, text: renderVersion(out) };
     },
   },
@@ -619,13 +658,67 @@ export const TOOL_REGISTRY: ToolEntry[] = [
         argStr(args, "repo"),
         argStr(args, "version_id"),
       );
-      const out = withInjectedVersion(v, args.raw === true);
+      const out = withInjectedSystemProps(v, args.raw === true);
       return { structured: out, text: renderVersion(out) };
     },
   },
   {
+    name: "history_list",
+    description:
+      "Scoped, document-spanning version history (sync/history plan §3.5). Where docs_history lists " +
+      "one literal path, this takes a `path` GLOB (omitted = the whole repo) and interleaves the " +
+      "matching documents' versions by version-log position. `ever: false` (default) anchors on the " +
+      "LIVE set — history of what lives at the glob now, riding existing indexes; `ever: true` also " +
+      "includes documents that once matched but moved away or were deleted (whole chains). `since`/" +
+      "`until` are opaque version-id bounds; `order` is desc (newest-first) by default. This " +
+      "subsumes docs_history — a single literal `path` reproduces it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string" },
+        path: { type: "string", description: "Gitignore-style glob; omit for the whole repo." },
+        ever: {
+          type: "boolean",
+          description: "Include documents that ever matched (moved-away / deleted). Default false.",
+        },
+        since: { type: "string", description: "Exclusive lower version-id bound." },
+        until: { type: "string", description: "Inclusive upper version-id bound." },
+        order: {
+          type: "string",
+          enum: ["asc", "desc"],
+          description: "Default desc (newest-first).",
+        },
+        limit: { type: "integer", minimum: 1 },
+        scope: {
+          type: "array",
+          description: "Read-visibility claims (ScopeClaim[]); the X-Mrplex-Scope header wins.",
+          items: { type: "object", additionalProperties: true },
+        },
+      },
+      required: ["repo"],
+    },
+    outputSchema: listResultSchema(
+      VERSION_SCHEMA,
+      "Matching versions, ordered by version-log position.",
+    ),
+    handler: async (kernel, ctx, args) => {
+      const order = argStrOpt(args, "order");
+      const rows = await kernel.history.list(queryCtx(ctx, args), {
+        repo: argStr(args, "repo"),
+        path: argStrOpt(args, "path"),
+        ever: argBoolOpt(args, "ever"),
+        since: argStrOpt(args, "since"),
+        until: argStrOpt(args, "until"),
+        order: order === "asc" || order === "desc" ? order : undefined,
+        limit: argIntOpt(args, "limit"),
+      });
+      return { structured: wrapList(rows), text: renderVersionList(rows) };
+    },
+  },
+  {
     name: "docs_history",
-    description: "List versions of a document newest-first.",
+    description:
+      "Deprecated: use history_list (a literal `path` reproduces this). List versions of a document newest-first.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1041,6 +1134,131 @@ export const TOOL_REGISTRY: ToolEntry[] = [
         }
         throw err;
       }
+    },
+  },
+  {
+    name: "history_since",
+    description:
+      "The global change feed (sync/history plan §3.3). Given an opaque cursor `after_version`, " +
+      "returns the longest GAP-FREE contiguous run of change refs after it, plus `next_since` to " +
+      "resume. Each ref is a lightweight pointer — `version_id`, `prev_version_id`, `repo`, `path`, " +
+      "`prev_path` (both ends of a move/delete), `content_hash` (skip a fetch when you already have " +
+      "these bytes), a server-derived `op` (create/update/move/delete), and `created_at`. Fetch " +
+      "bodies via `docs_get_version` only when needed. Persist exactly `next_since`; feed it back to " +
+      "poll. A short/empty page means caught-up or waiting on an in-flight write — just poll again.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        after_version: {
+          type: "string",
+          description: 'Opaque resume cursor. "" (empty) starts from the beginning of the log.',
+        },
+        repo: { type: "string", description: "Optional repo slug filter." },
+        limit: {
+          type: "integer",
+          minimum: 1,
+          description: "Max refs per page (server default applies when omitted).",
+        },
+        scope: {
+          type: "array",
+          description: "Read-visibility claims (ScopeClaim[]); the X-Mrplex-Scope header wins.",
+          items: { type: "object", additionalProperties: true },
+        },
+      },
+      required: ["after_version"],
+    },
+    outputSchema: {
+      type: "object",
+      properties: {
+        refs: { type: "array", items: VERSION_REF_SCHEMA, description: "Settled change refs." },
+        next_since: { type: "string", description: "Opaque cursor to resume the feed." },
+      },
+      required: ["refs", "next_since"],
+    },
+    handler: async (kernel, ctx, args) => {
+      const input = {
+        after_version: argStr(args, "after_version"),
+        repo: argStrOpt(args, "repo"),
+        limit: argIntOpt(args, "limit"),
+      };
+      const page = await kernel.history.since(queryCtx(ctx, args), input);
+      return {
+        structured: page as unknown as Record<string, unknown>,
+        text: page.refs.map((r) => JSON.stringify(r)).join("\n"),
+      };
+    },
+  },
+  {
+    name: "history_index",
+    description:
+      "Page the live document set of one repo as of a safe head R (sync/history plan §3.4) — the " +
+      "startup/reconciliation enumeration a sync client runs before tailing. Returns lightweight " +
+      "{path, version_id, content_hash} tuples in current-version-id order, keyset-paginated and " +
+      "bounded through R. On the first call omit `through_version`; the server captures R and " +
+      "echoes it — pass it back (plus `after_version` = the previous page's last version_id) on " +
+      "subsequent pages. System (`:deleted/`) and hidden (`.`-prefixed) paths are excluded, as " +
+      "`query` defaults. The handoff is exact: a base scan over (cursor, R] plus history_since(R) " +
+      "is gap-free, so a doc updated mid-pagination simply arrives later on the feed.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string", description: "Repo slug (the scan is per-repo)." },
+        through_version: {
+          type: "string",
+          description: "The safe head R; omit on the first call (server captures + returns it).",
+        },
+        after_version: {
+          type: "string",
+          description: "Previous page's last version_id; omit on the first call.",
+        },
+        limit: {
+          type: "integer",
+          minimum: 1,
+          description: "Max items per page (server default applies when omitted).",
+        },
+        scope: {
+          type: "array",
+          description: "Read-visibility claims (ScopeClaim[]); the X-Mrplex-Scope header wins.",
+          items: { type: "object", additionalProperties: true },
+        },
+      },
+      required: ["repo"],
+    },
+    outputSchema: {
+      type: "object",
+      properties: {
+        items: {
+          type: "array",
+          description: "Live-set entries in current-version-id order.",
+          items: {
+            type: "object",
+            properties: {
+              path: { type: "string" },
+              version_id: { type: "string" },
+              content_hash: { type: "string" },
+            },
+            required: ["path", "version_id", "content_hash"],
+          },
+        },
+        through_version: { type: "string", description: "The safe head R (echo on later pages)." },
+        next_after_version: {
+          type: "string",
+          description: "Cursor for the next page; absent on the final page.",
+        },
+      },
+      required: ["items", "through_version"],
+    },
+    handler: async (kernel, ctx, args) => {
+      const page = await kernel.history.index(queryCtx(ctx, args), {
+        repo: argStr(args, "repo"),
+        through_version: argStrOpt(args, "through_version"),
+        after_version: argStrOpt(args, "after_version"),
+        limit: argIntOpt(args, "limit"),
+      });
+      return {
+        structured: page as unknown as Record<string, unknown>,
+        text: page.items.map((i) => JSON.stringify(i)).join("\n"),
+      };
     },
   },
   {

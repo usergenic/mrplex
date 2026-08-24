@@ -651,10 +651,15 @@ function writeDocResponse(
     writeEmpty(res, 304, { ETag: etagOf(v.version_id) });
     return;
   }
+  // Inject $version then $content_hash in fixed order (sync/history plan §2.4).
   const fmRaw =
     mode === "raw"
       ? v.frontmatter_raw
-      : appendSystemProperty(v.frontmatter_raw, "version", v.version_id);
+      : appendSystemProperty(
+          appendSystemProperty(v.frontmatter_raw, "version", v.version_id),
+          "content_hash",
+          v.content_hash,
+        );
   if (accept === "markdown") {
     writeMarkdown(res, 200, renderMarkdown(fmRaw, v.body), {
       ETag: etagOf(v.version_id),
