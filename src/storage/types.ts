@@ -317,7 +317,9 @@ export type Storage = {
   }): Promise<{ id: number; frontmatter_raw: string; body: string }[]>;
 
   /** Set `content_hash` for a batch of version ids (backfill writer, §2.6). */
-  versions_set_content_hash(updates: readonly { id: number; content_hash: string }[]): Promise<void>;
+  versions_set_content_hash(
+    updates: readonly { id: number; content_hash: string }[],
+  ): Promise<void>;
 
   /**
    * All currently-live versions in a repo (i.e. rows where next_id IS NULL).

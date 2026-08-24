@@ -6,9 +6,7 @@
   "bin": {
     "mrplex": "./dist/cli/main.js"
   },
-  "files": [
-    "dist/"
-  ],
+  "files": ["dist/"],
   "scripts": {
     "build": "tsc -p tsconfig.build.json && node scripts/copy-assets.mjs && node scripts/set-script-permissions.mjs",
     "typecheck": "tsc --noEmit",
