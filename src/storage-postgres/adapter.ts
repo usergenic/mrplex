@@ -669,6 +669,47 @@ class PostgresStorage implements Storage {
     });
   }
 
+  async versions_missing_content_hash(opts: {
+    repo_id?: number;
+    after_id: number;
+    limit: number;
+  }): Promise<{ id: number; frontmatter_raw: string; body: string }[]> {
+    return this.withClient(async (c) => {
+      const repoClause = opts.repo_id === undefined ? "" : " and repo_id = $3";
+      const params =
+        opts.repo_id === undefined
+          ? [opts.after_id, opts.limit]
+          : [opts.after_id, opts.limit, opts.repo_id];
+      const res = await c.query<{ id: number; frontmatter_raw: string; body: string }>(
+        `select id, frontmatter_raw, body from versions
+         where content_hash is null and id > $1${repoClause}
+         order by id asc limit $2`,
+        params,
+      );
+      return res.rows.map((r) => ({
+        id: Number(r.id),
+        frontmatter_raw: r.frontmatter_raw,
+        body: r.body,
+      }));
+    });
+  }
+
+  async versions_set_content_hash(
+    updates: readonly { id: number; content_hash: string }[],
+  ): Promise<void> {
+    if (updates.length === 0) return;
+    return this.tx(async () => {
+      await this.withClient(async (c) => {
+        for (const u of updates) {
+          await c.query("update versions set content_hash = $1 where id = $2", [
+            u.content_hash,
+            u.id,
+          ]);
+        }
+      });
+    });
+  }
+
   async chunks_upsert(
     version_id: number,
     model: string,

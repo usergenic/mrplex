@@ -609,6 +609,35 @@ class SqliteStorage implements Storage {
     }[];
   }
 
+  async versions_missing_content_hash(opts: {
+    repo_id?: number;
+    after_id: number;
+    limit: number;
+  }): Promise<{ id: number; frontmatter_raw: string; body: string }[]> {
+    const repoClause = opts.repo_id === undefined ? "" : " and repo_id = ?";
+    const params =
+      opts.repo_id === undefined
+        ? [opts.after_id, opts.limit]
+        : [opts.after_id, opts.repo_id, opts.limit];
+    return this.db
+      .prepare(
+        `select id, frontmatter_raw, body from versions
+         where content_hash is null and id > ?${repoClause}
+         order by id asc limit ?`,
+      )
+      .all(...params) as { id: number; frontmatter_raw: string; body: string }[];
+  }
+
+  async versions_set_content_hash(
+    updates: readonly { id: number; content_hash: string }[],
+  ): Promise<void> {
+    if (updates.length === 0) return;
+    return this.tx(async () => {
+      const stmt = this.db.prepare("update versions set content_hash = ? where id = ?");
+      for (const u of updates) stmt.run(u.content_hash, u.id);
+    });
+  }
+
   async chunks_upsert(
     version_id: number,
     model: string,

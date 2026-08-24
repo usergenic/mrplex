@@ -29,6 +29,7 @@ import { KernelError } from "../kernel/errors.js";
 import { createKernel } from "../kernel/kernel.js";
 import type { GraphSpec } from "../kernel/wire.js";
 import { extractSystemProperties, split as splitFrontmatter } from "../markdown/frontmatter.js";
+import { backfillContentHashes } from "../markdown/hash-backfill.js";
 import { renderGraphSummary } from "../mcp/render.js";
 import { startMcpStdio } from "../mcp/server.js";
 import { startServer } from "../server/serve.js";
@@ -1513,6 +1514,39 @@ function buildProgram(): Command {
           }
         } catch (err) {
           reportError(err);
+        }
+      })();
+    });
+
+  // -------- hash (sync/history plan §2.6) --------
+  const hash = program.command("hash").description("content-hash maintenance");
+  hash
+    .command("backfill")
+    .description("compute $content_hash for versions written before migration 0002")
+    .action(function (this: Command) {
+      // The optional repo filter rides the global -r/--repo (or MRPLEX_REPO /
+      // config); an unset repo backfills every repo.
+      const gopts = this.optsWithGlobals<GlobalOpts>();
+      (async () => {
+        const storage = await openStorage(resolveDatabase(gopts));
+        try {
+          let repoId: number | undefined;
+          if (gopts.repo !== undefined) {
+            const repo = await storage.repos_by_slug(gopts.repo);
+            if (!repo) throw new KernelError("repo_not_found", { repo: gopts.repo });
+            repoId = repo.id;
+          }
+          const report = await backfillContentHashes(storage, { repo_id: repoId });
+          if (gopts.json) {
+            process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+          } else {
+            const scope = gopts.repo ?? "all repos";
+            process.stdout.write(`hash backfill ${scope}: hashed=${report.hashed}\n`);
+          }
+        } catch (err) {
+          reportError(err);
+        } finally {
+          await storage.close();
         }
       })();
     });

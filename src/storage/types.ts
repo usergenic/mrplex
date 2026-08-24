@@ -276,6 +276,22 @@ export type Storage = {
   }): Promise<{ id: number; path: string; content_hash: string | null }[]>;
 
   /**
+   * Content-hash backfill (sync/history plan §2.6). Fetch one batch of rows
+   * with `content_hash IS NULL` (id-ascending, id > `after_id`, capped at
+   * `limit`), optionally scoped to `repo_id`. Returns the raw fields the shared
+   * hash function needs; the kernel computes hashes and writes them via
+   * `versions_set_content_hash`. Keyset by id so batches don't re-scan.
+   */
+  versions_missing_content_hash(opts: {
+    repo_id?: number;
+    after_id: number;
+    limit: number;
+  }): Promise<{ id: number; frontmatter_raw: string; body: string }[]>;
+
+  /** Set `content_hash` for a batch of version ids (backfill writer, §2.6). */
+  versions_set_content_hash(updates: readonly { id: number; content_hash: string }[]): Promise<void>;
+
+  /**
    * All currently-live versions in a repo (i.e. rows where next_id IS NULL).
    * Used by `repos.set_path_config` to produce the advisory PathWarning[]
    * scan (§3.5.3). Riding the partial-index on (repo_id, path) where
