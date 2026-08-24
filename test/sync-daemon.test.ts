@@ -4,7 +4,15 @@
  * (local → remote) and the poll loop (remote → local) with short timings.
  */
 
-import { mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -132,5 +140,50 @@ describe("sync daemon", () => {
       return cur.body === "two\n" ? cur : undefined;
     });
     expect(v2.prev_version_id).toBe(v1.version_id);
+  });
+
+  it("with a cursor marker present, skips the index scan (offline deletes are lazy, §4.9)", async () => {
+    // A remote doc exists but is NOT on the local disk. Write a cursor marker
+    // whose position is already past that doc's create, so the feed-from-cursor
+    // delivers nothing. If the daemon (wrongly) ran a full index reconciliation
+    // it would materialize the doc; with a marker present it must not.
+    const v = await client.docs.create("notes", "server-only.md", {
+      body: "on server\n",
+      frontmatter_raw: "",
+    });
+    mkdirSync(join(vault, ".mrplex"), { recursive: true });
+    writeFileSync(
+      join(vault, ".mrplex/sync.json"),
+      `${JSON.stringify({ repo: "notes", last_synced_version_id: v.version_id })}\n`,
+    );
+    daemon = await start();
+    // Give the startup path time to (not) materialize.
+    await new Promise((r) => setTimeout(r, 300));
+    expect(existsSync(join(vault, "server-only.md"))).toBe(false);
+  });
+
+  it("with a marker present, pushes an offline local edit via the dirty walk", async () => {
+    // Materialize a doc, stop, edit offline, then restart with the marker.
+    const v1 = await client.docs.create("notes", "a.md", { body: "one\n", frontmatter_raw: "" });
+    daemon = await start();
+    await waitFor(() => {
+      try {
+        return readFileSync(join(vault, "a.md"), "utf8").includes("one");
+      } catch {
+        return false;
+      }
+    });
+    await daemon.stop();
+    daemon = undefined;
+    // Offline edit (daemon not running).
+    const original = readFileSync(join(vault, "a.md"), "utf8");
+    writeFileSync(join(vault, "a.md"), original.replace("one", "offline edit"));
+    // Restart: the marker is present, so the local dirty walk should push it.
+    daemon = await start();
+    const cur = await waitFor(async () => {
+      const c = await client.docs.get("notes", "a.md");
+      return c.body === "offline edit\n" ? c : undefined;
+    });
+    expect(cur.prev_version_id).toBe(v1.version_id);
   });
 });

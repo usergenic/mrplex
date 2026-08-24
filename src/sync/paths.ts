@@ -21,8 +21,12 @@ export type ScopeFilter = {
 
 /**
  * Build the include/exclude predicate. Defaults to `**\/*.md` include (§4.1).
- * Exclusions always win; the `.mrplex/` state dir is excluded unconditionally
- * so the cursor file is never synced or witnessed.
+ * Exclusions always win. Any path with a dot-prefixed segment is excluded
+ * unconditionally — this covers the `.mrplex/` state dir AND app dotdirs like
+ * `.obsidian/` (§4.2). Crucially, the local walk (fs-store) prunes the same
+ * dotdirs, so both directions filter identically and can never disagree about
+ * what is in scope (§4.1: "the same include/exclude globs filter both
+ * directions").
  */
 export function makeScopeFilter(opts?: {
   include?: string[];
@@ -32,11 +36,16 @@ export function makeScopeFilter(opts?: {
   const exclude = opts?.exclude ?? [];
   return {
     matches(docPath: string): boolean {
-      if (docPath.startsWith(`${SYNC_DIR}/`)) return false;
+      if (hasDotSegment(docPath)) return false;
       if (exclude.length > 0 && pathMatchesGlobs(exclude, docPath)) return false;
       return pathMatchesGlobs(include, docPath);
     },
   };
+}
+
+/** True when any POSIX path segment starts with a dot (`.mrplex/`, `.obsidian/`, …). */
+export function hasDotSegment(docPath: string): boolean {
+  return docPath.split("/").some((seg) => seg.startsWith("."));
 }
 
 /**

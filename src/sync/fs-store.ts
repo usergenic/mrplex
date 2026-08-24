@@ -7,7 +7,7 @@
 
 import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
-import { SYNC_DIR, toDocPath, toLocalPath } from "./paths.js";
+import { toDocPath, toLocalPath } from "./paths.js";
 import type { FileStore } from "./reconcile.js";
 
 export function createFsStore(root: string): FileStore {
@@ -46,9 +46,11 @@ async function walk(root: string, dir: string, out: string[]): Promise<void> {
   }
   for (const ent of entries) {
     if (ent.isDirectory()) {
-      // Prune the sync state dir and hidden dirs (e.g. .obsidian) — the scope
-      // filter would exclude them anyway; pruning avoids the descent.
-      if (ent.name === SYNC_DIR || ent.name.startsWith(".")) continue;
+      // Prune any dot-prefixed dir (the `.mrplex/` state dir, app dotdirs like
+      // `.obsidian/`). This is exactly what makeScopeFilter's hasDotSegment
+      // excludes, so the walk and the scope filter agree in both directions
+      // (§4.1); pruning here just avoids the descent.
+      if (ent.name.startsWith(".")) continue;
       await walk(root, `${dir}/${ent.name}`, out);
     } else if (ent.isFile()) {
       const docPath = toDocPath(root, `${dir}/${ent.name}`);

@@ -77,6 +77,25 @@ export function startDaemon(client: KernelClient, opts: DaemonOptions): Daemon {
     });
   }
 
+  /**
+   * The marker-present offline reconcile (§4.9): a purely-local walk that
+   * pushes offline edits and creations without enumerating the remote. Each
+   * file runs the ordinary push pass — clean files no-op via the hash gate,
+   * dirty ones push, files lacking provenance resolve the remote path first.
+   * Offline deletions and moves reconcile lazily (they are not witnessed), per
+   * the plan's stated consequence; a full pass (--once) is the lever for those.
+   */
+  async function localDirtyWalk(): Promise<void> {
+    for (const docPath of await store.list()) {
+      if (!scope.matches(docPath)) continue;
+      try {
+        await pushPath(docPath, { client, store, repo: opts.repo, map, log });
+      } catch (err) {
+        log(`push error\t${docPath}\t${(err as Error).message}`);
+      }
+    }
+  }
+
   async function pollFeedOnce(): Promise<void> {
     const { cursor: next } = await applyFeed(client, store, scope, {
       repo: opts.repo,
@@ -111,15 +130,31 @@ export function startDaemon(client: KernelClient, opts: DaemonOptions): Daemon {
   }
 
   const ready = (async () => {
-    // 1. Startup reconciliation (§4.9). Seeds the map from the index + local walk.
+    // 1. Startup is deterministic on the cursor marker (§4.9, §7).
     const existing = await readCursor(opts.root);
     serverHint = existing?.server;
-    const report = await reconcileOnce(client, store, scope, { repo: opts.repo, log });
+    // Seed the map from local provenance first, so the dirty walk's witnessed
+    // deletes (and the feed's) know each file's prev_version_id.
     await seedMapFromLocal(store, scope, map);
-    cursor = report.through_version;
+    if (existing === null) {
+      // Marker absent → full index reconciliation, then resume the feed from R.
+      const report = await reconcileOnce(client, store, scope, { repo: opts.repo, log });
+      // reconcileOnce may have materialized/pushed files; re-seed so the map
+      // reflects the post-reconcile provenance.
+      await seedMapFromLocal(store, scope, map);
+      cursor = report.through_version;
+    } else {
+      // Marker present → skip the index scan. Run a purely-local dirty walk
+      // (pushes offline edits + creations; no remote enumeration), then resume
+      // history.since(cursor). The feed is gap-free from any cursor age (§3.2),
+      // so an old marker is merely more replay, never a correctness question.
+      // Offline deletions/moves reconcile lazily until a full pass (§4.9).
+      await localDirtyWalk();
+      cursor = existing.last_synced_version_id;
+    }
     await persistCursor();
 
-    // 2. Drain the feed from R (advances + re-persists the cursor if it moves).
+    // 2. Drain the feed from the cursor (advances + re-persists if it moves).
     await pollFeedOnce();
 
     // 3. Start the watcher (local → remote).

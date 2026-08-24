@@ -824,12 +824,21 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
         // Compile the path glob to an anchored regex source (the same dialect
         // scope + graph use). Omitted glob = every document in the repo.
         const pathRegexes = input.path === undefined ? [] : [`^${globToRegexSource(input.path)}$`];
+        // Reject an unparseable bound rather than coercing to 0 — for `until`
+        // that would silently mean `id <= 0` (empty result), inverting intent.
+        const decodeBound = (kind: "since" | "until", value: string): number => {
+          const id = decodeVersionId(value);
+          if (id === null) {
+            throw new KernelError("version_not_found", { version_id: value, bound: kind });
+          }
+          return id;
+        };
         const rows = await storage.versions_list({
           repo_id: repo.id,
           path_regexes: pathRegexes,
           ever: input.ever ?? false,
-          after_id: input.since !== undefined ? (decodeVersionId(input.since) ?? 0) : undefined,
-          until_id: input.until !== undefined ? (decodeVersionId(input.until) ?? 0) : undefined,
+          after_id: input.since !== undefined ? decodeBound("since", input.since) : undefined,
+          until_id: input.until !== undefined ? decodeBound("until", input.until) : undefined,
           order: input.order ?? "desc",
           limit: input.limit ?? HISTORY_LIST_DEFAULT_LIMIT,
         });

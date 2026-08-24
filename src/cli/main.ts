@@ -1562,6 +1562,12 @@ function buildProgram(): Command {
   program
     .command("sync <root>")
     .description("two-way sync between a local vault and a mrplex repo (§4)")
+    .addHelpText(
+      "after",
+      "\nNote: on a repo created before migration 0002, run `mrplex hash backfill` first.\n" +
+        "Until every version has a stored $content_hash, a clean local copy that lacks\n" +
+        "sync intrinsics can be parked as a conflict instead of adopted (§2.6).",
+    )
     .option("--once", "run startup reconciliation once, then exit (no watcher)", false)
     .option("--interval <ms>", "feed poll interval in ms (daemon; default 5000)", parsePositiveInt)
     .option("--debounce <ms>", "per-path debounce in ms (daemon; default 500)", parsePositiveInt)

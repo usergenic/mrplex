@@ -203,6 +203,28 @@ describe("reconcile — §4.9 rows", () => {
   });
 });
 
+describe("reconcile — row 8 (offline move)", () => {
+  it("a file whose embedded version lives at a different remote path → push move", async () => {
+    // Doc created at old.md, then the file moved locally to new.md while sync
+    // was stopped (still embeds old.md's version). Remote is still at old.md.
+    const v1 = await client.docs.create("notes", "old.md", { body: "x\n", frontmatter_raw: "" });
+    const moved = renderInjected(await client.docs.get("notes", "old.md"));
+    const store = memStore({ "new.md": moved });
+    const report = await reconcile(store);
+    expect(verdictFor(report, "new.md")).toBe("push");
+    // The document's identity moved: new.md is now current, prev is v1.
+    const cur = await client.docs.get("notes", "new.md");
+    expect(cur.prev_version_id).toBe(v1.version_id);
+    // old.md no longer live remotely.
+    await expect(client.docs.get("notes", "old.md")).rejects.toThrow();
+  });
+
+  // Note: the stale_prev move-race branch (parkConflictForCurrent) requires the
+  // embedded version to be current at a different path yet be superseded between
+  // the lookup and the put — an inherent race, not deterministically
+  // reproducible in a serial test (same shape as the create_conflict downgrade).
+});
+
 describe("reconcile + feed handoff", () => {
   it("a doc that advances after R is delivered by the feed, not duplicated", async () => {
     const v1 = await client.docs.create("notes", "a.md", { body: "one\n", frontmatter_raw: "" });

@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 import { sqliteAdapter } from "../storage-sqlite/adapter.js";
 import type { Storage } from "../storage/types.js";
 import type { CallContext } from "./context.js";
+import { KernelError } from "./errors.js";
 import { deriveOp } from "./history.js";
 import { createKernel } from "./kernel.js";
 
@@ -266,5 +267,17 @@ describe("history.list", () => {
       order: "asc",
     });
     expect(rows.map((r) => r.version_id)).toEqual([v2.version_id, v3.version_id]);
+  });
+
+  it("rejects a malformed --until instead of silently returning empty", async () => {
+    const { kernel, actor } = await bootstrap();
+    await kernel.docs.create(actor, "notes", "a.md", { body: "1\n", frontmatter_raw: "" });
+    // A typo'd bound must error, not coerce to id<=0 (which returns nothing).
+    await expect(
+      kernel.history.list(actor, { repo: "notes", until: "not-a-version" }),
+    ).rejects.toBeInstanceOf(KernelError);
+    await expect(
+      kernel.history.list(actor, { repo: "notes", since: "garbage" }),
+    ).rejects.toBeInstanceOf(KernelError);
   });
 });
