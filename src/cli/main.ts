@@ -47,6 +47,7 @@ import { startProxyServer } from "../shell/proxy.js";
 import { startShellServer } from "../shell/serve.js";
 import { type StdioCredential, startShellStdio } from "../shell/stdio.js";
 import { normalizeDatabaseUrl, openStorage } from "../storage/registry.js";
+import { syncOnce } from "../sync/run.js";
 import { type CliConfig, loadConfig, saveConfig } from "./config.js";
 import { exitCodeForKernelError } from "./exit-codes.js";
 import {
@@ -1516,6 +1517,64 @@ function buildProgram(): Command {
           reportError(err);
         }
       })();
+    });
+
+  // -------- sync (sync/history plan §4) --------
+  program
+    .command("sync <root>")
+    .description("two-way sync between a local vault and a mrplex repo (§4)")
+    .option("--once", "run startup reconciliation once, then exit (no watcher)", false)
+    .option(
+      "--include <glob>",
+      "include glob (default **/*.md); repeat to add more",
+      (value: string, prev: string[] | undefined) => [...(prev ?? []), value],
+    )
+    .option(
+      "--exclude <glob>",
+      "exclude glob (wins over include); repeat to add more",
+      (value: string, prev: string[] | undefined) => [...(prev ?? []), value],
+    )
+    .option("--dry-run", "report the actions a reconciliation would take, changing nothing", false)
+    .option("-v, --verbose", "log each action to stderr", false)
+    .action(function (this: Command, root: string) {
+      const localOpts = this.opts<{
+        once: boolean;
+        include?: string[];
+        exclude?: string[];
+        dryRun: boolean;
+        verbose: boolean;
+      }>();
+      const globals = this.optsWithGlobals<GlobalOpts>();
+      let repo: string;
+      try {
+        repo = resolveRepoSlug(globals);
+      } catch (err) {
+        reportError(err);
+      }
+      if (!localOpts.once) {
+        process.stderr.write("sync: only --once is implemented so far (the daemon is M8)\n");
+        process.exit(1);
+      }
+      withClient(this, async (client, opts) => {
+        const report = await syncOnce(client, {
+          root,
+          repo,
+          server: resolveServer(globals),
+          include: localOpts.include,
+          exclude: localOpts.exclude,
+          dryRun: localOpts.dryRun,
+          log: localOpts.verbose ? (m) => process.stderr.write(`${m}\n`) : undefined,
+        });
+        const changed = report.actions.filter(
+          (a) => a.verdict !== "clean" && a.verdict !== "skip",
+        ).length;
+        emit(
+          report,
+          opts,
+          `sync ${repo} @ ${root}: through=${report.through_version} ` +
+            `actions=${changed} feed=${report.feed_applied}${localOpts.dryRun ? " (dry-run)" : ""}`,
+        );
+      }).catch(reportError);
     });
 
   // -------- hash (sync/history plan §2.6) --------
