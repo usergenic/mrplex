@@ -47,6 +47,7 @@ import { startProxyServer } from "../shell/proxy.js";
 import { startShellServer } from "../shell/serve.js";
 import { type StdioCredential, startShellStdio } from "../shell/stdio.js";
 import { normalizeDatabaseUrl, openStorage } from "../storage/registry.js";
+import { startDaemon } from "../sync/daemon.js";
 import { syncOnce } from "../sync/run.js";
 import { type CliConfig, loadConfig, saveConfig } from "./config.js";
 import { exitCodeForKernelError } from "./exit-codes.js";
@@ -1524,6 +1525,13 @@ function buildProgram(): Command {
     .command("sync <root>")
     .description("two-way sync between a local vault and a mrplex repo (§4)")
     .option("--once", "run startup reconciliation once, then exit (no watcher)", false)
+    .option("--interval <ms>", "feed poll interval in ms (daemon; default 5000)", parsePositiveInt)
+    .option("--debounce <ms>", "per-path debounce in ms (daemon; default 500)", parsePositiveInt)
+    .option(
+      "--settle <ms>",
+      "skip files younger than this many ms (partial saves)",
+      parsePositiveInt,
+    )
     .option(
       "--include <glob>",
       "include glob (default **/*.md); repeat to add more",
@@ -1539,6 +1547,9 @@ function buildProgram(): Command {
     .action(function (this: Command, root: string) {
       const localOpts = this.opts<{
         once: boolean;
+        interval?: number;
+        debounce?: number;
+        settle?: number;
         include?: string[];
         exclude?: string[];
         dryRun: boolean;
@@ -1551,30 +1562,65 @@ function buildProgram(): Command {
       } catch (err) {
         reportError(err);
       }
-      if (!localOpts.once) {
-        process.stderr.write("sync: only --once is implemented so far (the daemon is M8)\n");
-        process.exit(1);
+      const verboseLog = localOpts.verbose
+        ? (m: string) => process.stderr.write(`${m}\n`)
+        : undefined;
+
+      if (localOpts.once) {
+        withClient(this, async (client, opts) => {
+          const report = await syncOnce(client, {
+            root,
+            repo,
+            server: resolveServer(globals),
+            include: localOpts.include,
+            exclude: localOpts.exclude,
+            dryRun: localOpts.dryRun,
+            log: verboseLog,
+          });
+          const changed = report.actions.filter(
+            (a) => a.verdict !== "clean" && a.verdict !== "skip",
+          ).length;
+          emit(
+            report,
+            opts,
+            `sync ${repo} @ ${root}: through=${report.through_version} ` +
+              `actions=${changed} feed=${report.feed_applied}${localOpts.dryRun ? " (dry-run)" : ""}`,
+          );
+        }).catch(reportError);
+        return;
       }
-      withClient(this, async (client, opts) => {
-        const report = await syncOnce(client, {
+
+      // Daemon: run until interrupted (Ctrl-C). The client stays open; SIGINT/
+      // SIGTERM stop the daemon and close the transport cleanly.
+      (async () => {
+        const client = await openClient(globals);
+        const daemon = startDaemon(client, {
           root,
           repo,
           server: resolveServer(globals),
           include: localOpts.include,
           exclude: localOpts.exclude,
-          dryRun: localOpts.dryRun,
-          log: localOpts.verbose ? (m) => process.stderr.write(`${m}\n`) : undefined,
+          intervalMs: localOpts.interval,
+          debounceMs: localOpts.debounce,
+          settleMs: localOpts.settle,
+          log: verboseLog,
         });
-        const changed = report.actions.filter(
-          (a) => a.verdict !== "clean" && a.verdict !== "skip",
-        ).length;
-        emit(
-          report,
-          opts,
-          `sync ${repo} @ ${root}: through=${report.through_version} ` +
-            `actions=${changed} feed=${report.feed_applied}${localOpts.dryRun ? " (dry-run)" : ""}`,
-        );
-      }).catch(reportError);
+        const shutdown = async () => {
+          await daemon.stop();
+          await client.close();
+          process.exit(0);
+        };
+        process.on("SIGINT", shutdown);
+        process.on("SIGTERM", shutdown);
+        try {
+          await daemon.ready;
+          process.stderr.write(`sync ${repo} @ ${root}: watching (Ctrl-C to stop)\n`);
+        } catch (err) {
+          await daemon.stop();
+          await client.close();
+          reportError(err);
+        }
+      })();
     });
 
   // -------- hash (sync/history plan §2.6) --------

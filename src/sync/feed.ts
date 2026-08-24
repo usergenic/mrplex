@@ -21,12 +21,19 @@ import {
   renderMaterialized,
 } from "./intrinsics.js";
 import type { ScopeFilter } from "./paths.js";
+import type { RemoteMap } from "./push.js";
 import type { FileStore } from "./reconcile.js";
 
 export type ApplyFeedOptions = {
   repo: string;
   since: string;
   log?: (msg: string) => void;
+  /**
+   * Optional daemon working-map (§4.2 tier 3). When supplied, feed application
+   * keeps it current — set on materialize, delete on remove — so a later
+   * witnessed unlink knows the file's prev_version_id.
+   */
+  map?: RemoteMap;
 };
 
 export type ApplyFeedResult = {
@@ -53,7 +60,7 @@ export async function applyFeed(
   for (;;) {
     const page = await client.history.since({ after_version: cursor, repo: opts.repo });
     for (const ref of page.refs) {
-      if (await applyRef(client, store, scope, opts.repo, ref, log)) applied++;
+      if (await applyRef(client, store, scope, opts.repo, ref, log, opts.map)) applied++;
     }
     // No forward progress → caught up (or a hot gap). Stop draining.
     if (page.next_since === cursor || page.refs.length === 0) {
@@ -73,12 +80,14 @@ async function applyRef(
   repo: string,
   ref: VersionRef,
   log: (msg: string) => void,
+  map?: RemoteMap,
 ): Promise<boolean> {
   if (ref.op === "delete") {
     // Remove the local file at prev_path IF clean; dirty ⇒ keep (resurrection
     // happens on its next local-change cycle). §4.3 delete.
     const target = ref.prev_path;
     if (target === null || !scope.matches(target)) return false;
+    map?.delete(target);
     const text = await store.read(target);
     if (text === null) return false;
     const intr = readFileIntrinsics(text);
@@ -91,6 +100,7 @@ async function applyRef(
   if (ref.op === "move") {
     const from = ref.prev_path;
     if (from !== null && scope.matches(from)) {
+      map?.delete(from);
       const text = await store.read(from);
       if (text !== null) {
         const intr = readFileIntrinsics(text);
@@ -109,6 +119,7 @@ async function applyRef(
     if (isIgnored(intr)) return false;
     if (intr.computed_hash === ref.content_hash) {
       // Bytes already present (our own push echoing back, or a vault copy).
+      map?.set(ref.path, { version_id: ref.version_id, content_hash: ref.content_hash });
       // Repair provenance only if the embedded version lags.
       if (intr.version === ref.version_id) return false;
       const v = await client.docs.get_version(repo, ref.version_id);
@@ -126,6 +137,7 @@ async function applyRef(
   }
   const v = await client.docs.get_version(repo, ref.version_id);
   await store.write(ref.path, renderMaterialized(v));
+  map?.set(ref.path, { version_id: ref.version_id, content_hash: ref.content_hash });
   log(`feed ${ref.op}\t${ref.path}`);
   return true;
 }
