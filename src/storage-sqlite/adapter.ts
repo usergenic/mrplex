@@ -21,6 +21,7 @@ import type {
   VectorSearchHit,
   VersionInsertInput,
   VersionRow,
+  VersionsListOptions,
   VersionsSinceOptions,
   VersionsSinceResult,
 } from "../storage/types.js";
@@ -520,6 +521,65 @@ class SqliteStorage implements Storage {
     return rows.map(hydrateVersion);
   }
 
+  async versions_list(opts: VersionsListOptions): Promise<VersionRow[]> {
+    // 1. Select the document ids in scope. Empty path_regexes → every doc in
+    //    the repo; otherwise match paths via the regexp() UDF (same engine the
+    //    scope-glob compiler uses). `ever` decides whether a match on ANY
+    //    version counts, or only the current one.
+    const hasGlob = opts.path_regexes.length > 0;
+    const ors = opts.path_regexes.map(() => "regexp(?, path)").join(" OR ");
+    let docIds: number[];
+    if (!hasGlob) {
+      docIds = (
+        this.db
+          .prepare("select distinct document_id from versions where repo_id = ?")
+          .all(opts.repo_id) as { document_id: number }[]
+      ).map((r) => r.document_id);
+    } else {
+      const liveClause = opts.ever ? "" : " and next_id is null";
+      docIds = (
+        this.db
+          .prepare(
+            `select distinct document_id from versions
+             where repo_id = ?${liveClause} and (${ors})`,
+          )
+          .all(opts.repo_id, ...opts.path_regexes) as { document_id: number }[]
+      ).map((r) => r.document_id);
+    }
+    if (docIds.length === 0) return [];
+
+    // 2. Walk those documents' versions, interleaved by id, within the cursor
+    //    bounds. `ever: false` still returns the WHOLE chain of a selected live
+    //    document (history of what lives here now); the path filter only chose
+    //    the documents, not which of their versions to include.
+    const clauses: string[] = [];
+    const params: (string | number)[] = [];
+    if (opts.after_id !== undefined) {
+      clauses.push("id > ?");
+      params.push(opts.after_id);
+    }
+    if (opts.until_id !== undefined) {
+      clauses.push("id <= ?");
+      params.push(opts.until_id);
+    }
+    const rows = chunkedInList<VersionRawRow>(docIds, (ph, chunk) => {
+      const where = [`document_id in (${ph})`, ...clauses].join(" and ");
+      return this.db
+        .prepare(
+          `select id, document_id, repo_id, prev_id, next_id, path,
+                  frontmatter_raw, frontmatter, body, author, created_at, content_hash
+           from versions where ${where}
+           order by id ${opts.order === "desc" ? "desc" : "asc"}
+           limit ?`,
+        )
+        .all(...chunk, ...params, opts.limit) as VersionRawRow[];
+    });
+    // chunkedInList concatenates per-chunk results; re-sort + re-limit so the
+    // global ordering/limit holds when docIds span multiple chunks.
+    rows.sort((a, b) => (opts.order === "desc" ? b.id - a.id : a.id - b.id));
+    return rows.slice(0, opts.limit).map(hydrateVersion);
+  }
+
   async versions_since(opts: VersionsSinceOptions): Promise<VersionsSinceResult> {
     // Gaps are global, so scan the global id sequence (id, repo, age) — the
     // repo filter never affects gap detection, only the delivered rows. A
@@ -567,10 +627,13 @@ class SqliteStorage implements Storage {
 
   async versions_paths_by_ids(ids: readonly number[]): Promise<Map<number, string>> {
     const map = new Map<number, string>();
-    const rows = chunkedInList<{ id: number; path: string }>(ids, (ph, chunk) =>
-      this.db
-        .prepare(`select id, path from versions where id in (${ph})`)
-        .all(...chunk) as { id: number; path: string }[],
+    const rows = chunkedInList<{ id: number; path: string }>(
+      ids,
+      (ph, chunk) =>
+        this.db.prepare(`select id, path from versions where id in (${ph})`).all(...chunk) as {
+          id: number;
+          path: string;
+        }[],
     );
     for (const r of rows) map.set(r.id, r.path);
     return map;

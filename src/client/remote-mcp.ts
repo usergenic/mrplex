@@ -205,6 +205,8 @@ function buildRemoteClient(client: Client): KernelClient {
         call<HistorySincePage>("history_since", input as unknown as Record<string, unknown>),
       index: (input) =>
         call<HistoryIndexPage>("history_index", input as unknown as Record<string, unknown>),
+      list: (input) =>
+        callList<Version>("history_list", input as unknown as Record<string, unknown>),
     },
     close: async () => {
       if (closed) return;

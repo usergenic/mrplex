@@ -37,6 +37,7 @@ import type {
   VectorSearchHit,
   VersionInsertInput,
   VersionRow,
+  VersionsListOptions,
   VersionsSinceOptions,
   VersionsSinceResult,
 } from "../storage/types.js";
@@ -578,6 +579,49 @@ class PostgresStorage implements Storage {
          order by depth asc${limitClause}`,
         params,
       );
+      return res.rows as VersionRow[];
+    });
+  }
+
+  async versions_list(opts: VersionsListOptions): Promise<VersionRow[]> {
+    return this.withClient(async (c) => {
+      // 1. Document ids in scope. Empty globs → all docs; else match by path
+      //    regex (POSIX ARE, `path ~ ANY`), with `ever` gating live-only.
+      const hasGlob = opts.path_regexes.length > 0;
+      let docIds: number[];
+      if (!hasGlob) {
+        const res = await c.query<{ document_id: number }>(
+          "select distinct document_id from versions where repo_id = $1",
+          [opts.repo_id],
+        );
+        docIds = res.rows.map((r) => Number(r.document_id));
+      } else {
+        const liveClause = opts.ever ? "" : " and next_id is null";
+        const res = await c.query<{ document_id: number }>(
+          `select distinct document_id from versions
+           where repo_id = $1${liveClause} and path ~ ANY($2::text[])`,
+          [opts.repo_id, opts.path_regexes as string[]],
+        );
+        docIds = res.rows.map((r) => Number(r.document_id));
+      }
+      if (docIds.length === 0) return [];
+
+      // 2. Their versions, interleaved by id, within cursor bounds.
+      const params: (number | number[])[] = [docIds];
+      let sql = `select id, document_id, repo_id, prev_id, next_id, path,
+                        frontmatter_raw, frontmatter, body, author, created_at, content_hash
+                 from versions where document_id = ANY($1::bigint[])`;
+      if (opts.after_id !== undefined) {
+        params.push(opts.after_id);
+        sql += ` and id > $${params.length}`;
+      }
+      if (opts.until_id !== undefined) {
+        params.push(opts.until_id);
+        sql += ` and id <= $${params.length}`;
+      }
+      params.push(opts.limit);
+      sql += ` order by id ${opts.order === "desc" ? "desc" : "asc"} limit $${params.length}`;
+      const res = await c.query<VersionRawRow>(sql, params);
       return res.rows as VersionRow[];
     });
   }

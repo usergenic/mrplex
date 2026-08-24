@@ -663,8 +663,62 @@ export const TOOL_REGISTRY: ToolEntry[] = [
     },
   },
   {
+    name: "history_list",
+    description:
+      "Scoped, document-spanning version history (sync/history plan §3.5). Where docs_history lists " +
+      "one literal path, this takes a `path` GLOB (omitted = the whole repo) and interleaves the " +
+      "matching documents' versions by version-log position. `ever: false` (default) anchors on the " +
+      "LIVE set — history of what lives at the glob now, riding existing indexes; `ever: true` also " +
+      "includes documents that once matched but moved away or were deleted (whole chains). `since`/" +
+      "`until` are opaque version-id bounds; `order` is desc (newest-first) by default. This " +
+      "subsumes docs_history — a single literal `path` reproduces it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string" },
+        path: { type: "string", description: "Gitignore-style glob; omit for the whole repo." },
+        ever: {
+          type: "boolean",
+          description: "Include documents that ever matched (moved-away / deleted). Default false.",
+        },
+        since: { type: "string", description: "Exclusive lower version-id bound." },
+        until: { type: "string", description: "Inclusive upper version-id bound." },
+        order: {
+          type: "string",
+          enum: ["asc", "desc"],
+          description: "Default desc (newest-first).",
+        },
+        limit: { type: "integer", minimum: 1 },
+        scope: {
+          type: "array",
+          description: "Read-visibility claims (ScopeClaim[]); the X-Mrplex-Scope header wins.",
+          items: { type: "object", additionalProperties: true },
+        },
+      },
+      required: ["repo"],
+    },
+    outputSchema: listResultSchema(
+      VERSION_SCHEMA,
+      "Matching versions, ordered by version-log position.",
+    ),
+    handler: async (kernel, ctx, args) => {
+      const order = argStrOpt(args, "order");
+      const rows = await kernel.history.list(queryCtx(ctx, args), {
+        repo: argStr(args, "repo"),
+        path: argStrOpt(args, "path"),
+        ever: argBoolOpt(args, "ever"),
+        since: argStrOpt(args, "since"),
+        until: argStrOpt(args, "until"),
+        order: order === "asc" || order === "desc" ? order : undefined,
+        limit: argIntOpt(args, "limit"),
+      });
+      return { structured: wrapList(rows), text: renderVersionList(rows) };
+    },
+  },
+  {
     name: "docs_history",
-    description: "List versions of a document newest-first.",
+    description:
+      "Deprecated: use history_list (a literal `path` reproduces this). List versions of a document newest-first.",
     inputSchema: {
       type: "object",
       properties: {

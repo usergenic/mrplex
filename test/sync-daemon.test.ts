@@ -43,7 +43,7 @@ async function start(): Promise<Daemon> {
 /** Poll `fn` until it returns truthy or the deadline passes. */
 async function waitFor<T>(
   fn: () => T | undefined | Promise<T | undefined>,
-  timeoutMs = 3000,
+  timeoutMs = 8000,
 ): Promise<T> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {

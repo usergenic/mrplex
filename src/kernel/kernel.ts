@@ -29,6 +29,7 @@ import { planRepairs } from "../links/repair.js";
 import { findStaleLinks } from "../links/stale.js";
 import { contentHash } from "../markdown/content-hash.js";
 import type { RepoRow, Storage, VersionRow } from "../storage/types.js";
+import { globToRegexSource } from "./auth/glob.js";
 import {
   type ClaimMatcher,
   claimsGrantRead,
@@ -172,6 +173,8 @@ export type Kernel = {
     since(ctx: CallContext, input: HistorySinceQuery): Promise<HistorySincePage>;
     /** Page the live set as of a safe head R (startup reconciliation). */
     index(ctx: CallContext, input: HistoryIndexQuery): Promise<HistoryIndexPage>;
+    /** Scoped, document-spanning history walk — subsumes docs.history (§3.5). */
+    list(ctx: CallContext, input: HistoryListQuery): Promise<Version[]>;
   };
 };
 
@@ -187,6 +190,22 @@ export type HistoryIndexQuery = {
   repo: string;
   through_version?: string;
   after_version?: string;
+  limit?: number;
+};
+
+/**
+ * Public input to `history.list` (§3.5). `path` is a glob (a single literal
+ * path is the old `docs.history`); omitted = the whole repo. `ever` includes
+ * documents that once matched (moved-away / deleted). `since`/`until` are
+ * opaque version-id bounds; `order` defaults to newest-first (presentation).
+ */
+export type HistoryListQuery = {
+  repo: string;
+  path?: string;
+  ever?: boolean;
+  since?: string;
+  until?: string;
+  order?: "asc" | "desc";
   limit?: number;
 };
 
@@ -755,8 +774,7 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
           repoSlug: (id) => slugById.get(id) ?? "",
           // Delete tombstones live under the server's system sigils (`:deleted/`
           // etc.); these are server-wide, so the server config is authoritative.
-          isSystemPath: (path) =>
-            pathIsInSystemNamespace(path, serverPathConfig.system_sigils),
+          isSystemPath: (path) => pathIsInSystemNamespace(path, serverPathConfig.system_sigils),
           canRead: (id, path) => {
             if (claims === null) return true;
             const slug = slugById.get(id);
@@ -799,7 +817,31 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
           deps,
         );
       },
+
+      async list(ctx, input) {
+        const repo = await resolveRepo(ctx, input.repo);
+        const claims = claimsFor(ctx);
+        // Compile the path glob to an anchored regex source (the same dialect
+        // scope + graph use). Omitted glob = every document in the repo.
+        const pathRegexes = input.path === undefined ? [] : [`^${globToRegexSource(input.path)}$`];
+        const rows = await storage.versions_list({
+          repo_id: repo.id,
+          path_regexes: pathRegexes,
+          ever: input.ever ?? false,
+          after_id: input.since !== undefined ? (decodeVersionId(input.since) ?? 0) : undefined,
+          until_id: input.until !== undefined ? (decodeVersionId(input.until) ?? 0) : undefined,
+          order: input.order ?? "desc",
+          limit: input.limit ?? HISTORY_LIST_DEFAULT_LIMIT,
+        });
+        // Scope: a version is visible only if the caller can read its path.
+        return rows
+          .filter((r) => claims === null || claimsGrantRead(claims, repo.slug, r.path))
+          .map((r) => toVersionWire(r, repo.slug));
+      },
     },
   };
   return kernel;
 }
+
+/** Default `history.list` page size when a caller omits `limit` (§3.5). */
+const HISTORY_LIST_DEFAULT_LIMIT = 100;

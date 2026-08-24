@@ -1043,11 +1043,10 @@ function buildProgram(): Command {
 
   docs
     .command("history <path>")
-    .description("list versions of a document newest-first")
+    .description("list versions of a document newest-first (subsumed by `mrplex history`)")
     .option("--limit <n>", "limit to N most-recent (positive integer)", parsePositiveInt)
-    .option("--before <ts>", "only versions with created_at < <ts>")
     .action(function (this: Command, path: string) {
-      const localOpts = this.opts<{ limit?: number; before?: string }>();
+      const localOpts = this.opts<{ limit?: number }>();
       const globals = this.optsWithGlobals<GlobalOpts>();
       let repo: string;
       try {
@@ -1056,10 +1055,9 @@ function buildProgram(): Command {
         reportError(err);
       }
       withClient(this, async (client, opts) => {
-        const result = await client.docs.history(repo, path, {
-          limit: localOpts.limit,
-          before: localOpts.before,
-        });
+        // A single literal path is the old docs.history; route through the
+        // unified scoped walk (§3.5).
+        const result = await client.history.list({ repo, path, limit: localOpts.limit });
         emit(result, opts, renderHistoryTable(result));
       }).catch(reportError);
     });
@@ -1364,6 +1362,46 @@ function buildProgram(): Command {
           const n = await pollOnce();
           if (n === 0) await sleep(intervalMs);
         }
+      }).catch(reportError);
+    });
+
+  // -------- history (sync/history plan §3.5) --------
+  program
+    .command("history [path-glob]")
+    .description("scoped, document-spanning version history — glob + --ever (§3.5)")
+    .option("--ever", "include documents that moved away or were deleted", false)
+    .option("--since <version-id>", "exclusive lower version-id bound")
+    .option("--until <version-id>", "inclusive upper version-id bound")
+    .option("--order <dir>", "asc (oldest-first) | desc (newest-first, default)")
+    .option("--limit <n>", "max versions (positive integer)", parsePositiveInt)
+    .action(function (this: Command, pathGlob: string | undefined) {
+      const localOpts = this.opts<{
+        ever: boolean;
+        since?: string;
+        until?: string;
+        order?: string;
+        limit?: number;
+      }>();
+      const globals = this.optsWithGlobals<GlobalOpts>();
+      let repo: string;
+      try {
+        repo = resolveRepoSlug(globals);
+      } catch (err) {
+        reportError(err);
+      }
+      const order =
+        localOpts.order === "asc" ? "asc" : localOpts.order === "desc" ? "desc" : undefined;
+      withClient(this, async (client, opts) => {
+        const result = await client.history.list({
+          repo,
+          path: pathGlob,
+          ever: localOpts.ever,
+          since: localOpts.since,
+          until: localOpts.until,
+          order,
+          limit: localOpts.limit,
+        });
+        emit(result, opts, renderHistoryTable(result));
       }).catch(reportError);
     });
 

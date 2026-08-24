@@ -91,6 +91,7 @@ function buildClient(
     history: {
       since: (input) => kernel.history.since(ctx, input),
       index: (input) => kernel.history.index(ctx, input),
+      list: (input) => kernel.history.list(ctx, input),
     },
     close: async () => {
       if (closed) return;

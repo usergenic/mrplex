@@ -187,3 +187,84 @@ describe("history.index", () => {
     expect(feed.refs.map((r) => r.path)).toEqual(["late.md"]);
   });
 });
+
+describe("history.list", () => {
+  it("a single literal path reproduces docs.history (newest-first whole chain)", async () => {
+    const { kernel, actor } = await bootstrap();
+    const v1 = await kernel.docs.create(actor, "notes", "a.md", {
+      body: "1\n",
+      frontmatter_raw: "",
+    });
+    const v2 = await kernel.docs.put(actor, "notes", v1.version_id, "a.md", {
+      body: "2\n",
+      frontmatter_raw: "",
+    });
+    const rows = await kernel.history.list(actor, { repo: "notes", path: "a.md" });
+    expect(rows.map((r) => r.version_id)).toEqual([v2.version_id, v1.version_id]);
+  });
+
+  it("spans documents by glob, interleaved by version-log position", async () => {
+    const { kernel, actor } = await bootstrap();
+    await kernel.docs.create(actor, "notes", "guides/a.md", { body: "1\n", frontmatter_raw: "" });
+    await kernel.docs.create(actor, "notes", "other/b.md", { body: "2\n", frontmatter_raw: "" });
+    await kernel.docs.create(actor, "notes", "guides/c.md", { body: "3\n", frontmatter_raw: "" });
+    const rows = await kernel.history.list(actor, {
+      repo: "notes",
+      path: "guides/**",
+      order: "asc",
+    });
+    expect(rows.map((r) => r.path)).toEqual(["guides/a.md", "guides/c.md"]);
+  });
+
+  it("ever:false anchors on the live set (a moved-away doc is excluded)", async () => {
+    const { kernel, actor } = await bootstrap();
+    const v1 = await kernel.docs.create(actor, "notes", "old.md", {
+      body: "1\n",
+      frontmatter_raw: "",
+    });
+    // Move old.md → new.md; its current path no longer matches "old.md".
+    await kernel.docs.put(actor, "notes", v1.version_id, "new.md", {
+      body: "1\n",
+      frontmatter_raw: "",
+    });
+    const live = await kernel.history.list(actor, { repo: "notes", path: "old.md" });
+    expect(live).toEqual([]);
+    // ever:true finds the whole chain of the document that once lived at old.md.
+    const ever = await kernel.history.list(actor, { repo: "notes", path: "old.md", ever: true });
+    expect(ever.length).toBe(2);
+    expect(ever.some((r) => r.path === "new.md")).toBe(true);
+  });
+
+  it("omitted glob returns the whole repo's history", async () => {
+    const { kernel, actor } = await bootstrap();
+    await kernel.docs.create(actor, "notes", "a.md", { body: "1\n", frontmatter_raw: "" });
+    await kernel.docs.create(actor, "notes", "b.md", { body: "2\n", frontmatter_raw: "" });
+    const rows = await kernel.history.list(actor, { repo: "notes", order: "asc" });
+    expect(rows.map((r) => r.path)).toEqual(["a.md", "b.md"]);
+  });
+
+  it("respects since/until version-id bounds", async () => {
+    const { kernel, actor } = await bootstrap();
+    const v1 = await kernel.docs.create(actor, "notes", "a.md", {
+      body: "1\n",
+      frontmatter_raw: "",
+    });
+    const v2 = await kernel.docs.put(actor, "notes", v1.version_id, "a.md", {
+      body: "2\n",
+      frontmatter_raw: "",
+    });
+    const v3 = await kernel.docs.put(actor, "notes", v2.version_id, "a.md", {
+      body: "3\n",
+      frontmatter_raw: "",
+    });
+    // (v1, v3] ascending → v2, v3.
+    const rows = await kernel.history.list(actor, {
+      repo: "notes",
+      path: "a.md",
+      since: v1.version_id,
+      until: v3.version_id,
+      order: "asc",
+    });
+    expect(rows.map((r) => r.version_id)).toEqual([v2.version_id, v3.version_id]);
+  });
+});

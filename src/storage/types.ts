@@ -67,6 +67,26 @@ export type HistoryOptions = {
 };
 
 /**
+ * Options for the scoped history walk (sync/history plan §3.5). A forward
+ * id-ordered walk over the versions of documents selected by a path glob,
+ * bounded by version-id cursors. `path_regexes` are anchored regex sources
+ * (the gitignore-glob compilation used everywhere); empty = every document in
+ * the repo. `ever: false` anchors on the *live* set (docs whose CURRENT path
+ * matches); `ever: true` includes any document that *ever* had a matching path
+ * (whole chains). `after_id`/`until_id` are version-id bounds (exclusive lower,
+ * inclusive upper). `order` picks id ascending (oldest-first) or descending.
+ */
+export type VersionsListOptions = {
+  repo_id: number;
+  path_regexes: readonly string[];
+  ever: boolean;
+  after_id?: number;
+  until_id?: number;
+  order: "asc" | "desc";
+  limit: number;
+};
+
+/**
  * Options for the gap-aware forward feed walk (sync/history plan §3.2–3.3).
  * `after_id` is the resume cursor (0 = from the beginning); `repo_id` filters
  * the output without affecting gap detection (gaps are global). `now_ms` and
@@ -235,6 +255,14 @@ export type Storage = {
   version_by_id(id: number): Promise<VersionRow | null>;
   version_current(repo_id: number, path: string): Promise<VersionRow | null>;
   version_history(document_id: number, opts?: HistoryOptions): Promise<VersionRow[]>;
+
+  /**
+   * Scoped, document-spanning history walk (sync/history plan §3.5). Selects
+   * documents by path glob (via `path_regexes`), then returns their version
+   * rows interleaved by id, bounded by `after_id`/`until_id` cursors. See
+   * `VersionsListOptions` for the `ever` (live vs. whole-corpus) distinction.
+   */
+  versions_list(opts: VersionsListOptions): Promise<VersionRow[]>;
 
   /**
    * The gap-aware forward feed walk (sync/history plan §3.2–3.3): the longest

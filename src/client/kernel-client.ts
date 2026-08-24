@@ -97,6 +97,15 @@ export type KernelClient = {
       after_version?: string;
       limit?: number;
     }): Promise<HistoryIndexPage>;
+    list(input: {
+      repo: string;
+      path?: string;
+      ever?: boolean;
+      since?: string;
+      until?: string;
+      order?: "asc" | "desc";
+      limit?: number;
+    }): Promise<Version[]>;
   };
 
   /** Release any transport-owned resources. Idempotent. */
