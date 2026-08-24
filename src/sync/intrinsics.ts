@@ -84,3 +84,17 @@ export function renderIgnoredSibling(v: Version): string {
   fm = appendSystemProperty(fm, "sync", SYNC_IGNORE);
   return join({ frontmatter_raw: fm, body: v.body });
 }
+
+/**
+ * Stamp `$version` / `$content_hash` onto an existing file without replacing
+ * its user bytes. Used when the editor saved again between our kernel write
+ * and the ack rewrite — we must not revert their typing.
+ */
+export function stampProvenance(text: string, versionId: string, contentHash: string): string {
+  const lf = text.replace(/\r\n/g, "\n");
+  const { frontmatter_raw, body } = split(lf);
+  const { raw } = extractSystemProperties(frontmatter_raw);
+  let fm = appendSystemProperty(raw, "version", versionId);
+  fm = appendSystemProperty(fm, "content_hash", contentHash);
+  return join({ frontmatter_raw: fm, body });
+}

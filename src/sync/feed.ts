@@ -12,6 +12,7 @@
 
 import type { KernelClient } from "../client/kernel-client.js";
 import { withVersionSuffix } from "../kernel/deletion.js";
+import { decodeVersionId } from "../kernel/version-id.js";
 import type { VersionRef } from "../kernel/wire.js";
 import {
   isDirty,
@@ -111,7 +112,8 @@ async function applyRef(
   }
 
   // create / update / move-destination: materialize at ref.path unless the
-  // local file already holds these bytes, is dirty, or is $sync: ignore.
+  // local file already holds these bytes, is at-or-ahead of this ref, is
+  // dirty against a *newer* remote, or is $sync: ignore.
   if (!scope.matches(ref.path)) return false;
   const existing = await store.read(ref.path);
   if (existing !== null) {
@@ -122,12 +124,17 @@ async function applyRef(
       map?.set(ref.path, { version_id: ref.version_id, content_hash: ref.content_hash });
       // Repair provenance only if the embedded version lags.
       if (intr.version === ref.version_id) return false;
+      if (versionAtOrAhead(intr.version, ref.version_id)) return false;
       const v = await client.docs.get_version(repo, ref.version_id);
       await store.write(ref.path, renderMaterialized(v));
       return true;
     }
+    // Local is at or ahead of this ref (echo of our push, or a replay of an
+    // older version). Never clobber and never park a sibling of something we
+    // already have — including when the user has typed more since (dirty).
+    if (versionAtOrAhead(intr.version, ref.version_id)) return false;
     if (isDirty(intr)) {
-      // A local edit collides with an incoming version → conflict, not
+      // A local edit collides with a *newer* incoming version → conflict, not
       // overwrite. Park the remote as an ignored sibling; keep local bytes.
       const v = await client.docs.get_version(repo, ref.version_id);
       await store.write(withVersionSuffix(ref.path, ref.version_id), renderIgnoredSibling(v));
@@ -140,4 +147,14 @@ async function applyRef(
   map?.set(ref.path, { version_id: ref.version_id, content_hash: ref.content_hash });
   log(`feed ${ref.op}\t${ref.path}`);
   return true;
+}
+
+/** True when the local embedded version is this ref or a later one. */
+function versionAtOrAhead(localVersion: string | undefined, refVersion: string): boolean {
+  if (!localVersion) return false;
+  if (localVersion === refVersion) return true;
+  const local = decodeVersionId(localVersion);
+  const ref = decodeVersionId(refVersion);
+  if (local === null || ref === null) return false;
+  return local > ref;
 }

@@ -159,6 +159,32 @@ describe("applyFeed — conflict + ignore", () => {
     expect(store.files.get(`a-${v2.version_id}.md`)).toContain("$sync: ignore");
   });
 
+  it("does not park or clobber when local is dirty on the same $version (push echo)", async () => {
+    const v1 = await client.docs.create("notes", "a.md", { body: "one\n", frontmatter_raw: "" });
+    const dirty = materialized(await client.docs.get_version("notes", v1.version_id)).replace(
+      "one",
+      "one two",
+    );
+    const store = memStore({ "a.md": dirty });
+    await applyFeed(client, store, scope, { repo: "notes", since: "" });
+    expect(store.files.get("a.md")).toBe(dirty);
+    expect([...store.files.keys()].some((k) => /-v\d+\.md$/.test(k))).toBe(false);
+  });
+
+  it("does not clobber a newer clean local with an older feed ref", async () => {
+    const v1 = await client.docs.create("notes", "a.md", { body: "one\n", frontmatter_raw: "" });
+    const v2 = await client.docs.put("notes", v1.version_id, "a.md", {
+      body: "two\n",
+      frontmatter_raw: "",
+    });
+    const store = memStore({
+      "a.md": materialized(await client.docs.get_version("notes", v2.version_id)),
+    });
+    await applyFeed(client, store, scope, { repo: "notes", since: "" });
+    expect(store.files.get("a.md")).toContain("two");
+    expect(store.files.get("a.md")).not.toContain("one");
+  });
+
   it("leaves a $sync: ignore local file untouched", async () => {
     const v1 = await client.docs.create("notes", "a.md", { body: "orig\n", frontmatter_raw: "" });
     const ignored = "---\n$sync: ignore\n---\nmy private copy\n";

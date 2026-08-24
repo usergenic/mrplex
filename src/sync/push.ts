@@ -30,6 +30,7 @@ import {
   readFileIntrinsics,
   renderIgnoredSibling,
   renderMaterialized,
+  stampProvenance,
 } from "./intrinsics.js";
 import type { FileStore } from "./reconcile.js";
 
@@ -211,11 +212,12 @@ export async function pushPath(path: string, deps: PushDeps): Promise<PushResult
 }
 
 /**
- * `stale_prev` on a put: dest occupied → conflict-park; dest empty and the
- * document currently lives in the system namespace (a premature local delete
- * of a rename source) → put from that current version to restore identity;
- * dest empty with no recoverable current → create so the local file is not
- * stranded.
+ * `stale_prev` on a put: dest occupied → rebase local bytes onto the remote
+ * current (Obsidian keeps typing after we already pushed a snapshot); dest
+ * empty and the document currently lives in the system namespace (a premature
+ * local delete of a rename source) → put from that current version to restore
+ * identity; dest empty with no recoverable current → create so the local file
+ * is not stranded.
  */
 async function recoverStalePut(
   deps: PushDeps,
@@ -228,12 +230,30 @@ async function recoverStalePut(
   const log = deps.log ?? (() => {});
   const destCurrent = await currentAtPath(client, repo, path);
   if (destCurrent) {
-    await store.write(
-      withVersionSuffix(path, destCurrent.version_id),
-      renderIgnoredSibling(destCurrent),
-    );
-    log(`conflict\t${path}`);
-    return "conflict";
+    if (computedHash === destCurrent.content_hash) {
+      return occupiedPath(deps, path, computedHash, destCurrent);
+    }
+    try {
+      // Same-path continuation: the editor is still on an older $version but
+      // has newer bytes. Put those bytes on top of current instead of parking
+      // a sibling that then gets fed back over the open note.
+      return await commitPut(deps, path, destCurrent.version_id, user, "update");
+    } catch (rebaseErr) {
+      if (
+        !(
+          rebaseErr instanceof KernelError &&
+          (rebaseErr.code === "stale_prev" || rebaseErr.code === "path_taken")
+        )
+      ) {
+        throw rebaseErr;
+      }
+      await store.write(
+        withVersionSuffix(path, destCurrent.version_id),
+        renderIgnoredSibling(destCurrent),
+      );
+      log(`conflict\t${path}`);
+      return "conflict";
+    }
   }
 
   const data = err.data as StalePrevData;
@@ -281,7 +301,7 @@ async function createAtPath(
   const log = deps.log ?? (() => {});
   try {
     const v = await client.docs.create(repo, path, user);
-    await store.write(path, renderMaterialized(v));
+    await ackLocalWrite(store, path, v, user);
     map.set(path, { version_id: v.version_id, content_hash: v.content_hash });
     log(`create\t${path}`);
     return "created";
@@ -304,11 +324,32 @@ async function commitPut(
   const { client, store, repo, map } = deps;
   const log = deps.log ?? (() => {});
   const v = await client.docs.put(repo, prevVersionId, path, user);
-  await store.write(path, renderMaterialized(v));
+  await ackLocalWrite(store, path, v, user);
   dropMapEntriesForVersion(map, prevVersionId, path);
   map.set(path, { version_id: v.version_id, content_hash: v.content_hash });
   log(`${logLabel}\t${path}`);
   return "updated";
+}
+
+/**
+ * After a successful kernel write, restamp the local file. If the editor saved
+ * again during the round-trip, keep those bytes and only update provenance —
+ * never write the snapshot we just pushed over newer typing.
+ */
+async function ackLocalWrite(
+  store: FileStore,
+  path: string,
+  v: Version,
+  pushed: UserContent,
+): Promise<void> {
+  const now = await store.read(path);
+  if (now === null) return;
+  const current = stripToUserContent(now);
+  if (current.body === pushed.body && current.frontmatter_raw === pushed.frontmatter_raw) {
+    await store.write(path, renderMaterialized(v));
+    return;
+  }
+  await store.write(path, stampProvenance(now, v.version_id, v.content_hash));
 }
 
 /** The occupied-path rule (§4.4): hash match → adopt; differ → conflict park. */

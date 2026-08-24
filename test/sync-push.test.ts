@@ -259,22 +259,22 @@ describe("pushPath — occupied path, no provenance (§4.4)", () => {
 });
 
 describe("pushPath — dirty edit racing remote (stale_prev)", () => {
-  it("a put whose embedded version is superseded → conflict park", async () => {
+  it("a put whose embedded version is superseded rebases local bytes onto current", async () => {
     const v1 = await client.docs.create("notes", "a.md", { body: "base\n", frontmatter_raw: "" });
-    // Local file: dirty, embeds v1.
     const dirty = materialized(await client.docs.get_version("notes", v1.version_id)).replace(
       "base",
       "my edit",
     );
-    // Remote advances to v2 out of band.
-    const v2 = await client.docs.put("notes", v1.version_id, "a.md", {
-      body: "remote edit\n",
+    await client.docs.put("notes", v1.version_id, "a.md", {
+      body: "remote snapshot\n",
       frontmatter_raw: "",
     });
     const store = memStore({ "a.md": dirty });
     const map: RemoteMap = new Map();
-    expect(await push("a.md", store, map)).toBe("conflict");
-    expect(store.files.get("a.md")).toBe(dirty); // local preserved
-    expect(store.files.get(`a-${v2.version_id}.md`)).toContain("remote edit");
+    expect(await push("a.md", store, map)).toBe("updated");
+    const cur = await client.docs.get("notes", "a.md");
+    expect(cur.body).toBe("my edit\n");
+    expect(store.files.get("a.md")).toContain("my edit");
+    expect([...store.files.keys()].some((k) => k.includes("-v") && k.endsWith(".md"))).toBe(false);
   });
 });
