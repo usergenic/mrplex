@@ -46,6 +46,12 @@ import {
 } from "./frontmatter-input.js";
 import { type GraphDeps, runGraph } from "./graph.js";
 import {
+  HISTORY_SAFETY_WINDOW_MS,
+  HISTORY_SINCE_DEFAULT_LIMIT,
+  type HistorySinceDeps,
+  runHistorySince,
+} from "./history.js";
+import {
   HARDCODED_DEFAULTS,
   type PathConfig,
   type PathConfigOverride,
@@ -57,7 +63,15 @@ import {
 import { type QuerySpec, runQuery } from "./query/query.js";
 import { validatePath, validateSlug } from "./validation.js";
 import { decodeVersionId, encodeVersionId } from "./version-id.js";
-import type { GraphResult, GraphSpec, PathWarning, QueryHit, Repo, Version } from "./wire.js";
+import type {
+  GraphResult,
+  GraphSpec,
+  HistorySincePage,
+  PathWarning,
+  QueryHit,
+  Repo,
+  Version,
+} from "./wire.js";
 
 export type HistoryOptions = { limit?: number; before?: string };
 
@@ -148,6 +162,18 @@ export type Kernel = {
   query(ctx: CallContext, spec: QuerySpec): Promise<QueryHit[]>;
   /** Neighborhood expansion over the links index (docs/graph-plan.md). */
   graph(ctx: CallContext, spec: GraphSpec): Promise<GraphResult>;
+  /** Change-log read surface keyed by version-log position (sync/history §3). */
+  history: {
+    /** The global change feed — the longest gap-free run after the cursor. */
+    since(ctx: CallContext, input: HistorySinceQuery): Promise<HistorySincePage>;
+  };
+};
+
+/** Public input to `history.since` (§3.3). `repo` is an optional slug filter. */
+export type HistorySinceQuery = {
+  after_version: string;
+  repo?: string;
+  limit?: number;
 };
 
 export type KernelConfig = {
@@ -695,6 +721,45 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
     async graph(ctx: CallContext, spec: GraphSpec): Promise<GraphResult> {
       const deps: GraphDeps = { storage, serverPathConfig };
       return runGraph(claimsFor(ctx), spec, deps);
+    },
+
+    history: {
+      async since(ctx, input) {
+        // Resolve the optional repo filter to an id (and gate its existence
+        // through the caller's scope, same as resolveRepo).
+        let repoId: number | undefined;
+        if (input.repo !== undefined) {
+          const repo = await resolveRepo(ctx, input.repo);
+          repoId = repo.id;
+        }
+        // Build id→slug once per call.
+        const repos = await storage.repos_list();
+        const slugById = new Map(repos.map((r) => [r.id, r.slug]));
+        const claims = claimsFor(ctx);
+        const deps: HistorySinceDeps = {
+          storage,
+          repoSlug: (id) => slugById.get(id) ?? "",
+          // Delete tombstones live under the server's system sigils (`:deleted/`
+          // etc.); these are server-wide, so the server config is authoritative.
+          isSystemPath: (path) =>
+            pathIsInSystemNamespace(path, serverPathConfig.system_sigils),
+          canRead: (id, path) => {
+            if (claims === null) return true;
+            const slug = slugById.get(id);
+            return slug !== undefined && claimsGrantRead(claims, slug, path);
+          },
+        };
+        return runHistorySince(
+          {
+            after_version: input.after_version,
+            repo_id: repoId,
+            limit: input.limit ?? HISTORY_SINCE_DEFAULT_LIMIT,
+            now_ms: Date.now(),
+            window_ms: HISTORY_SAFETY_WINDOW_MS,
+          },
+          deps,
+        );
+      },
     },
   };
   return kernel;

@@ -227,6 +227,15 @@ export function guardKernel(kernel: Kernel, entitlement: Entitlement, audit?: Au
     // stays kernel-side (the engine applies scope∧filter as visibility).
     graph: (_ctx, spec) =>
       forward("graph", { repo: spec.repo }, () => kernel.graph(readCtx(), spec)),
+
+    history: {
+      // Read-only change feed; the engine applies read scope to each ref's
+      // endpoints (a ref is delivered only if the caller can see either end).
+      since: (_ctx, input) =>
+        forward("history.since", { repo: input.repo }, () =>
+          kernel.history.since(readCtx(), input),
+        ),
+    },
   };
 }
 

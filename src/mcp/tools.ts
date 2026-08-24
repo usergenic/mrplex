@@ -348,6 +348,43 @@ const QUERY_HIT_SCHEMA: JsonSchemaProp = {
   additionalProperties: true,
 };
 
+const VERSION_REF_SCHEMA: JsonSchemaProp = {
+  type: "object",
+  description:
+    "A change-feed pointer (sync/history plan §3.3). Consumers fetch bodies via docs_get_version " +
+    "only when needed; content_hash lets them skip no-op materializations.",
+  properties: {
+    version_id: { type: "string", description: "Opaque id of this version." },
+    prev_version_id: {
+      anyOf: [{ type: "string" }, { type: "null" }],
+      description: "Prior version id, or null for a create.",
+    },
+    repo: { type: "string", description: "Repo slug." },
+    path: { type: "string", description: "This version's path." },
+    prev_path: {
+      anyOf: [{ type: "string" }, { type: "null" }],
+      description: "Path of the prior version (both ends of a move/delete), or null.",
+    },
+    content_hash: { type: "string", description: "SHA-256 (bare hex) of canonical content." },
+    op: {
+      type: "string",
+      enum: ["create", "update", "move", "delete"],
+      description: "Server-derived operation.",
+    },
+    created_at: { type: "string", description: "ISO-8601 UTC timestamp." },
+  },
+  required: [
+    "version_id",
+    "prev_version_id",
+    "repo",
+    "path",
+    "prev_path",
+    "content_hash",
+    "op",
+    "created_at",
+  ],
+};
+
 const GRAPH_DOCUMENT_SCHEMA: JsonSchemaProp = {
   type: "object",
   description:
@@ -1043,6 +1080,58 @@ export const TOOL_REGISTRY: ToolEntry[] = [
         }
         throw err;
       }
+    },
+  },
+  {
+    name: "history_since",
+    description:
+      "The global change feed (sync/history plan §3.3). Given an opaque cursor `after_version`, " +
+      "returns the longest GAP-FREE contiguous run of change refs after it, plus `next_since` to " +
+      "resume. Each ref is a lightweight pointer — `version_id`, `prev_version_id`, `repo`, `path`, " +
+      "`prev_path` (both ends of a move/delete), `content_hash` (skip a fetch when you already have " +
+      "these bytes), a server-derived `op` (create/update/move/delete), and `created_at`. Fetch " +
+      "bodies via `docs_get_version` only when needed. Persist exactly `next_since`; feed it back to " +
+      "poll. A short/empty page means caught-up or waiting on an in-flight write — just poll again.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        after_version: {
+          type: "string",
+          description: 'Opaque resume cursor. "" (empty) starts from the beginning of the log.',
+        },
+        repo: { type: "string", description: "Optional repo slug filter." },
+        limit: {
+          type: "integer",
+          minimum: 1,
+          description: "Max refs per page (server default applies when omitted).",
+        },
+        scope: {
+          type: "array",
+          description: "Read-visibility claims (ScopeClaim[]); the X-Mrplex-Scope header wins.",
+          items: { type: "object", additionalProperties: true },
+        },
+      },
+      required: ["after_version"],
+    },
+    outputSchema: {
+      type: "object",
+      properties: {
+        refs: { type: "array", items: VERSION_REF_SCHEMA, description: "Settled change refs." },
+        next_since: { type: "string", description: "Opaque cursor to resume the feed." },
+      },
+      required: ["refs", "next_since"],
+    },
+    handler: async (kernel, ctx, args) => {
+      const input = {
+        after_version: argStr(args, "after_version"),
+        repo: argStrOpt(args, "repo"),
+        limit: argIntOpt(args, "limit"),
+      };
+      const page = await kernel.history.since(queryCtx(ctx, args), input);
+      return {
+        structured: page as unknown as Record<string, unknown>,
+        text: page.refs.map((r) => JSON.stringify(r)).join("\n"),
+      };
     },
   },
   {

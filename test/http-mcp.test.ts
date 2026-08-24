@@ -37,9 +37,9 @@ afterEach(async () => {
 });
 
 describe("MCP lifecycle + tools/list", () => {
-  it("lists 20 tools (no user/token tools after noauth; links_* + set_link_config + query_syntax + graph)", async () => {
+  it("lists 21 tools (no user/token tools after noauth; links_* + set_link_config + query_syntax + graph + history_since)", async () => {
     const r = await client.listTools();
-    expect(r.tools.length).toBe(20);
+    expect(r.tools.length).toBe(21);
     // Sample the important names.
     const names = new Set(r.tools.map((t) => t.name));
     for (const name of [
@@ -53,6 +53,7 @@ describe("MCP lifecycle + tools/list", () => {
       "query",
       "query_syntax",
       "graph",
+      "history_since",
       "links_backfill",
       "links_stale",
       "links_repair",

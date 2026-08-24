@@ -246,6 +246,13 @@ export type Storage = {
   versions_since(opts: VersionsSinceOptions): Promise<VersionsSinceResult>;
 
   /**
+   * Batch id → path lookup (sync/history plan §3.3): the feed derives each
+   * ref's `prev_path` (both ends of a move/delete) from its `prev_id` without
+   * hydrating whole prev rows. Ids not present are simply absent from the map.
+   */
+  versions_paths_by_ids(ids: readonly number[]): Promise<Map<number, string>>;
+
+  /**
    * All currently-live versions in a repo (i.e. rows where next_id IS NULL).
    * Used by `repos.set_path_config` to produce the advisory PathWarning[]
    * scan (§3.5.3). Riding the partial-index on (repo_id, path) where

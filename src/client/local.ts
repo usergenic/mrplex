@@ -88,6 +88,9 @@ function buildClient(
     },
     query: (spec) => kernel.query(ctx, spec),
     graph: (spec) => kernel.graph(ctx, spec),
+    history: {
+      since: (input) => kernel.history.since(ctx, input),
+    },
     close: async () => {
       if (closed) return;
       closed = true;

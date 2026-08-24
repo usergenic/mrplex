@@ -320,6 +320,10 @@ async function withClient<T>(
   }
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function emit(result: unknown, opts: GlobalOpts, prettyText: string): void {
   if (opts.json) {
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
@@ -1304,6 +1308,59 @@ function buildProgram(): Command {
               ? renderGraphMermaid(result)
               : renderGraphSummary(result);
         emit(result, opts, text);
+      }).catch(reportError);
+    });
+
+  // -------- tail (sync/history plan §3.6) --------
+  // The reference change-feed consumer: one VersionRef per line as NDJSON.
+  // Crash-resume is `tail --since <last-line-version_id>`. `--follow N` sits at
+  // the live tip, re-polling every N seconds on a short/empty page — the proving
+  // ground for the leading-gap heal path.
+  program
+    .command("tail")
+    .description("stream the global change feed as NDJSON (sync/history plan §3.6)")
+    .option("--since <version-id>", 'resume cursor; omitted or "" starts from the beginning')
+    .option(
+      "--follow <seconds>",
+      "poll interval in seconds; stay at the live tip re-polling on empty pages",
+      parsePositiveInt,
+    )
+    .option("--limit <n>", "max refs per page (positive integer)", parsePositiveInt)
+    .action(function (this: Command) {
+      const localOpts = this.opts<{
+        since?: string;
+        follow?: number;
+        limit?: number;
+      }>();
+      // The optional repo filter rides the global -r/--repo (or MRPLEX_REPO /
+      // config); an unset repo tails every repo in scope.
+      const globals = this.optsWithGlobals<GlobalOpts>();
+      withClient(this, async (client) => {
+        let cursor = localOpts.since ?? "";
+        const pollOnce = async (): Promise<number> => {
+          const page = await client.history.since({
+            after_version: cursor,
+            repo: globals.repo,
+            limit: localOpts.limit,
+          });
+          for (const ref of page.refs) {
+            process.stdout.write(`${JSON.stringify(ref)}\n`);
+          }
+          cursor = page.next_since;
+          return page.refs.length;
+        };
+        if (localOpts.follow === undefined) {
+          // One-shot: drain the currently-safe feed in pages, then stop.
+          let n = await pollOnce();
+          while (n > 0) n = await pollOnce();
+          return;
+        }
+        // Follow: never terminate; sleep between polls (including empty ones).
+        const intervalMs = localOpts.follow * 1000;
+        for (;;) {
+          const n = await pollOnce();
+          if (n === 0) await sleep(intervalMs);
+        }
       }).catch(reportError);
     });
 

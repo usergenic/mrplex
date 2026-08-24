@@ -34,6 +34,32 @@ export type PathWarning = {
   reason: string;
 };
 
+/** The operation a version row represents, derived server-side (§3.3). */
+export type VersionOp = "create" | "update" | "move" | "delete";
+
+/**
+ * A lightweight change-feed pointer (sync/history plan §3.3). Consumers fetch
+ * bodies via `docs.get_version` only when needed; `content_hash` lets them
+ * skip no-op materializations and `prev_path` names both ends of a move/delete.
+ * `op` is derived server-side so consumers never parse path sigils.
+ */
+export type VersionRef = {
+  version_id: string;
+  prev_version_id: string | null;
+  repo: string;
+  path: string;
+  prev_path: string | null;
+  content_hash: string;
+  op: VersionOp;
+  created_at: string;
+};
+
+/** Result of `history.since` — a page of refs plus the resume cursor (§3.3). */
+export type HistorySincePage = {
+  refs: VersionRef[];
+  next_since: string;
+};
+
 /**
  * A projected `query` hit (docs/query-select-plan.md). `query` names the
  * fields it wants via `select` and gets back these lean objects rather than

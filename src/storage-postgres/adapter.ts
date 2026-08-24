@@ -617,6 +617,19 @@ class PostgresStorage implements Storage {
     });
   }
 
+  async versions_paths_by_ids(ids: readonly number[]): Promise<Map<number, string>> {
+    const map = new Map<number, string>();
+    if (ids.length === 0) return map;
+    return this.withClient(async (c) => {
+      const res = await c.query<{ id: number; path: string }>(
+        "select id, path from versions where id = any($1)",
+        [ids as number[]],
+      );
+      for (const r of res.rows) map.set(Number(r.id), r.path);
+      return map;
+    });
+  }
+
   async chunks_upsert(
     version_id: number,
     model: string,

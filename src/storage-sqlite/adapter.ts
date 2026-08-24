@@ -560,6 +560,17 @@ class SqliteStorage implements Storage {
     return { rows: rows.map(hydrateVersion), next_id: upper_id };
   }
 
+  async versions_paths_by_ids(ids: readonly number[]): Promise<Map<number, string>> {
+    const map = new Map<number, string>();
+    const rows = chunkedInList<{ id: number; path: string }>(ids, (ph, chunk) =>
+      this.db
+        .prepare(`select id, path from versions where id in (${ph})`)
+        .all(...chunk) as { id: number; path: string }[],
+    );
+    for (const r of rows) map.set(r.id, r.path);
+    return map;
+  }
+
   async chunks_upsert(
     version_id: number,
     model: string,
