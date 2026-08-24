@@ -37,7 +37,10 @@ import type {
   VectorSearchHit,
   VersionInsertInput,
   VersionRow,
+  VersionsSinceOptions,
+  VersionsSinceResult,
 } from "../storage/types.js";
+import { GLOBAL_SCAN_CAP, safeFrontier } from "../storage/versions-since.js";
 import { compileSearchPlan } from "./compile-postgres.js";
 import { isRegexInvalid, isSerializationRetryable, isVersionRaceViolation } from "./errors.js";
 import { migrate } from "./migrations/index.js";
@@ -571,6 +574,46 @@ class PostgresStorage implements Storage {
         params,
       );
       return res.rows as VersionRow[];
+    });
+  }
+
+  async versions_since(opts: VersionsSinceOptions): Promise<VersionsSinceResult> {
+    return this.withClient(async (c) => {
+      // Global scan (id, repo, age) — gaps are only meaningful on the global
+      // id sequence; the repo filter narrows the delivered rows only. On PG
+      // burned ids (rolled-back nextval) and commit-visibility skew make gaps
+      // routine, which is exactly what the safety window handles.
+      const lightRes = await c.query<{ id: number; repo_id: number; created_at: string }>(
+        "select id, repo_id, created_at from versions where id > $1 order by id asc limit $2",
+        [opts.after_id, GLOBAL_SCAN_CAP],
+      );
+      const { upper_id } = safeFrontier(
+        lightRes.rows.map((r) => ({
+          id: Number(r.id),
+          repo_id: Number(r.repo_id),
+          created_at_ms: Date.parse(r.created_at),
+        })),
+        opts.after_id,
+        opts.repo_id,
+        opts.limit,
+        opts.now_ms,
+        opts.window_ms,
+      );
+      if (upper_id <= opts.after_id) return { rows: [], next_id: opts.after_id };
+      const repoClause = opts.repo_id === undefined ? "" : " and repo_id = $3";
+      const params: number[] =
+        opts.repo_id === undefined
+          ? [opts.after_id, upper_id]
+          : [opts.after_id, upper_id, opts.repo_id];
+      const res = await c.query<VersionRawRow>(
+        `select id, document_id, repo_id, prev_id, next_id, path,
+                frontmatter_raw, frontmatter, body, author, created_at, content_hash
+         from versions
+         where id > $1 and id <= $2${repoClause}
+         order by id asc`,
+        params,
+      );
+      return { rows: res.rows as VersionRow[], next_id: upper_id };
     });
   }
 

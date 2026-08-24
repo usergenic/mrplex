@@ -67,6 +67,34 @@ export type HistoryOptions = {
 };
 
 /**
+ * Options for the gap-aware forward feed walk (sync/history plan §3.2–3.3).
+ * `after_id` is the resume cursor (0 = from the beginning); `repo_id` filters
+ * the output without affecting gap detection (gaps are global). `now_ms` and
+ * `window_ms` drive the safety window — the adapter supplies wall-clock now;
+ * `window_ms` is the caller's tolerance for treating a gap's successor as
+ * "settled long enough that the hole is burned, not pending."
+ */
+export type VersionsSinceOptions = {
+  after_id: number;
+  repo_id?: number;
+  limit: number;
+  now_ms: number;
+  window_ms: number;
+};
+
+/**
+ * Result of `versions_since`: the settled rows in `(after_id, next_id]`
+ * (repo-filtered, ascending by id) and the resume cursor `next_id`. Every id
+ * ≤ `next_id` is final and gap-free; `next_id === after_id` means nothing is
+ * safe to deliver yet (caught up, or stalled at a hot gap — the client just
+ * polls again).
+ */
+export type VersionsSinceResult = {
+  rows: VersionRow[];
+  next_id: number;
+};
+
+/**
  * Chunks (design §3.2, §5.3). One row per chunk of a version's body.
  * `embedding` is null while the row is pending embedding (rare in
  * practice — chunk rows are only inserted alongside their vectors).
@@ -207,6 +235,15 @@ export type Storage = {
   version_by_id(id: number): Promise<VersionRow | null>;
   version_current(repo_id: number, path: string): Promise<VersionRow | null>;
   version_history(document_id: number, opts?: HistoryOptions): Promise<VersionRow[]>;
+
+  /**
+   * The gap-aware forward feed walk (sync/history plan §3.2–3.3): the longest
+   * safe contiguous run of version rows after `opts.after_id`, filtered to
+   * `opts.repo_id` when given. Returns settled rows only (never crosses a hot
+   * gap) plus the resume cursor `next_id`. See `versions-since.ts` for the
+   * safety-window logic both adapters share.
+   */
+  versions_since(opts: VersionsSinceOptions): Promise<VersionsSinceResult>;
 
   /**
    * All currently-live versions in a repo (i.e. rows where next_id IS NULL).

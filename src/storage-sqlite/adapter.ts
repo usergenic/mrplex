@@ -21,7 +21,10 @@ import type {
   VectorSearchHit,
   VersionInsertInput,
   VersionRow,
+  VersionsSinceOptions,
+  VersionsSinceResult,
 } from "../storage/types.js";
+import { GLOBAL_SCAN_CAP, safeFrontier } from "../storage/versions-since.js";
 import { compileSearchPlan } from "./compile-sqlite.js";
 import { migrate } from "./migrations/index.js";
 import { decodeVectorBlob, encodeVectorBlob, loadSqliteVec } from "./vec.js";
@@ -510,6 +513,51 @@ class SqliteStorage implements Storage {
       )
       .all(...params) as VersionRawRow[];
     return rows.map(hydrateVersion);
+  }
+
+  async versions_since(opts: VersionsSinceOptions): Promise<VersionsSinceResult> {
+    // Gaps are global, so scan the global id sequence (id, repo, age) — the
+    // repo filter never affects gap detection, only the delivered rows. A
+    // bounded scan keeps each poll cheap; truncating early only under-delivers
+    // (the next poll continues), never crosses a hole.
+    const light = this.db
+      .prepare(
+        `select id, repo_id, created_at from versions
+         where id > ? order by id asc limit ?`,
+      )
+      .all(opts.after_id, GLOBAL_SCAN_CAP) as {
+      id: number;
+      repo_id: number;
+      created_at: string;
+    }[];
+    const { upper_id } = safeFrontier(
+      light.map((r) => ({
+        id: r.id,
+        repo_id: r.repo_id,
+        created_at_ms: Date.parse(r.created_at),
+      })),
+      opts.after_id,
+      opts.repo_id,
+      opts.limit,
+      opts.now_ms,
+      opts.window_ms,
+    );
+    if (upper_id <= opts.after_id) return { rows: [], next_id: opts.after_id };
+    const repoClause = opts.repo_id === undefined ? "" : " and repo_id = ?";
+    const params: number[] =
+      opts.repo_id === undefined
+        ? [opts.after_id, upper_id]
+        : [opts.after_id, upper_id, opts.repo_id];
+    const rows = this.db
+      .prepare(
+        `select id, document_id, repo_id, prev_id, next_id, path,
+                frontmatter_raw, frontmatter, body, author, created_at, content_hash
+         from versions
+         where id > ? and id <= ?${repoClause}
+         order by id asc`,
+      )
+      .all(...params) as VersionRawRow[];
+    return { rows: rows.map(hydrateVersion), next_id: upper_id };
   }
 
   async chunks_upsert(
