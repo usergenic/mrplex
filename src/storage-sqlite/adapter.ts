@@ -1,6 +1,7 @@
 import { RE2JS } from "@bufbuild/re2";
 import Database from "better-sqlite3";
 import { normalizeKey } from "../kernel/casefold.js";
+import { contentHash } from "../markdown/content-hash.js";
 import type { SearchPlan } from "../storage/search-plan.js";
 import type {
   AdjacentLink,
@@ -37,6 +38,7 @@ type VersionRawRow = {
   body: string;
   author: string;
   created_at: string;
+  content_hash: string | null;
 };
 
 const hydrateVersion = (row: VersionRawRow): VersionRow => ({
@@ -265,10 +267,10 @@ class SqliteStorage implements Storage {
         .prepare(
           `insert into versions
             (document_id, repo_id, prev_id, next_id, path, path_norm,
-             frontmatter_raw, frontmatter, body, author, created_at)
-           values (?, ?, ?, null, ?, ?, ?, ?, ?, ?, ?)
+             frontmatter_raw, frontmatter, body, author, created_at, content_hash)
+           values (?, ?, ?, null, ?, ?, ?, ?, ?, ?, ?, ?)
            returning id, document_id, repo_id, prev_id, next_id, path,
-                     frontmatter_raw, frontmatter, body, author, created_at`,
+                     frontmatter_raw, frontmatter, body, author, created_at, content_hash`,
         )
         .get(
           input.document_id,
@@ -281,6 +283,7 @@ class SqliteStorage implements Storage {
           input.body,
           input.author,
           input.created_at,
+          contentHash(input.frontmatter_raw, input.body),
         ) as VersionRawRow;
 
       if (input.prev_id !== null) {
@@ -297,7 +300,7 @@ class SqliteStorage implements Storage {
     const row = this.db
       .prepare(
         `select id, document_id, repo_id, prev_id, next_id, path,
-                frontmatter_raw, frontmatter, body, author, created_at
+                frontmatter_raw, frontmatter, body, author, created_at, content_hash
          from versions where id = ?`,
       )
       .get(id) as VersionRawRow | undefined;
@@ -309,7 +312,7 @@ class SqliteStorage implements Storage {
     const row = this.db
       .prepare(
         `select id, document_id, repo_id, prev_id, next_id, path,
-                frontmatter_raw, frontmatter, body, author, created_at
+                frontmatter_raw, frontmatter, body, author, created_at, content_hash
          from versions where repo_id = ? and path_norm = ? and next_id is null`,
       )
       .get(repo_id, normalizeKey(path)) as VersionRawRow | undefined;
@@ -320,7 +323,7 @@ class SqliteStorage implements Storage {
     const rows = this.db
       .prepare(
         `select id, document_id, repo_id, prev_id, next_id, path,
-                frontmatter_raw, frontmatter, body, author, created_at
+                frontmatter_raw, frontmatter, body, author, created_at, content_hash
          from versions
          where repo_id = ? and next_id is null
          order by path`,
@@ -437,7 +440,7 @@ class SqliteStorage implements Storage {
         this.db
           .prepare(
             `select id, document_id, repo_id, prev_id, next_id, path,
-                  frontmatter_raw, frontmatter, body, author, created_at
+                  frontmatter_raw, frontmatter, body, author, created_at, content_hash
            from versions
            where repo_id = ? and next_id is null and document_id in (${ph})`,
           )
@@ -487,21 +490,21 @@ class SqliteStorage implements Storage {
       .prepare(
         `with recursive chain(
            id, document_id, repo_id, prev_id, next_id, path,
-           frontmatter_raw, frontmatter, body, author, created_at, depth
+           frontmatter_raw, frontmatter, body, author, created_at, content_hash, depth
          ) as (
            select id, document_id, repo_id, prev_id, next_id, path,
-                  frontmatter_raw, frontmatter, body, author, created_at, 0
+                  frontmatter_raw, frontmatter, body, author, created_at, content_hash, 0
              from versions
              where document_id = ? and next_id is null
            union all
            select v.id, v.document_id, v.repo_id, v.prev_id, v.next_id, v.path,
                   v.frontmatter_raw, v.frontmatter, v.body, v.author, v.created_at,
-                  c.depth + 1
+                  v.content_hash, c.depth + 1
              from versions v
              join chain c on v.id = c.prev_id
          )
          select id, document_id, repo_id, prev_id, next_id, path,
-                frontmatter_raw, frontmatter, body, author, created_at
+                frontmatter_raw, frontmatter, body, author, created_at, content_hash
          from chain${where}
          order by depth asc${limitClause}`,
       )

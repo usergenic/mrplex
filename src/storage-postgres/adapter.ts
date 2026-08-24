@@ -18,6 +18,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import pg, { Pool, type PoolClient } from "pg";
 import { normalizeKey } from "../kernel/casefold.js";
 import { KernelError } from "../kernel/errors.js";
+import { contentHash } from "../markdown/content-hash.js";
 import type { SearchPlan } from "../storage/search-plan.js";
 import type {
   AdjacentLink,
@@ -106,6 +107,7 @@ type VersionRawRow = {
   body: string;
   author: string;
   created_at: string;
+  content_hash: string | null;
 };
 
 class PostgresStorage implements Storage {
@@ -307,10 +309,10 @@ class PostgresStorage implements Storage {
         const ins = await c.query<VersionRawRow>(
           `insert into versions
              (document_id, repo_id, prev_id, next_id, path, path_norm,
-              frontmatter_raw, frontmatter, body, author, created_at)
-           values ($1, $2, $3, null, $4, $5, $6, $7::jsonb, $8, $9, $10)
+              frontmatter_raw, frontmatter, body, author, created_at, content_hash)
+           values ($1, $2, $3, null, $4, $5, $6, $7::jsonb, $8, $9, $10, $11)
            returning id, document_id, repo_id, prev_id, next_id, path,
-                     frontmatter_raw, frontmatter, body, author, created_at`,
+                     frontmatter_raw, frontmatter, body, author, created_at, content_hash`,
           [
             input.document_id,
             input.repo_id,
@@ -322,6 +324,7 @@ class PostgresStorage implements Storage {
             input.body,
             input.author,
             input.created_at,
+            contentHash(input.frontmatter_raw, input.body),
           ],
         );
         const inserted = ins.rows[0] as VersionRawRow;
@@ -340,7 +343,7 @@ class PostgresStorage implements Storage {
     return this.withClient(async (c) => {
       const res = await c.query<VersionRawRow>(
         `select id, document_id, repo_id, prev_id, next_id, path,
-                frontmatter_raw, frontmatter, body, author, created_at
+                frontmatter_raw, frontmatter, body, author, created_at, content_hash
          from versions where id = $1`,
         [id],
       );
@@ -353,7 +356,7 @@ class PostgresStorage implements Storage {
       // Case-insensitive identity: fold the query key to path_norm (§3.5.1).
       const res = await c.query<VersionRawRow>(
         `select id, document_id, repo_id, prev_id, next_id, path,
-                frontmatter_raw, frontmatter, body, author, created_at
+                frontmatter_raw, frontmatter, body, author, created_at, content_hash
          from versions where repo_id = $1 and path_norm = $2 and next_id is null`,
         [repo_id, normalizeKey(path)],
       );
@@ -365,7 +368,7 @@ class PostgresStorage implements Storage {
     return this.withClient(async (c) => {
       const res = await c.query<VersionRawRow>(
         `select id, document_id, repo_id, prev_id, next_id, path,
-                frontmatter_raw, frontmatter, body, author, created_at
+                frontmatter_raw, frontmatter, body, author, created_at, content_hash
          from versions
          where repo_id = $1 and next_id is null
          order by path`,
@@ -484,7 +487,7 @@ class PostgresStorage implements Storage {
     return this.withClient(async (c) => {
       const res = await c.query<VersionRawRow>(
         `select id, document_id, repo_id, prev_id, next_id, path,
-                frontmatter_raw, frontmatter, body, author, created_at
+                frontmatter_raw, frontmatter, body, author, created_at, content_hash
          from versions
          where repo_id = $1 and next_id is null and document_id = ANY($2::bigint[])`,
         [repo_id, document_ids],
@@ -551,18 +554,18 @@ class PostgresStorage implements Storage {
       const res = await c.query<VersionRawRow>(
         `with recursive chain as (
            select id, document_id, repo_id, prev_id, next_id, path,
-                  frontmatter_raw, frontmatter, body, author, created_at, 0 as depth
+                  frontmatter_raw, frontmatter, body, author, created_at, content_hash, 0 as depth
              from versions
              where document_id = $1 and next_id is null
            union all
            select v.id, v.document_id, v.repo_id, v.prev_id, v.next_id, v.path,
                   v.frontmatter_raw, v.frontmatter, v.body, v.author, v.created_at,
-                  c.depth + 1
+                  v.content_hash, c.depth + 1
              from versions v
              join chain c on v.id = c.prev_id
          )
          select id, document_id, repo_id, prev_id, next_id, path,
-                frontmatter_raw, frontmatter, body, author, created_at
+                frontmatter_raw, frontmatter, body, author, created_at, content_hash
          from chain${where}
          order by depth asc${limitClause}`,
         params,

@@ -85,6 +85,27 @@ describe("migrate", () => {
     expect(repoCols.map((c) => c.name)).toContain("link_config");
   });
 
+  it("adds the nullable content_hash column + index (0002)", () => {
+    const db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    migrate(db);
+    const cols = db.prepare("pragma table_info(versions)").all() as {
+      name: string;
+      type: string;
+      notnull: number;
+    }[];
+    const ch = cols.find((c) => c.name === "content_hash");
+    expect(ch).toBeDefined();
+    expect(ch?.type.toUpperCase()).toBe("TEXT");
+    expect(ch?.notnull).toBe(0); // nullable — instant migration, backfilled later
+    const idx = db
+      .prepare(
+        "select name from sqlite_master where type='index' and name='versions_content_hash_idx'",
+      )
+      .get() as { name: string } | undefined;
+    expect(idx?.name).toBe("versions_content_hash_idx");
+  });
+
   it("is idempotent — running twice is a no-op", () => {
     const db = new Database(":memory:");
     db.pragma("foreign_keys = ON");

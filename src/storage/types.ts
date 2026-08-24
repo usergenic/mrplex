@@ -41,6 +41,12 @@ export type VersionRow = {
   body: string;
   author: string;
   created_at: string;
+  /**
+   * SHA-256 (bare hex) of canonical content (sync/history plan §2). Derived and
+   * server-owned — computed in-tx by `version_insert`, never part of the insert
+   * input. Null only on pre-backfill rows written before migration 0002.
+   */
+  content_hash: string | null;
 };
 
 export type VersionInsertInput = {
