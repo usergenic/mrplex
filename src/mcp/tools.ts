@@ -1135,6 +1135,79 @@ export const TOOL_REGISTRY: ToolEntry[] = [
     },
   },
   {
+    name: "history_index",
+    description:
+      "Page the live document set of one repo as of a safe head R (sync/history plan §3.4) — the " +
+      "startup/reconciliation enumeration a sync client runs before tailing. Returns lightweight " +
+      "{path, version_id, content_hash} tuples in current-version-id order, keyset-paginated and " +
+      "bounded through R. On the first call omit `through_version`; the server captures R and " +
+      "echoes it — pass it back (plus `after_version` = the previous page's last version_id) on " +
+      "subsequent pages. System (`:deleted/`) and hidden (`.`-prefixed) paths are excluded, as " +
+      "`query` defaults. The handoff is exact: a base scan over (cursor, R] plus history_since(R) " +
+      "is gap-free, so a doc updated mid-pagination simply arrives later on the feed.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string", description: "Repo slug (the scan is per-repo)." },
+        through_version: {
+          type: "string",
+          description: "The safe head R; omit on the first call (server captures + returns it).",
+        },
+        after_version: {
+          type: "string",
+          description: "Previous page's last version_id; omit on the first call.",
+        },
+        limit: {
+          type: "integer",
+          minimum: 1,
+          description: "Max items per page (server default applies when omitted).",
+        },
+        scope: {
+          type: "array",
+          description: "Read-visibility claims (ScopeClaim[]); the X-Mrplex-Scope header wins.",
+          items: { type: "object", additionalProperties: true },
+        },
+      },
+      required: ["repo"],
+    },
+    outputSchema: {
+      type: "object",
+      properties: {
+        items: {
+          type: "array",
+          description: "Live-set entries in current-version-id order.",
+          items: {
+            type: "object",
+            properties: {
+              path: { type: "string" },
+              version_id: { type: "string" },
+              content_hash: { type: "string" },
+            },
+            required: ["path", "version_id", "content_hash"],
+          },
+        },
+        through_version: { type: "string", description: "The safe head R (echo on later pages)." },
+        next_after_version: {
+          type: "string",
+          description: "Cursor for the next page; absent on the final page.",
+        },
+      },
+      required: ["items", "through_version"],
+    },
+    handler: async (kernel, ctx, args) => {
+      const page = await kernel.history.index(queryCtx(ctx, args), {
+        repo: argStr(args, "repo"),
+        through_version: argStrOpt(args, "through_version"),
+        after_version: argStrOpt(args, "after_version"),
+        limit: argIntOpt(args, "limit"),
+      });
+      return {
+        structured: page as unknown as Record<string, unknown>,
+        text: page.items.map((i) => JSON.stringify(i)).join("\n"),
+      };
+    },
+  },
+  {
     name: "query_syntax",
     description:
       "Reference documentation for the `query` tool's filter language: CEL syntax, $-intrinsics " +

@@ -98,3 +98,92 @@ describe("history.since", () => {
     expect(page.refs.map((r) => r.path)).toEqual(["n.md"]);
   });
 });
+
+describe("history.index", () => {
+  it("enumerates the live set with content_hash, capturing R on the first call", async () => {
+    const { kernel, actor } = await bootstrap();
+    const va = await kernel.docs.create(actor, "notes", "a.md", {
+      body: "1\n",
+      frontmatter_raw: "",
+    });
+    await kernel.docs.create(actor, "notes", "b.md", { body: "2\n", frontmatter_raw: "" });
+    const page = await kernel.history.index(actor, { repo: "notes" });
+    expect(page.items.map((i) => i.path)).toEqual(["a.md", "b.md"]);
+    expect(page.items[0]?.content_hash).toBe(va.content_hash);
+    expect(page.through_version).not.toBe("v0");
+    expect(page.next_after_version).toBeUndefined(); // single final page
+  });
+
+  it("reflects only the current version of an updated doc (not history)", async () => {
+    const { kernel, actor } = await bootstrap();
+    const v1 = await kernel.docs.create(actor, "notes", "a.md", {
+      body: "1\n",
+      frontmatter_raw: "",
+    });
+    const v2 = await kernel.docs.put(actor, "notes", v1.version_id, "a.md", {
+      body: "2\n",
+      frontmatter_raw: "",
+    });
+    const page = await kernel.history.index(actor, { repo: "notes" });
+    expect(page.items).toHaveLength(1);
+    expect(page.items[0]?.version_id).toBe(v2.version_id);
+  });
+
+  it("excludes deleted (system-namespace) documents", async () => {
+    const { kernel, actor } = await bootstrap();
+    const v = await kernel.docs.create(actor, "notes", "gone.md", {
+      body: "x\n",
+      frontmatter_raw: "",
+    });
+    await kernel.docs.delete(actor, "notes", v.version_id);
+    await kernel.docs.create(actor, "notes", "live.md", { body: "y\n", frontmatter_raw: "" });
+    const page = await kernel.history.index(actor, { repo: "notes" });
+    expect(page.items.map((i) => i.path)).toEqual(["live.md"]);
+  });
+
+  it("keyset-paginates through R and echoes it across pages", async () => {
+    const { kernel, actor } = await bootstrap();
+    for (const p of ["a.md", "b.md", "c.md", "d.md"]) {
+      await kernel.docs.create(actor, "notes", p, { body: "x\n", frontmatter_raw: "" });
+    }
+    const p1 = await kernel.history.index(actor, { repo: "notes", limit: 2 });
+    expect(p1.items.map((i) => i.path)).toEqual(["a.md", "b.md"]);
+    expect(p1.next_after_version).toBeDefined();
+    const p2 = await kernel.history.index(actor, {
+      repo: "notes",
+      through_version: p1.through_version,
+      after_version: p1.next_after_version,
+      limit: 2,
+    });
+    expect(p2.through_version).toBe(p1.through_version); // R echoed
+    expect(p2.items.map((i) => i.path)).toEqual(["c.md", "d.md"]);
+    expect(p2.next_after_version).toBeUndefined();
+  });
+
+  it("handoff invariant: a doc created after R is absent from index but on the feed exactly once", async () => {
+    const { kernel, actor } = await bootstrap();
+    await kernel.docs.create(actor, "notes", "a.md", { body: "1\n", frontmatter_raw: "" });
+    // First page captures R at the current tip.
+    const p1 = await kernel.history.index(actor, { repo: "notes", limit: 1 });
+    const R = p1.through_version;
+    // A concurrent create lands AFTER R.
+    await kernel.docs.create(actor, "notes", "late.md", { body: "2\n", frontmatter_raw: "" });
+    // Continue paginating the index through the SAME R: late.md must not appear.
+    let after = p1.next_after_version;
+    const indexPaths = [...p1.items.map((i) => i.path)];
+    while (after !== undefined) {
+      const page = await kernel.history.index(actor, {
+        repo: "notes",
+        through_version: R,
+        after_version: after,
+        limit: 1,
+      });
+      indexPaths.push(...page.items.map((i) => i.path));
+      after = page.next_after_version;
+    }
+    expect(indexPaths).toEqual(["a.md"]); // late.md excluded (id > R)
+    // history.since(R) delivers late.md exactly once.
+    const feed = await kernel.history.since(actor, { after_version: R });
+    expect(feed.refs.map((r) => r.path)).toEqual(["late.md"]);
+  });
+});

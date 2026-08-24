@@ -28,6 +28,7 @@ import type { QuerySpec } from "../kernel/query/query.js";
 import type {
   GraphResult,
   GraphSpec,
+  HistoryIndexPage,
   HistorySincePage,
   PathWarning,
   QueryHit,
@@ -202,6 +203,8 @@ function buildRemoteClient(client: Client): KernelClient {
     history: {
       since: (input) =>
         call<HistorySincePage>("history_since", input as unknown as Record<string, unknown>),
+      index: (input) =>
+        call<HistoryIndexPage>("history_index", input as unknown as Record<string, unknown>),
     },
     close: async () => {
       if (closed) return;

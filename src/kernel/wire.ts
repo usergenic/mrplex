@@ -60,6 +60,24 @@ export type HistorySincePage = {
   next_since: string;
 };
 
+/** One live-set entry from `history.index` (§3.4). */
+export type IndexItem = {
+  path: string;
+  version_id: string;
+  content_hash: string;
+};
+
+/**
+ * A page of `history.index` (sync/history plan §3.4). `through_version` is the
+ * safe head `R` — captured on the first call, echoed on later pages;
+ * `next_after_version` is absent on the final page.
+ */
+export type HistoryIndexPage = {
+  items: IndexItem[];
+  through_version: string;
+  next_after_version?: string;
+};
+
 /**
  * A projected `query` hit (docs/query-select-plan.md). `query` names the
  * fields it wants via `select` and gets back these lean objects rather than

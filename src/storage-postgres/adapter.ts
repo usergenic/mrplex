@@ -40,7 +40,12 @@ import type {
   VersionsSinceOptions,
   VersionsSinceResult,
 } from "../storage/types.js";
-import { GLOBAL_SCAN_CAP, safeFrontier } from "../storage/versions-since.js";
+import {
+  GLOBAL_SCAN_CAP,
+  SAFE_HEAD_TAIL,
+  safeFrontier,
+  safeHeadFromTail,
+} from "../storage/versions-since.js";
 import { compileSearchPlan } from "./compile-postgres.js";
 import { isRegexInvalid, isSerializationRetryable, isVersionRaceViolation } from "./errors.js";
 import { migrate } from "./migrations/index.js";
@@ -627,6 +632,40 @@ class PostgresStorage implements Storage {
       );
       for (const r of res.rows) map.set(Number(r.id), r.path);
       return map;
+    });
+  }
+
+  async versions_safe_head(now_ms: number, window_ms: number): Promise<number> {
+    return this.withClient(async (c) => {
+      const res = await c.query<{ id: number; created_at: string }>(
+        "select id, created_at from versions order by id desc limit $1",
+        [SAFE_HEAD_TAIL],
+      );
+      const tail = res.rows
+        .map((r) => ({ id: Number(r.id), repo_id: 0, created_at_ms: Date.parse(r.created_at) }))
+        .reverse(); // ascending by id
+      return safeHeadFromTail(tail, now_ms, window_ms);
+    });
+  }
+
+  async versions_live_index(opts: {
+    repo_id: number;
+    through_id: number;
+    after_id: number;
+    limit: number;
+  }): Promise<{ id: number; path: string; content_hash: string | null }[]> {
+    return this.withClient(async (c) => {
+      const res = await c.query<{ id: number; path: string; content_hash: string | null }>(
+        `select id, path, content_hash from versions
+         where repo_id = $1 and next_id is null and id > $2 and id <= $3
+         order by id asc limit $4`,
+        [opts.repo_id, opts.after_id, opts.through_id, opts.limit],
+      );
+      return res.rows.map((r) => ({
+        id: Number(r.id),
+        path: r.path,
+        content_hash: r.content_hash,
+      }));
     });
   }
 

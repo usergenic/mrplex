@@ -235,6 +235,10 @@ export function guardKernel(kernel: Kernel, entitlement: Entitlement, audit?: Au
         forward("history.since", { repo: input.repo }, () =>
           kernel.history.since(readCtx(), input),
         ),
+      index: (_ctx, input) =>
+        forward("history.index", { repo: input.repo }, () =>
+          kernel.history.index(readCtx(), input),
+        ),
     },
   };
 }

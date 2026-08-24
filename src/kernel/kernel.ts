@@ -46,9 +46,12 @@ import {
 } from "./frontmatter-input.js";
 import { type GraphDeps, runGraph } from "./graph.js";
 import {
+  HISTORY_INDEX_DEFAULT_LIMIT,
   HISTORY_SAFETY_WINDOW_MS,
   HISTORY_SINCE_DEFAULT_LIMIT,
+  type HistoryIndexDeps,
   type HistorySinceDeps,
+  runHistoryIndex,
   runHistorySince,
 } from "./history.js";
 import {
@@ -66,6 +69,7 @@ import { decodeVersionId, encodeVersionId } from "./version-id.js";
 import type {
   GraphResult,
   GraphSpec,
+  HistoryIndexPage,
   HistorySincePage,
   PathWarning,
   QueryHit,
@@ -166,6 +170,8 @@ export type Kernel = {
   history: {
     /** The global change feed — the longest gap-free run after the cursor. */
     since(ctx: CallContext, input: HistorySinceQuery): Promise<HistorySincePage>;
+    /** Page the live set as of a safe head R (startup reconciliation). */
+    index(ctx: CallContext, input: HistoryIndexQuery): Promise<HistoryIndexPage>;
   };
 };
 
@@ -173,6 +179,14 @@ export type Kernel = {
 export type HistorySinceQuery = {
   after_version: string;
   repo?: string;
+  limit?: number;
+};
+
+/** Public input to `history.index` (§3.4). `repo` is required (per-repo scan). */
+export type HistoryIndexQuery = {
+  repo: string;
+  through_version?: string;
+  after_version?: string;
   limit?: number;
 };
 
@@ -754,6 +768,31 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
             after_version: input.after_version,
             repo_id: repoId,
             limit: input.limit ?? HISTORY_SINCE_DEFAULT_LIMIT,
+            now_ms: Date.now(),
+            window_ms: HISTORY_SAFETY_WINDOW_MS,
+          },
+          deps,
+        );
+      },
+
+      async index(ctx, input) {
+        const repo = await resolveRepo(ctx, input.repo);
+        const cfg = repoEffectiveConfig(repo);
+        // Exclude system (`:deleted/`) and hidden (`.`) namespaces, as `query`
+        // defaults do — the sync live set is the visible, current corpus.
+        const excludedSigils = [...cfg.system_sigils, ...cfg.hidden_sigils];
+        const claims = claimsFor(ctx);
+        const deps: HistoryIndexDeps = {
+          storage,
+          isExcluded: (path) => pathIsInSystemNamespace(path, excludedSigils),
+          canRead: (path) => claims === null || claimsGrantRead(claims, repo.slug, path),
+        };
+        return runHistoryIndex(
+          {
+            repo_id: repo.id,
+            through_version: input.through_version,
+            after_version: input.after_version,
+            limit: input.limit ?? HISTORY_INDEX_DEFAULT_LIMIT,
             now_ms: Date.now(),
             window_ms: HISTORY_SAFETY_WINDOW_MS,
           },

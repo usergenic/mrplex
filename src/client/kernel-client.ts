@@ -24,6 +24,7 @@ import type { QuerySpec } from "../kernel/query/query.js";
 import type {
   GraphResult,
   GraphSpec,
+  HistoryIndexPage,
   HistorySincePage,
   PathWarning,
   QueryHit,
@@ -90,6 +91,12 @@ export type KernelClient = {
       repo?: string;
       limit?: number;
     }): Promise<HistorySincePage>;
+    index(input: {
+      repo: string;
+      through_version?: string;
+      after_version?: string;
+      limit?: number;
+    }): Promise<HistoryIndexPage>;
   };
 
   /** Release any transport-owned resources. Idempotent. */

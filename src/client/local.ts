@@ -90,6 +90,7 @@ function buildClient(
     graph: (spec) => kernel.graph(ctx, spec),
     history: {
       since: (input) => kernel.history.since(ctx, input),
+      index: (input) => kernel.history.index(ctx, input),
     },
     close: async () => {
       if (closed) return;

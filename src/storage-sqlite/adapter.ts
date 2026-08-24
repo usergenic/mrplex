@@ -24,7 +24,12 @@ import type {
   VersionsSinceOptions,
   VersionsSinceResult,
 } from "../storage/types.js";
-import { GLOBAL_SCAN_CAP, safeFrontier } from "../storage/versions-since.js";
+import {
+  GLOBAL_SCAN_CAP,
+  SAFE_HEAD_TAIL,
+  safeFrontier,
+  safeHeadFromTail,
+} from "../storage/versions-since.js";
 import { compileSearchPlan } from "./compile-sqlite.js";
 import { migrate } from "./migrations/index.js";
 import { decodeVectorBlob, encodeVectorBlob, loadSqliteVec } from "./vec.js";
@@ -569,6 +574,39 @@ class SqliteStorage implements Storage {
     );
     for (const r of rows) map.set(r.id, r.path);
     return map;
+  }
+
+  async versions_safe_head(now_ms: number, window_ms: number): Promise<number> {
+    // The recent tail is all that can hold a hot (unsettled) gap; older gaps
+    // are burned and settled by construction.
+    const tail = this.db
+      .prepare("select id, created_at from versions order by id desc limit ?")
+      .all(SAFE_HEAD_TAIL) as { id: number; created_at: string }[];
+    tail.reverse(); // ascending by id
+    return safeHeadFromTail(
+      tail.map((r) => ({ id: r.id, repo_id: 0, created_at_ms: Date.parse(r.created_at) })),
+      now_ms,
+      window_ms,
+    );
+  }
+
+  async versions_live_index(opts: {
+    repo_id: number;
+    through_id: number;
+    after_id: number;
+    limit: number;
+  }): Promise<{ id: number; path: string; content_hash: string | null }[]> {
+    return this.db
+      .prepare(
+        `select id, path, content_hash from versions
+         where repo_id = ? and next_id is null and id > ? and id <= ?
+         order by id asc limit ?`,
+      )
+      .all(opts.repo_id, opts.after_id, opts.through_id, opts.limit) as {
+      id: number;
+      path: string;
+      content_hash: string | null;
+    }[];
   }
 
   async chunks_upsert(

@@ -8,10 +8,19 @@
 
 import type { Storage, VersionRow } from "../storage/types.js";
 import { decodeVersionId, encodeVersionId } from "./version-id.js";
-import type { HistorySincePage, VersionOp, VersionRef } from "./wire.js";
+import type {
+  HistoryIndexPage,
+  HistorySincePage,
+  IndexItem,
+  VersionOp,
+  VersionRef,
+} from "./wire.js";
 
 /** Default feed page size when a caller omits `limit` (§3.3). */
 export const HISTORY_SINCE_DEFAULT_LIMIT = 500;
+
+/** Default `history.index` page size when a caller omits `limit` (§3.4). */
+export const HISTORY_INDEX_DEFAULT_LIMIT = 1000;
 
 /**
  * Safety-window duration (§3.2): a gap's successor visible longer than this is
@@ -97,6 +106,89 @@ export async function runHistorySince(
 
   const nextSince = next_id > afterId ? encodeVersionId(next_id) : input.after_version;
   return { refs, next_since: nextSince };
+}
+
+export type HistoryIndexInput = {
+  repo_id: number;
+  through_version?: string; // omitted on the first call; captured + echoed
+  after_version?: string; // previous page's last version_id
+  limit: number;
+  now_ms: number;
+  window_ms: number;
+};
+
+export type HistoryIndexDeps = {
+  storage: Storage;
+  /** Exclude a path from the index (system/hidden namespaces, as query does). */
+  isExcluded: (path: string) => boolean;
+  /** Visibility gate for the caller's scope. */
+  canRead: (path: string) => boolean;
+};
+
+/**
+ * Page the live set as of a safe head `R` (§3.4). On the first call (no
+ * `through_version`) the server captures `R = versions_safe_head(...)` and
+ * echoes it; subsequent pages pass it back. Keyset over current-version id in
+ * `(after, R]`, never offset — a document updated mid-pagination gets a new id
+ * > R, drops out of the remaining pages, and is delivered by
+ * `history.since(R)` afterward. System/hidden paths and out-of-scope rows are
+ * dropped here (the storage page is lightweight and unfiltered), so a raw page
+ * may yield fewer visible items than `limit`; we keep pulling storage pages
+ * until we fill `limit` or reach R.
+ */
+export async function runHistoryIndex(
+  input: HistoryIndexInput,
+  deps: HistoryIndexDeps,
+): Promise<HistoryIndexPage> {
+  const through =
+    input.through_version !== undefined && input.through_version !== ""
+      ? (decodeVersionId(input.through_version) ?? 0)
+      : await deps.storage.versions_safe_head(input.now_ms, input.window_ms);
+  const throughVersion = encodeVersionId(through);
+
+  let afterId =
+    input.after_version !== undefined && input.after_version !== ""
+      ? (decodeVersionId(input.after_version) ?? 0)
+      : 0;
+
+  const items: IndexItem[] = [];
+  let exhausted = false;
+  while (items.length < input.limit && !exhausted) {
+    const rows = await deps.storage.versions_live_index({
+      repo_id: input.repo_id,
+      through_id: through,
+      after_id: afterId,
+      // Over-fetch a little so heavy exclusion doesn't cause many round-trips.
+      limit: input.limit,
+    });
+    if (rows.length === 0) {
+      exhausted = true;
+      break;
+    }
+    for (const r of rows) {
+      afterId = r.id;
+      if (deps.isExcluded(r.path)) continue;
+      if (!deps.canRead(r.path)) continue;
+      items.push({
+        path: r.path,
+        version_id: encodeVersionId(r.id),
+        content_hash: r.content_hash ?? "",
+      });
+      if (items.length === input.limit) break;
+    }
+    // A short storage page means we've reached R's boundary.
+    if (rows.length < input.limit) exhausted = true;
+  }
+
+  // More live rows may remain ≤ R only if the page filled AND we haven't yet
+  // consumed up to R itself. Reaching R (afterId === through) means the keyset
+  // window is exhausted even when the visible page happened to fill exactly.
+  const hasMore = !exhausted && items.length === input.limit && afterId < through;
+  return {
+    items,
+    through_version: throughVersion,
+    ...(hasMore ? { next_after_version: encodeVersionId(afterId) } : {}),
+  };
 }
 
 function toRef(row: VersionRow, prevPath: string | null, deps: HistorySinceDeps): VersionRef {

@@ -253,6 +253,29 @@ export type Storage = {
   versions_paths_by_ids(ids: readonly number[]): Promise<Map<number, string>>;
 
   /**
+   * The safe head `R` (sync/history plan §3.4): the raw version id the feed
+   * would hand out as `next_since` at the live tip — everything ≤ R is visible
+   * and final. Computed with the same safety-window machinery as the feed, but
+   * anchored at the tip rather than a cursor, so `history.index` scans through
+   * a settled boundary while `history.since(R)` covers the rest with no gaps.
+   * Returns 0 when the log is empty.
+   */
+  versions_safe_head(now_ms: number, window_ms: number): Promise<number>;
+
+  /**
+   * One keyset page of the live set for `history.index` (§3.4): live rows
+   * (`next_id IS NULL`) in `repo_id` whose current version id is in
+   * `(after_id, through_id]`, ascending by id, capped at `limit`. Lightweight
+   * tuples only — the kernel applies system/hidden exclusion and scope.
+   */
+  versions_live_index(opts: {
+    repo_id: number;
+    through_id: number;
+    after_id: number;
+    limit: number;
+  }): Promise<{ id: number; path: string; content_hash: string | null }[]>;
+
+  /**
    * All currently-live versions in a repo (i.e. rows where next_id IS NULL).
    * Used by `repos.set_path_config` to produce the advisory PathWarning[]
    * scan (§3.5.3). Riding the partial-index on (repo_id, path) where

@@ -31,6 +31,14 @@
  */
 export const GLOBAL_SCAN_CAP = 10000;
 
+/**
+ * How many recent rows to inspect when computing the safe head `R`. Only the
+ * newest rows can hold an unsettled (hot) gap — anything older than the safety
+ * window is burned-and-settled — so a small tail suffices regardless of log
+ * size. Comfortably exceeds any plausible in-flight concurrent-write count.
+ */
+export const SAFE_HEAD_TAIL = 1000;
+
 /** A lightweight row for the frontier walk — no body/frontmatter needed. */
 export type FrontierRow = {
   id: number;
@@ -93,4 +101,23 @@ export function safeFrontier(
   }
 
   return { upper_id: capped ? cutoff : frontier };
+}
+
+/**
+ * The safe head `R` (§3.4) from a bounded tail of recent rows. `tail` is the
+ * last rows by id, ascending (id + age; repo irrelevant here). We anchor the
+ * walk at `tail[0].id - 1` so the tail's first row isn't mistaken for a leading
+ * gap: everything below the tail is older than any realistic safety window, so
+ * its gaps are burned and already settled. Within the tail, the walk crosses
+ * burned gaps and stops before the first hot one — exactly the id the feed
+ * would hand out as `next_since` at the tip. Empty tail → 0.
+ */
+export function safeHeadFromTail(
+  tail: readonly FrontierRow[],
+  now_ms: number,
+  window_ms: number,
+): number {
+  if (tail.length === 0) return 0;
+  const anchor = (tail[0] as FrontierRow).id - 1;
+  return safeFrontier(tail, anchor, undefined, tail.length, now_ms, window_ms).upper_id;
 }
