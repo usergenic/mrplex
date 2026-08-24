@@ -34,7 +34,11 @@ export function renderQueryTable(hits: QueryHit[]): string {
 }
 
 function renderCell(value: unknown): string {
-  if (value === undefined || value === null) return "";
+  // A key absent from this hit (not selected, or missing frontmatter) is an
+  // empty cell; a present-but-null intrinsic (e.g. $next_version_id on the
+  // current version) renders as "null" to match the MCP text renderer.
+  if (value === undefined) return "";
+  if (value === null) return "null";
   if (typeof value === "string") return value;
   return JSON.stringify(value);
 }
