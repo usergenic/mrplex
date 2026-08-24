@@ -4,9 +4,10 @@
  *
  *   • remote → local: poll history.since(cursor) every --interval, apply refs
  *     (feed.ts), advance the cursor after fs effects.
- *   • local → remote: a chokidar watcher debounces per-path events into a work
- *     queue; each settled path runs the push pass (push.ts). Event *types* are
- *     untrusted — the pass stats the path (§4.6).
+ *   • local → remote: a chokidar watcher coalesces events into a debounce
+ *     *burst* (all paths that settled together). The burst runs present files
+ *     first so unlink+add of a rename is a move, not a delete (§4.7); each
+ *     path is still stated, not trusted by event type (§4.6).
  *
  * chokidar is confined to this module (§4.4). Echo suppression falls out of
  * self-description (§4.5): our own pushes come back on the feed but the local
@@ -22,7 +23,7 @@ import { applyFeed } from "./feed.js";
 import { createFsStore } from "./fs-store.js";
 import { isIgnored, readFileIntrinsics } from "./intrinsics.js";
 import { SYNC_DIR, type ScopeFilter, makeScopeFilter, toDocPath } from "./paths.js";
-import { type RemoteMap, pushPath } from "./push.js";
+import { type RemoteMap, pushBurst, pushPath } from "./push.js";
 import { type FileStore, reconcileOnce } from "./reconcile.js";
 
 export type DaemonOptions = {
@@ -59,7 +60,8 @@ export function startDaemon(client: KernelClient, opts: DaemonOptions): Daemon {
 
   let stopped = false;
   let watcher: FSWatcher | undefined;
-  const pending = new Map<string, NodeJS.Timeout>();
+  const pending = new Set<string>();
+  let burstTimer: NodeJS.Timeout | undefined;
   let cursor = "";
   let existingCursor: SyncCursor | null = null;
   // Serialize all remote-touching work so a poll and a push never interleave a
@@ -112,22 +114,17 @@ export function startDaemon(client: KernelClient, opts: DaemonOptions): Daemon {
 
   function schedulePush(docPath: string): void {
     if (!scope.matches(docPath)) return;
-    const existing = pending.get(docPath);
-    if (existing) clearTimeout(existing);
-    pending.set(
-      docPath,
-      setTimeout(() => {
-        pending.delete(docPath);
-        void serialize(async () => {
-          if (stopped) return;
-          try {
-            await pushPath(docPath, { client, store, repo: opts.repo, map, log });
-          } catch (err) {
-            log(`push error\t${docPath}\t${(err as Error).message}`);
-          }
-        });
-      }, debounceMs),
-    );
+    pending.add(docPath);
+    if (burstTimer) clearTimeout(burstTimer);
+    burstTimer = setTimeout(() => {
+      burstTimer = undefined;
+      const batch = [...pending];
+      pending.clear();
+      void serialize(async () => {
+        if (stopped) return;
+        await pushBurst(batch, { client, store, repo: opts.repo, map, log });
+      });
+    }, debounceMs);
   }
 
   const ready = (async () => {
@@ -200,7 +197,8 @@ export function startDaemon(client: KernelClient, opts: DaemonOptions): Daemon {
     ready,
     async stop() {
       stopped = true;
-      for (const t of pending.values()) clearTimeout(t);
+      if (burstTimer) clearTimeout(burstTimer);
+      burstTimer = undefined;
       pending.clear();
       if (watcher) await watcher.close();
       await chain.catch(() => {});

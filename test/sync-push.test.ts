@@ -9,7 +9,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { KernelClient } from "../src/client/kernel-client.js";
 import { openLocalClient } from "../src/client/local.js";
-import { type RemoteMap, pushPath } from "../src/sync/push.js";
+import { type RemoteMap, pushBurst, pushPath } from "../src/sync/push.js";
 import type { FileStore } from "../src/sync/reconcile.js";
 
 let client: KernelClient;
@@ -107,6 +107,95 @@ describe("pushPath — move (§4.7)", () => {
     expect(await push("new.md", store, map)).toBe("updated"); // move rides a put
     const cur = await client.docs.get("notes", "new.md");
     expect(cur.prev_version_id).toBe(v1.version_id); // identity preserved
+  });
+
+  it("a clean rename (same bytes, new path) still pushes a move", async () => {
+    const v1 = await client.docs.create("notes", "old.md", { body: "x\n", frontmatter_raw: "" });
+    const store = memStore({
+      "new.md": materialized(await client.docs.get_version("notes", v1.version_id)),
+    });
+    const map: RemoteMap = new Map([
+      ["old.md", { version_id: v1.version_id, content_hash: v1.content_hash }],
+    ]);
+    expect(await push("new.md", store, map)).toBe("updated");
+    const cur = await client.docs.get("notes", "new.md");
+    expect(cur.prev_version_id).toBe(v1.version_id);
+    expect(cur.body).toBe("x\n");
+    await expect(client.docs.get("notes", "old.md")).rejects.toThrow();
+    expect(map.has("old.md")).toBe(false);
+    expect(map.get("new.md")?.version_id).toBe(cur.version_id);
+  });
+
+  it("after a premature delete, a late add at the new path restores from :deleted", async () => {
+    const v1 = await client.docs.create("notes", "Untitled.md", {
+      body: "Gribblepibbly\n",
+      frontmatter_raw: "",
+    });
+    const renamed = materialized(await client.docs.get_version("notes", v1.version_id));
+    const store = memStore();
+    const map: RemoteMap = new Map([
+      ["Untitled.md", { version_id: v1.version_id, content_hash: v1.content_hash }],
+    ]);
+    expect(await push("Untitled.md", store, map)).toBe("deleted");
+    store.files.set("brand-new-idea.md", renamed);
+    expect(await push("brand-new-idea.md", store, map)).toBe("updated");
+    const cur = await client.docs.get("notes", "brand-new-idea.md");
+    expect(cur.body).toBe("Gribblepibbly\n");
+    await expect(client.docs.get("notes", "Untitled.md")).rejects.toThrow();
+  });
+
+  it("after a premature delete, a dirty late add restores with the new bytes", async () => {
+    const v1 = await client.docs.create("notes", "Untitled.md", {
+      body: "x\n",
+      frontmatter_raw: "",
+    });
+    const stamped = materialized(await client.docs.get_version("notes", v1.version_id));
+    const store = memStore();
+    const map: RemoteMap = new Map([
+      ["Untitled.md", { version_id: v1.version_id, content_hash: v1.content_hash }],
+    ]);
+    expect(await push("Untitled.md", store, map)).toBe("deleted");
+    store.files.set("brand-new-idea.md", stamped.replace("x", "Gribblepibbly"));
+    expect(await push("brand-new-idea.md", store, map)).toBe("updated");
+    const cur = await client.docs.get("notes", "brand-new-idea.md");
+    expect(cur.body).toBe("Gribblepibbly\n");
+  });
+});
+
+describe("pushBurst — rename pairing (§4.7)", () => {
+  it("unlink+add of the same identity in one burst is a move, not a delete", async () => {
+    const v1 = await client.docs.create("notes", "Untitled.md", {
+      body: "idea\n",
+      frontmatter_raw: "",
+    });
+    const text = materialized(await client.docs.get_version("notes", v1.version_id));
+    const store = memStore({ "brand-new-idea.md": text });
+    const map: RemoteMap = new Map([
+      ["Untitled.md", { version_id: v1.version_id, content_hash: v1.content_hash }],
+    ]);
+    // Unlink first in the array — burst must still process the dest before delete.
+    const results = await pushBurst(["Untitled.md", "brand-new-idea.md"], {
+      client,
+      store,
+      repo: "notes",
+      map,
+    });
+    expect(results).toContain("updated");
+    expect(results).not.toContain("deleted");
+    const cur = await client.docs.get("notes", "brand-new-idea.md");
+    expect(cur.prev_version_id).toBe(v1.version_id);
+    await expect(client.docs.get("notes", "Untitled.md")).rejects.toThrow();
+  });
+
+  it("a burst that is only an unlink still deletes", async () => {
+    const v = await client.docs.create("notes", "gone.md", { body: "x\n", frontmatter_raw: "" });
+    const store = memStore();
+    const map: RemoteMap = new Map([
+      ["gone.md", { version_id: v.version_id, content_hash: v.content_hash }],
+    ]);
+    const results = await pushBurst(["gone.md"], { client, store, repo: "notes", map });
+    expect(results).toEqual(["deleted"]);
+    await expect(client.docs.get("notes", "gone.md")).rejects.toThrow();
   });
 });
 

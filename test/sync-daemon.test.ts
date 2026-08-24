@@ -9,6 +9,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
   unlinkSync,
   writeFileSync,
@@ -160,6 +161,32 @@ describe("sync daemon", () => {
     // Give the startup path time to (not) materialize.
     await new Promise((r) => setTimeout(r, 300));
     expect(existsSync(join(vault, "server-only.md"))).toBe(false);
+  });
+
+  it("a local rename of a clean file is a move, not a delete", async () => {
+    const v1 = await client.docs.create("notes", "Untitled.md", {
+      body: "This is a brand new idea.\n",
+      frontmatter_raw: "",
+    });
+    daemon = await start();
+    await waitFor(() => {
+      try {
+        return readFileSync(join(vault, "Untitled.md"), "utf8").includes("$version");
+      } catch {
+        return false;
+      }
+    });
+    renameSync(join(vault, "Untitled.md"), join(vault, "brand-new-idea.md"));
+    const moved = await waitFor(async () => {
+      try {
+        return await client.docs.get("notes", "brand-new-idea.md");
+      } catch {
+        return undefined;
+      }
+    });
+    expect(moved.prev_version_id).toBe(v1.version_id);
+    expect(moved.body).toBe("This is a brand new idea.\n");
+    await expect(client.docs.get("notes", "Untitled.md")).rejects.toThrow();
   });
 
   it("with a marker present, pushes an offline local edit via the dirty walk", async () => {
