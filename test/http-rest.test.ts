@@ -211,12 +211,16 @@ describe("REST docs — content negotiation", () => {
     expect(await r.text()).toBe("---\nstatus: draft\n---\nhello m3\n");
   });
 
-  it("Accept: text/markdown (default) appends $version", async () => {
+  it("Accept: text/markdown (default) appends $version then $content_hash", async () => {
     const r = await fetch(`${base}/repos/notes/docs/hello.md`, {
       headers: { ...authHeaders(), Accept: "text/markdown" },
     });
     expect(r.status).toBe(200);
-    expect(await r.text()).toBe("---\nstatus: draft\n$version: v1\n---\nhello m3\n");
+    const text = await r.text();
+    // Both intrinsics are injected, $version before $content_hash (§2.4).
+    expect(text).toMatch(
+      /^---\nstatus: draft\n\$version: v1\n\$content_hash: [0-9a-f]{64}\n---\nhello m3\n$/,
+    );
   });
 
   it("Accept: application/json returns Version envelope", async () => {

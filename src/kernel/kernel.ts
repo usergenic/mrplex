@@ -27,6 +27,7 @@ import {
 import { bindDanglingToPath, reindexOutboundLinks } from "../links/maintain.js";
 import { planRepairs } from "../links/repair.js";
 import { findStaleLinks } from "../links/stale.js";
+import { contentHash } from "../markdown/content-hash.js";
 import type { RepoRow, Storage, VersionRow } from "../storage/types.js";
 import {
   type ClaimMatcher,
@@ -194,6 +195,9 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
       body: row.body,
       author: row.author,
       created_at: row.created_at,
+      // Pre-backfill rows (written before migration 0002) carry a null
+      // column; compute on the fly during the transition (§2.6).
+      content_hash: row.content_hash ?? contentHash(row.frontmatter_raw, row.body),
     };
   }
 

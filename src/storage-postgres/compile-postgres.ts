@@ -230,6 +230,8 @@ const INTRINSIC_COLUMNS: Record<string, string> = {
   // See compile-filter.ts for the $updated_at naming rationale.
   updated_at: "versions.created_at",
   body: "versions.body",
+  // Canonical content fingerprint (sync/history plan §2.5).
+  content_hash: "versions.content_hash",
 };
 
 function compileIntrinsic(mangledName: string): string {

@@ -64,6 +64,7 @@ const INTRINSIC_PROJECTORS: Record<string, (v: Version) => unknown> = {
   $updated_at: (v) => v.created_at,
   $author: (v) => v.author,
   $body: (v) => v.body,
+  $content_hash: (v) => v.content_hash,
 };
 
 /** Identity default — the cheapest useful projection (§2). */

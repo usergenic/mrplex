@@ -25,6 +25,7 @@ export type Version = {
   body: string;
   author: string; // opaque caller-supplied string (noauth plan §1)
   created_at: string; // ISO 8601 UTC
+  content_hash: string; // sha-256 of canonical content (sync/history plan §2)
 };
 
 export type PathWarning = {

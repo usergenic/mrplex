@@ -161,15 +161,17 @@ function queryCtx(ctx: CallContext, args: Record<string, unknown>): CallContext 
 }
 
 /**
- * Add `$version: <version_id>` to `frontmatter_raw` unless the caller asked
- * for raw output. Non-destructive — plain text append, no YAML round-trip.
+ * Append the injected system properties — `$version` then `$content_hash`, in
+ * fixed order (sync/history plan §2.4) — to `frontmatter_raw` unless the caller
+ * asked for raw output. Non-destructive — plain text append, no YAML round-trip.
+ * This is the linchpin of sync: a materialized file carries its own ancestry
+ * (`$version`) and clean-state fingerprint (`$content_hash`).
  */
-function withInjectedVersion(v: Version, raw: boolean): Version {
+function withInjectedSystemProps(v: Version, raw: boolean): Version {
   if (raw) return v;
-  return {
-    ...v,
-    frontmatter_raw: appendSystemProperty(v.frontmatter_raw, "version", v.version_id),
-  };
+  let frontmatter_raw = appendSystemProperty(v.frontmatter_raw, "version", v.version_id);
+  frontmatter_raw = appendSystemProperty(frontmatter_raw, "content_hash", v.content_hash);
+  return { ...v, frontmatter_raw };
 }
 
 // -----------------------------------------------------------------------------
@@ -593,7 +595,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
     outputSchema: VERSION_SCHEMA,
     handler: async (kernel, ctx, args) => {
       const v = await kernel.docs.get(ctx, argStr(args, "repo"), argStr(args, "path"));
-      const out = withInjectedVersion(v, args.raw === true);
+      const out = withInjectedSystemProps(v, args.raw === true);
       return { structured: out, text: renderVersion(out) };
     },
   },
@@ -619,7 +621,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
         argStr(args, "repo"),
         argStr(args, "version_id"),
       );
-      const out = withInjectedVersion(v, args.raw === true);
+      const out = withInjectedSystemProps(v, args.raw === true);
       return { structured: out, text: renderVersion(out) };
     },
   },
