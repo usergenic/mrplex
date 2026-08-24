@@ -1,9 +1,12 @@
 /**
  * The one persistent client state: a single cursor (sync/history plan §4.2).
- * `<root>/.mrplex/sync.json` holds `{ server, repo, last_synced_version_id }`,
- * meaning "every change at or before this position in the log is reflected on
- * disk." In-vault so it travels with the vault it describes. There is no
- * per-file database, manifest, or tombstone journal.
+ * `<root>/.mrplex/sync.json` holds `{ server | database, repo,
+ * last_synced_version_id }`, meaning "every change at or before this position
+ * in the log is reflected on disk." The source is recorded as exactly one of
+ * `server` (remote sync) or `database` (local sync) — they are mutually
+ * exclusive, mirroring the CLI's --server/--database gate. In-vault so it
+ * travels with the vault it describes. There is no per-file manifest or
+ * tombstone journal.
  */
 
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
@@ -12,9 +15,29 @@ import { CURSOR_FILE } from "./paths.js";
 
 export type SyncCursor = {
   server?: string;
+  database?: string;
   repo?: string;
   last_synced_version_id: string;
 };
+
+/**
+ * Resolve the cursor's source fields (§4.2). The source is exactly one of
+ * `server` (remote sync) or `database` (local sync); a set `server` always
+ * wins, otherwise a set `database` is recorded. When neither is supplied on
+ * this run, carry forward whatever the existing marker held so an incidental
+ * re-run (e.g. via a different code path) doesn't strip provenance.
+ */
+export function sourceFields(
+  server: string | undefined,
+  database: string | undefined,
+  existing: SyncCursor | null,
+): Pick<SyncCursor, "server" | "database"> {
+  if (server !== undefined) return { server };
+  if (database !== undefined) return { database };
+  if (existing?.server !== undefined) return { server: existing.server };
+  if (existing?.database !== undefined) return { database: existing.database };
+  return {};
+}
 
 /**
  * Read the cursor file, or null when absent (marker absent → full index

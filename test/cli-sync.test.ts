@@ -75,10 +75,13 @@ describe("mrplex sync --once", () => {
     expect(file).toContain("from server");
     expect(file).toMatch(/\$version: v\d+/);
     expect(file).toMatch(/\$content_hash: [0-9a-f]{64}/);
-    // Cursor persisted.
+    // Cursor persisted, with the local source recorded as `database` (and no
+    // stray `server` key — the source is exactly one of the two).
     const cursor = JSON.parse(readFileSync(join(vault, ".mrplex/sync.json"), "utf8"));
     expect(cursor.repo).toBe("notes");
     expect(cursor.last_synced_version_id).toMatch(/^v\d+$/);
+    expect(cursor.database).toBe(dbUrl);
+    expect(cursor.server).toBeUndefined();
   });
 
   it("pushes a new local file to the remote", () => {

@@ -5,7 +5,7 @@
  */
 
 import type { KernelClient } from "../client/kernel-client.js";
-import { readCursor, writeCursor } from "./cursor.js";
+import { readCursor, sourceFields, writeCursor } from "./cursor.js";
 import { applyFeed } from "./feed.js";
 import { createFsStore } from "./fs-store.js";
 import { makeScopeFilter } from "./paths.js";
@@ -15,6 +15,7 @@ export type SyncOnceOptions = {
   root: string;
   repo: string;
   server?: string;
+  database?: string;
   include?: string[];
   exclude?: string[];
   dryRun?: boolean;
@@ -53,9 +54,12 @@ export async function syncOnce(
   });
 
   // Persist the cursor only after all filesystem effects complete (§4.3).
+  // Record the source as exactly one of server/database, falling back to
+  // whichever the existing marker carried so an incidental re-run doesn't drop
+  // it. server/database are mutually exclusive, so a set server wins outright.
   const existing = await readCursor(opts.root);
   await writeCursor(opts.root, {
-    server: opts.server ?? existing?.server,
+    ...sourceFields(opts.server, opts.database, existing),
     repo: opts.repo,
     last_synced_version_id: cursor,
   });

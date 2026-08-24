@@ -171,6 +171,18 @@ function resolveServer(opts: GlobalOpts): string | undefined {
 }
 
 /**
+ * The sync cursor's source: exactly one of `server` (remote) or `database`
+ * (local), mirroring the --server/--database gate. A remote sync records the
+ * server URL; a local sync records the resolved database URL so the marker
+ * says where it came from.
+ */
+function resolveSyncSource(opts: GlobalOpts): { server: string } | { database: string } {
+  const server = resolveServer(opts);
+  if (server !== undefined) return { server };
+  return { database: resolveDatabase(opts) };
+}
+
+/**
  * The policy|unsafe gate (auth-shell plan decision 11). A server-starting
  * command demands EXACTLY ONE of --policy or --unsafe. Throws a cli_usage
  * error otherwise so the CLI exits non-zero with a clear message — the raw
@@ -1612,10 +1624,11 @@ function buildProgram(): Command {
 
       if (localOpts.once) {
         withClient(this, async (client, opts) => {
+          const source = resolveSyncSource(globals);
           const report = await syncOnce(client, {
             root,
             repo,
-            server: resolveServer(globals),
+            ...source,
             include: localOpts.include,
             exclude: localOpts.exclude,
             dryRun: localOpts.dryRun,
@@ -1641,7 +1654,7 @@ function buildProgram(): Command {
         const daemon = startDaemon(client, {
           root,
           repo,
-          server: resolveServer(globals),
+          ...resolveSyncSource(globals),
           include: localOpts.include,
           exclude: localOpts.exclude,
           intervalMs: localOpts.interval,

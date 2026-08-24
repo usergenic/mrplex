@@ -17,7 +17,7 @@
 import { watch } from "chokidar";
 import type { FSWatcher } from "chokidar";
 import type { KernelClient } from "../client/kernel-client.js";
-import { readCursor, writeCursor } from "./cursor.js";
+import { type SyncCursor, readCursor, sourceFields, writeCursor } from "./cursor.js";
 import { applyFeed } from "./feed.js";
 import { createFsStore } from "./fs-store.js";
 import { isIgnored, readFileIntrinsics } from "./intrinsics.js";
@@ -29,6 +29,7 @@ export type DaemonOptions = {
   root: string;
   repo: string;
   server?: string;
+  database?: string;
   include?: string[];
   exclude?: string[];
   intervalMs?: number;
@@ -60,7 +61,7 @@ export function startDaemon(client: KernelClient, opts: DaemonOptions): Daemon {
   let watcher: FSWatcher | undefined;
   const pending = new Map<string, NodeJS.Timeout>();
   let cursor = "";
-  let serverHint: string | undefined;
+  let existingCursor: SyncCursor | null = null;
   // Serialize all remote-touching work so a poll and a push never interleave a
   // read-modify-write on the same path.
   let chain: Promise<void> = Promise.resolve();
@@ -71,7 +72,7 @@ export function startDaemon(client: KernelClient, opts: DaemonOptions): Daemon {
 
   async function persistCursor(): Promise<void> {
     await writeCursor(opts.root, {
-      server: opts.server ?? serverHint,
+      ...sourceFields(opts.server, opts.database, existingCursor),
       repo: opts.repo,
       last_synced_version_id: cursor,
     });
@@ -132,7 +133,7 @@ export function startDaemon(client: KernelClient, opts: DaemonOptions): Daemon {
   const ready = (async () => {
     // 1. Startup is deterministic on the cursor marker (§4.9, §7).
     const existing = await readCursor(opts.root);
-    serverHint = existing?.server;
+    existingCursor = existing;
     // Seed the map from local provenance first, so the dirty walk's witnessed
     // deletes (and the feed's) know each file's prev_version_id.
     await seedMapFromLocal(store, scope, map);
