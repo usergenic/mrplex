@@ -167,7 +167,10 @@ function resolveDatabase(opts: GlobalOpts): string {
 function resolveServer(opts: GlobalOpts): string | undefined {
   const cfg = loadConfig();
   const value = opts.server ?? process.env.MRPLEX_SERVER ?? cfg.server;
-  return value;
+  // An empty value (e.g. `--server ""` to override an env/config default) means
+  // "no server" — the same falsy treatment openClient gives it. Normalize to
+  // undefined so downstream (source resolution, the mutex gate) sees it as unset.
+  return value ? value : undefined;
 }
 
 /**
