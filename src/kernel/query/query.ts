@@ -15,7 +15,7 @@ import { type ClaimMatcher, claimsGrantRepo, claimsToScopeGroups } from "../auth
 import { KernelError } from "../errors.js";
 import type { PathConfig } from "../path-config.js";
 import { effectivePathConfig, parseRepoOverride } from "../path-config.js";
-import type { Version } from "../wire.js";
+import type { QueryHit, Version } from "../wire.js";
 import type { CelExpr } from "./ast.js";
 import { parseCel } from "./cel-parse.js";
 
@@ -28,6 +28,13 @@ export type QuerySpec = {
   limit?: number;
   include_hidden?: boolean;
   include_system?: boolean;
+  /**
+   * Fields to project onto each hit (docs/query-select-plan.md). Names bare
+   * frontmatter keys (`title`) or `$`-intrinsics (`$path`, `$body`, …).
+   * Defaults to `["$path"]` — the identity you almost always want and the
+   * cheapest thing to return.
+   */
+  select?: string[];
 };
 
 const KNOWN_SPEC_FIELDS = new Set<keyof QuerySpec>([
@@ -38,7 +45,29 @@ const KNOWN_SPEC_FIELDS = new Set<keyof QuerySpec>([
   "limit",
   "include_hidden",
   "include_system",
+  "select",
 ]);
+
+/**
+ * Projectable `$`-intrinsics (docs/query-select-plan.md §3): the filter
+ * compilers' filterable columns (`$path`, `$updated_at`, `$body`) plus the
+ * version-identity fields that are projectable but not filterable. Each maps
+ * a `$name` to the value read off the already-built `Version` wire object.
+ * `select` validates against this registry and rejects unknown `$names`.
+ */
+const INTRINSIC_PROJECTORS: Record<string, (v: Version) => unknown> = {
+  $path: (v) => v.path,
+  $repo: (v) => v.repo,
+  $version_id: (v) => v.version_id,
+  $prev_version_id: (v) => v.prev_version_id,
+  $next_version_id: (v) => v.next_version_id,
+  $updated_at: (v) => v.created_at,
+  $author: (v) => v.author,
+  $body: (v) => v.body,
+};
+
+/** Identity default — the cheapest useful projection (§2). */
+const DEFAULT_SELECT = ["$path"] as const;
 
 export type QueryDeps = {
   storage: Storage;
@@ -62,8 +91,9 @@ export async function runQuery(
   claims: ClaimMatcher[] | null,
   spec: QuerySpec,
   deps: QueryDeps,
-): Promise<Version[]> {
+): Promise<QueryHit[]> {
   validateSpec(spec);
+  const select = spec.select ?? [...DEFAULT_SELECT];
 
   // 1. Resolve repos the caller can address.
   const reposById = new Map<number, RepoRow>();
@@ -140,12 +170,10 @@ export async function runQuery(
     };
     const rows = await deps.storage.versions_search(plan);
     rows.sort((a, b) => (scoreById.get(a.id) ?? 1) - (scoreById.get(b.id) ?? 1));
-    return Promise.all(
-      rows.slice(0, userLimit).map((row) => {
-        const repoSlug = (reposById.get(row.repo_id) as RepoRow).slug;
-        return deps.toVersionWire(row, repoSlug);
-      }),
-    );
+    return rows.slice(0, userLimit).map((row) => {
+      const repoSlug = (reposById.get(row.repo_id) as RepoRow).slug;
+      return projectHit(deps.toVersionWire(row, repoSlug), select);
+    });
   }
 
   // 6. Non-rank path.
@@ -159,12 +187,28 @@ export async function runQuery(
   };
   const rows = await deps.storage.versions_search(plan);
 
-  return Promise.all(
-    rows.map((row) => {
-      const repoSlug = (reposById.get(row.repo_id) as RepoRow).slug;
-      return deps.toVersionWire(row, repoSlug);
-    }),
-  );
+  return rows.map((row) => {
+    const repoSlug = (reposById.get(row.repo_id) as RepoRow).slug;
+    return projectHit(deps.toVersionWire(row, repoSlug), select);
+  });
+}
+
+/**
+ * Project a full `Version` wire object down to a lean `QueryHit` per the
+ * `select` field list. `$`-prefixed names read intrinsics from the registry;
+ * bare names read frontmatter (a missing key is simply absent, matching
+ * `graph`'s `select`). Order follows `select` for deterministic key order.
+ */
+function projectHit(v: Version, select: readonly string[]): QueryHit {
+  const hit: QueryHit = {};
+  for (const name of select) {
+    if (name.startsWith("$")) {
+      hit[name as `$${string}`] = INTRINSIC_PROJECTORS[name]!(v);
+    } else if (v.frontmatter[name] !== undefined) {
+      hit[name] = v.frontmatter[name];
+    }
+  }
+  return hit;
 }
 
 // -----------------------------------------------------------------------------
@@ -191,6 +235,21 @@ function validateSpec(spec: QuerySpec): void {
       throw new KernelError("filter_invalid", {
         reason: `invalid limit: ${JSON.stringify(spec.limit)}`,
       });
+    }
+  }
+  if (spec.select !== undefined) {
+    if (!Array.isArray(spec.select) || spec.select.some((s) => typeof s !== "string")) {
+      throw new KernelError("filter_invalid", { reason: "select must be an array of strings" });
+    }
+    for (const name of spec.select) {
+      if (name.startsWith("$") && !(name in INTRINSIC_PROJECTORS)) {
+        // Derive the "expected" list from the registry so the message can't
+        // drift from the code (mirrors the filter compiler's intrinsic error).
+        const expected = Object.keys(INTRINSIC_PROJECTORS).join(", ");
+        throw new KernelError("filter_invalid", {
+          reason: `unknown intrinsic ${name} in select (expected ${expected})`,
+        });
+      }
     }
   }
 }

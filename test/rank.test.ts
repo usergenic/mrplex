@@ -89,7 +89,7 @@ describe("query — rank", () => {
       queryEmbed: async () => ({ vector: [0.9, 0.1, 0], model: "test-3d", dim: 3 }),
     });
     const rows = await kernel.query(admin, { repo: "notes", rank: "close to x" });
-    expect(rows.map((r) => r.path)).toEqual(["x.md", "y.md", "z.md"]);
+    expect(rows.map((r) => r.$path)).toEqual(["x.md", "y.md", "z.md"]);
   });
 
   it("intersects with filter (excluded rows disappear)", async () => {
@@ -124,10 +124,10 @@ describe("query — rank", () => {
     });
     // Only a.md is under model-a, so rank returns just that.
     const rankRows = await kernel.query(admin, { repo: "notes", rank: "x" });
-    expect(rankRows.map((r) => r.path)).toEqual(["a.md"]);
+    expect(rankRows.map((r) => r.$path)).toEqual(["a.md"]);
     // But filter-only sees both.
     const allRows = await kernel.query(admin, { repo: "notes" });
-    expect(allRows.map((r) => r.path).sort()).toEqual(["a.md", "b.md"]);
+    expect(allRows.map((r) => r.$path).sort()).toEqual(["a.md", "b.md"]);
   });
 
   it("system-namespace paths stay hidden from rank by default", async () => {
@@ -180,7 +180,7 @@ describe("query — rank", () => {
       include_system: true,
     });
     expect(withSystem.length).toBe(1);
-    expect(withSystem[0]?.path).toMatch(/^:deleted\//);
+    expect(withSystem[0]?.$path).toMatch(/^:deleted\//);
   });
 
   it("hook error at query time → rank_unavailable with cause", async () => {

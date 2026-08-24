@@ -66,11 +66,11 @@ export async function seededSession(
     repo: repoSlug,
     async query(filter) {
       const rows = await kernel.query(actor, { repo: repoSlug, filter, limit: 1000 });
-      return rows.map((r) => r.path).sort();
+      return rows.map((r) => r.$path as string).sort();
     },
     async textSearch(text) {
       const rows = await kernel.query(actor, { repo: repoSlug, text, limit: 1000 });
-      return rows.map((r) => r.path).sort();
+      return rows.map((r) => r.$path as string).sort();
     },
     async cleanup() {
       await storage.close();

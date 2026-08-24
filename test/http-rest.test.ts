@@ -430,6 +430,23 @@ describe("REST query", () => {
     expect(r.status).toBe(200);
     expect((await readJson<unknown[]>(r)).length).toBe(1);
   });
+
+  it("select: GET repeated param and POST body array project the same hit", async () => {
+    const getR = await fetch(`${base}/query?repo=notes&select=$path&select=status`, {
+      headers: authHeaders(),
+    });
+    expect(getR.status).toBe(200);
+    const getRows = await readJson<Record<string, unknown>[]>(getR);
+    expect(getRows).toEqual([{ $path: "a.md", status: "draft" }]);
+
+    const postR = await fetch(`${base}/query`, {
+      method: "POST",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ repo: "notes", select: ["$path", "status"] }),
+    });
+    expect(postR.status).toBe(200);
+    expect(await readJson<Record<string, unknown>[]>(postR)).toEqual(getRows);
+  });
 });
 
 describe("REST graph", () => {
@@ -527,8 +544,8 @@ describe("REST scope header", () => {
       headers: { "X-Mrplex-Scope": scope },
     });
     expect(r.status).toBe(200);
-    const rows = await readJson<{ path: string }[]>(r);
-    expect(rows.map((x) => x.path)).toEqual(["public.md"]);
+    const rows = await readJson<{ $path: string }[]>(r);
+    expect(rows.map((x) => x.$path)).toEqual(["public.md"]);
   });
 
   it("a malformed X-Mrplex-Scope → 400 filter_invalid", async () => {

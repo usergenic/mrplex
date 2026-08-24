@@ -337,7 +337,7 @@ export function runKernelSuite(factory: AdapterFactory): void {
           repo: "notes",
           filter: 'status == "draft" && "pricing" in list(tags)',
         });
-        expect(rows.map((r) => r.path).sort()).toEqual(["one.md", "two.md"]);
+        expect(rows.map((r) => r.$path).sort()).toEqual(["one.md", "two.md"]);
       });
 
       it("$path intrinsic", async () => {
@@ -354,7 +354,7 @@ export function runKernelSuite(factory: AdapterFactory): void {
           repo: "notes",
           filter: '$path.startsWith("drafts/")',
         });
-        expect(rows.map((r) => r.path)).toEqual(["drafts/x.md"]);
+        expect(rows.map((r) => r.$path)).toEqual(["drafts/x.md"]);
       });
 
       it("missing frontmatter key → predicate false", async () => {
@@ -394,7 +394,7 @@ export function runKernelSuite(factory: AdapterFactory): void {
       it("bare word matches any document containing that term", async () => {
         const actor = await aliceActor();
         const rows = await kernel.query(actor, { repo: "notes", text: "quick" });
-        expect(rows.map((r) => r.path).sort()).toEqual(["a.md", "c.md"]);
+        expect(rows.map((r) => r.$path).sort()).toEqual(["a.md", "c.md"]);
       });
 
       it("quoted phrase matches only adjacent occurrences", async () => {
@@ -403,7 +403,7 @@ export function runKernelSuite(factory: AdapterFactory): void {
           repo: "notes",
           text: '"quick brown"',
         });
-        expect(rows.map((r) => r.path)).toEqual(["a.md"]);
+        expect(rows.map((r) => r.$path)).toEqual(["a.md"]);
       });
 
       it("stem-neutral: fox / foxes both hit under both engines", async () => {
@@ -411,7 +411,7 @@ export function runKernelSuite(factory: AdapterFactory): void {
         const rows = await kernel.query(actor, { repo: "notes", text: "fox" });
         // SQLite porter stems "foxes" → "fox"; PG english snowball
         // does the same. Any doc mentioning either form matches.
-        expect(rows.map((r) => r.path).sort()).toEqual(["a.md", "c.md"]);
+        expect(rows.map((r) => r.$path).sort()).toEqual(["a.md", "c.md"]);
       });
     });
 
@@ -448,7 +448,7 @@ export function runKernelSuite(factory: AdapterFactory): void {
           queryEmbed: async () => ({ vector: [0.9, 0.1, 0], model, dim: 3 }),
         });
         const rows = await rankKernel.query(actor, { repo: "notes", rank: "close to x" });
-        expect(rows.map((r) => r.path)).toEqual(["x.md", "y.md", "z.md"]);
+        expect(rows.map((r) => r.$path)).toEqual(["x.md", "y.md", "z.md"]);
       });
 
       it("rank without a hook → rank_unavailable", async () => {
@@ -473,7 +473,7 @@ export function runKernelSuite(factory: AdapterFactory): void {
         });
         const scoped: CallContext = { scope: [{ repo: "notes", paths: ["public.md"] }] };
         const rows = await kernel.query(scoped, { repo: "notes" });
-        expect(rows.map((r) => r.path)).toEqual(["public.md"]);
+        expect(rows.map((r) => r.$path)).toEqual(["public.md"]);
       });
 
       it("an empty scope array → empty result (deny_all), never a 403", async () => {
@@ -660,7 +660,7 @@ export function runKernelSuite(factory: AdapterFactory): void {
         return kernel.docs.create(actor, "notes", path, { ...fm, body });
       };
       const paths = async (actor: CallContext, filter: string) =>
-        (await kernel.query(actor, { repo: "notes", filter })).map((v) => v.path).sort();
+        (await kernel.query(actor, { repo: "notes", filter })).map((v) => v.$path).sort();
 
       it("extracts + resolves an inline link on write", async () => {
         const actor = await aliceActor();
@@ -774,7 +774,7 @@ export function runKernelSuite(factory: AdapterFactory): void {
         await mk(actor, "alice.md", "a");
         await mk(actor, "moc.md", "[[alice]]");
         const bare = (await kernel.query(actor, { repo: "notes", filter: '$in("moc.md")' })).map(
-          (v) => v.path,
+          (v) => v.$path,
         );
         expect(bare).toEqual(["alice.md"]);
       });

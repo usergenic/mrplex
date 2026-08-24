@@ -86,15 +86,15 @@ describe("cli query", () => {
   it("filter only — CEL predicate over frontmatter", async () => {
     const out = run("--json", "query", "--repo", "notes", "--filter", 'status == "published"');
     expect(out.status).toBe(0);
-    const results = JSON.parse(out.stdout) as { path: string }[];
-    expect(results.map((r) => r.path)).toEqual(["pricing.md"]);
+    const results = JSON.parse(out.stdout) as { $path: string }[];
+    expect(results.map((r) => r.$path)).toEqual(["pricing.md"]);
   });
 
   it("text only — FTS", async () => {
     const out = run("--json", "query", "--repo", "notes", "--text", "welcome");
     expect(out.status).toBe(0);
-    const results = JSON.parse(out.stdout) as { path: string }[];
-    expect(results.map((r) => r.path)).toEqual(["welcome.md"]);
+    const results = JSON.parse(out.stdout) as { $path: string }[];
+    expect(results.map((r) => r.$path)).toEqual(["welcome.md"]);
   });
 
   it("filter + text compose via AND", async () => {
@@ -109,15 +109,15 @@ describe("cli query", () => {
       "details",
     );
     expect(out.status).toBe(0);
-    const results = JSON.parse(out.stdout) as { path: string }[];
-    expect(results.map((r) => r.path)).toEqual(["pricing.md"]);
+    const results = JSON.parse(out.stdout) as { $path: string }[];
+    expect(results.map((r) => r.$path)).toEqual(["pricing.md"]);
   });
 
   it('list() polymorphism — "guide" in list(tags) matches both scalar and list shapes', async () => {
     const out = run("--json", "query", "--repo", "notes", "--filter", '"guide" in list(tags)');
     expect(out.status).toBe(0);
-    const results = JSON.parse(out.stdout) as { path: string }[];
-    expect(results.map((r) => r.path)).toEqual(["guides/getting-started.md"]);
+    const results = JSON.parse(out.stdout) as { $path: string }[];
+    expect(results.map((r) => r.$path)).toEqual(["guides/getting-started.md"]);
   });
 
   it("$path intrinsic", async () => {
@@ -130,29 +130,29 @@ describe("cli query", () => {
       '$path.startsWith("guides/")',
     );
     expect(out.status).toBe(0);
-    const results = JSON.parse(out.stdout) as { path: string }[];
-    expect(results.map((r) => r.path)).toEqual(["guides/getting-started.md"]);
+    const results = JSON.parse(out.stdout) as { $path: string }[];
+    expect(results.map((r) => r.$path)).toEqual(["guides/getting-started.md"]);
   });
 
   it("--path bare basename matches at any depth", async () => {
     const out = run("--json", "query", "--repo", "notes", "--path", "getting-started.md");
     expect(out.status).toBe(0);
-    const results = JSON.parse(out.stdout) as { path: string }[];
-    expect(results.map((r) => r.path)).toEqual(["guides/getting-started.md"]);
+    const results = JSON.parse(out.stdout) as { $path: string }[];
+    expect(results.map((r) => r.$path)).toEqual(["guides/getting-started.md"]);
   });
 
   it("--path leading / anchors to root", async () => {
     const out = run("--json", "query", "--repo", "notes", "--path", "/welcome.md");
     expect(out.status).toBe(0);
-    const results = JSON.parse(out.stdout) as { path: string }[];
-    expect(results.map((r) => r.path)).toEqual(["welcome.md"]);
+    const results = JSON.parse(out.stdout) as { $path: string }[];
+    expect(results.map((r) => r.$path)).toEqual(["welcome.md"]);
   });
 
   it("--path segment glob does not cross /", async () => {
     const out = run("--json", "query", "--repo", "notes", "--path", "guides/*");
     expect(out.status).toBe(0);
-    const results = JSON.parse(out.stdout) as { path: string }[];
-    expect(results.map((r) => r.path)).toEqual(["guides/getting-started.md"]);
+    const results = JSON.parse(out.stdout) as { $path: string }[];
+    expect(results.map((r) => r.$path)).toEqual(["guides/getting-started.md"]);
   });
 
   it("--path composes with --filter via AND", async () => {
@@ -167,8 +167,8 @@ describe("cli query", () => {
       'status == "published"',
     );
     expect(out.status).toBe(0);
-    const results = JSON.parse(out.stdout) as { path: string }[];
-    expect(results.map((r) => r.path)).toEqual(["pricing.md"]);
+    const results = JSON.parse(out.stdout) as { $path: string }[];
+    expect(results.map((r) => r.$path)).toEqual(["pricing.md"]);
   });
 
   it("--limit caps results", async () => {
@@ -184,12 +184,32 @@ describe("cli query", () => {
     expect(out.stderr).toMatch(/positive integer/);
   });
 
-  it("pretty output renders a table", async () => {
+  it("pretty output renders a table with the projected columns", async () => {
     const out = run("query", "--repo", "notes", "--filter", 'status == "published"');
     expect(out.status).toBe(0);
-    expect(out.stdout).toContain("REPO");
-    expect(out.stdout).toContain("PATH");
+    // Default projection is $path only, so that's the single column header.
+    expect(out.stdout).toContain("$path");
     expect(out.stdout).toContain("pricing.md");
+  });
+
+  it("--select projects the named columns (repeatable)", async () => {
+    const out = run(
+      "--json",
+      "query",
+      "--repo",
+      "notes",
+      "--filter",
+      'status == "published"',
+      "-s",
+      "$path",
+      "-s",
+      "$repo",
+      "-s",
+      "status",
+    );
+    expect(out.status).toBe(0);
+    const results = JSON.parse(out.stdout) as Record<string, unknown>[];
+    expect(results).toEqual([{ $path: "pricing.md", $repo: "notes", status: "published" }]);
   });
 
   it("malformed CEL returns filter_invalid, exit 1", async () => {

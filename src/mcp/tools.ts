@@ -26,6 +26,7 @@ import { QUERY_SYNTAX_DOC } from "./query-syntax.js";
 import {
   renderGraphSummary,
   renderJson,
+  renderQueryHitList,
   renderRepoList,
   renderVersion,
   renderVersionList,
@@ -331,6 +332,18 @@ const SET_LINK_CONFIG_RESULT_SCHEMA: JsonSchema = {
     reindexed: LINKS_BACKFILL_SCHEMA,
   },
   required: ["repo", "reindexed"],
+};
+
+const QUERY_HIT_SCHEMA: JsonSchemaProp = {
+  type: "object",
+  description:
+    "A projected query hit (docs/query-select-plan.md). `$`-keys are system intrinsics selected " +
+    "via `select` ($path, $repo, $version_id, $prev_version_id, $next_version_id, $updated_at, " +
+    "$author, $body); any other keys are `select`-projected frontmatter. A key appears only when " +
+    "selected (and, for frontmatter, present). Default `select` yields just `$path`.",
+  // Which keys appear depends entirely on `select`, so none are required and
+  // both intrinsics and bare frontmatter keys ride additionalProperties.
+  additionalProperties: true,
 };
 
 const GRAPH_DOCUMENT_SCHEMA: JsonSchemaProp = {
@@ -841,9 +854,9 @@ export const TOOL_REGISTRY: ToolEntry[] = [
     description:
       "Query documents. Three composable modes that intersect when combined: `filter` (a CEL " +
       "boolean expression over frontmatter fields and $-prefixed intrinsics), `text` (full-text " +
-      "search over bodies), and `rank` (semantic similarity via embeddings). Returns current " +
-      "versions only, ordered by rank score, else text relevance, else last-update time " +
-      "descending. Filter examples: " +
+      "search over bodies), and `rank` (semantic similarity via embeddings). Returns lean " +
+      "projected hits (see `select`) for current versions only, ordered by rank score, else text " +
+      "relevance, else last-update time descending. Filter examples: " +
       `status == "published" && "pricing" in list(tags)` +
       " (list() matches scalar-or-list frontmatter uniformly) — " +
       `$path.startsWith("guides/")` +
@@ -895,6 +908,15 @@ export const TOOL_REGISTRY: ToolEntry[] = [
             "Include docs under system path segments (e.g. `:deleted/…`) — how you browse " +
             "trash to find documents to restore.",
         },
+        select: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            'Fields to project onto each hit (default ["$path"]). Bare keys name frontmatter ' +
+            "(a missing key is simply absent); `$`-intrinsics name system fields: $path, $repo, " +
+            "$version_id, $prev_version_id, $next_version_id, $updated_at, $author, $body. Document " +
+            "bodies travel only when `$body` is selected — this is how you list without shipping content.",
+        },
         scope: {
           type: "array",
           description:
@@ -903,13 +925,13 @@ export const TOOL_REGISTRY: ToolEntry[] = [
         },
       },
     },
-    outputSchema: listResultSchema(VERSION_SCHEMA, "Matching current document versions."),
+    outputSchema: listResultSchema(QUERY_HIT_SCHEMA, "Matching current documents, projected."),
     handler: async (kernel, ctx, args) => {
       const { scope: _scope, ...specArgs } = args;
       const spec = specArgs as QuerySpec;
       try {
         const rows = await kernel.query(queryCtx(ctx, args), spec);
-        return { structured: wrapList(rows), text: renderVersionList(rows) };
+        return { structured: wrapList(rows), text: renderQueryHitList(rows) };
       } catch (err) {
         // Teach through the error: a bad filter is the moment the caller
         // most wants the language reference.

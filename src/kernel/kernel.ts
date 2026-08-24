@@ -56,7 +56,7 @@ import {
 import { type QuerySpec, runQuery } from "./query/query.js";
 import { validatePath, validateSlug } from "./validation.js";
 import { decodeVersionId, encodeVersionId } from "./version-id.js";
-import type { GraphResult, GraphSpec, PathWarning, Repo, Version } from "./wire.js";
+import type { GraphResult, GraphSpec, PathWarning, QueryHit, Repo, Version } from "./wire.js";
 
 export type HistoryOptions = { limit?: number; before?: string };
 
@@ -144,7 +144,7 @@ export type Kernel = {
     /** Rewrite stale link text as optimistic docs.put; dry_run plans only. */
     repair(ctx: CallContext, repo: string, opts?: { dry_run?: boolean }): Promise<RepairResult>;
   };
-  query(ctx: CallContext, spec: QuerySpec): Promise<Version[]>;
+  query(ctx: CallContext, spec: QuerySpec): Promise<QueryHit[]>;
   /** Neighborhood expansion over the links index (docs/graph-plan.md). */
   graph(ctx: CallContext, spec: GraphSpec): Promise<GraphResult>;
 };
@@ -679,7 +679,7 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
       },
     },
 
-    async query(ctx: CallContext, spec: QuerySpec): Promise<Version[]> {
+    async query(ctx: CallContext, spec: QuerySpec): Promise<QueryHit[]> {
       return runQuery(claimsFor(ctx), spec, {
         storage,
         serverPathConfig,
