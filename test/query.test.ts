@@ -55,7 +55,7 @@ describe("query — filter mode", () => {
       repo: "notes",
       filter: 'status == "draft"',
     });
-    expect(results.map((v) => v.path).sort()).toEqual(["a.md", "c.md"]);
+    expect(results.map((v) => v.$path).sort()).toEqual(["a.md", "c.md"]);
   });
 
   it("supports the design's §5.1 example — status && list membership", async () => {
@@ -66,7 +66,7 @@ describe("query — filter mode", () => {
       repo: "notes",
       filter: 'status == "draft" && "pricing" in list(tags)',
     });
-    expect(results.map((v) => v.path)).toEqual(["one.md"]);
+    expect(results.map((v) => v.$path)).toEqual(["one.md"]);
   });
 
   it("$path intrinsic", async () => {
@@ -76,7 +76,7 @@ describe("query — filter mode", () => {
       repo: "notes",
       filter: '$path.startsWith("drafts/")',
     });
-    expect(results.map((v) => v.path)).toEqual(["drafts/one.md"]);
+    expect(results.map((v) => v.$path)).toEqual(["drafts/one.md"]);
   });
 });
 
@@ -90,7 +90,7 @@ describe("query — text mode", () => {
     await seedDoc("notes", "b.md", {}, "Nothing to see here");
     await seedDoc("notes", "c.md", {}, "another quick note");
     const results = await kernel.query(admin, { repo: "notes", text: "quick" });
-    expect(results.map((v) => v.path).sort()).toEqual(["a.md", "c.md"]);
+    expect(results.map((v) => v.$path).sort()).toEqual(["a.md", "c.md"]);
   });
 
   it("filter + text compose via AND", async () => {
@@ -102,7 +102,7 @@ describe("query — text mode", () => {
       filter: 'status == "draft"',
       text: "quick",
     });
-    expect(results.map((v) => v.path)).toEqual(["a.md"]);
+    expect(results.map((v) => v.$path)).toEqual(["a.md"]);
   });
 
   it("returns [] when the FTS query matches nothing", async () => {
@@ -121,14 +121,14 @@ describe("query — sigil exclusion", () => {
     await seedDoc("notes", "visible.md", {}, "");
     await seedDoc("notes", ".obsidian/config.md", {}, "");
     const results = await kernel.query(admin, { repo: "notes" });
-    expect(results.map((v) => v.path)).toEqual(["visible.md"]);
+    expect(results.map((v) => v.$path)).toEqual(["visible.md"]);
   });
 
   it("include_hidden surfaces .-prefixed paths", async () => {
     await seedDoc("notes", "visible.md", {}, "");
     await seedDoc("notes", ".obsidian/config.md", {}, "");
     const results = await kernel.query(admin, { repo: "notes", include_hidden: true });
-    expect(results.map((v) => v.path).sort()).toEqual([".obsidian/config.md", "visible.md"]);
+    expect(results.map((v) => v.$path).sort()).toEqual([".obsidian/config.md", "visible.md"]);
   });
 
   it("hides system-sigil paths (trashed docs) by default", async () => {
@@ -141,7 +141,7 @@ describe("query — sigil exclusion", () => {
     const results = await kernel.query(admin, { repo: "notes" });
     expect(results).toEqual([]);
     const withSystem = await kernel.query(admin, { repo: "notes", include_system: true });
-    expect(withSystem.map((v) => v.path)).toEqual([
+    expect(withSystem.map((v) => v.$path)).toEqual([
       expect.stringMatching(/^:deleted\/hello-v\d+\.md$/),
     ]);
   });
@@ -159,14 +159,14 @@ describe("query — scope filter (§8.2)", () => {
       scope: [{ repo: "notes", paths: ["public.md"] }],
     };
     const results = await kernel.query(scoped, { repo: "notes" });
-    expect(results.map((v) => v.path)).toEqual(["public.md"]);
+    expect(results.map((v) => v.$path)).toEqual(["public.md"]);
   });
 
   it("absent scope sees everything", async () => {
     await seedDoc("notes", "a.md", {}, "");
     await seedDoc("notes", "b.md", {}, "");
     const results = await kernel.query(admin, { repo: "notes" });
-    expect(results.map((v) => v.path).sort()).toEqual(["a.md", "b.md"]);
+    expect(results.map((v) => v.$path).sort()).toEqual(["a.md", "b.md"]);
   });
 
   it("scope filter honors ! negation with last-match-wins semantics", async () => {
@@ -177,7 +177,7 @@ describe("query — scope filter (§8.2)", () => {
       scope: [{ repo: "notes", paths: ["drafts/**", "!drafts/pinned/**"] }],
     };
     const results = await kernel.query(scoped, { repo: "notes" });
-    expect(results.map((v) => v.path).sort()).toEqual(["drafts/one.md", "drafts/three.md"]);
+    expect(results.map((v) => v.$path).sort()).toEqual(["drafts/one.md", "drafts/three.md"]);
   });
 
   it("scope filter respects limit under narrow scope (no silent under-count)", async () => {
@@ -192,7 +192,7 @@ describe("query — scope filter (§8.2)", () => {
     };
     const results = await kernel.query(scoped, { repo: "notes", limit: 5 });
     expect(results).toHaveLength(5);
-    expect(results.every((v) => v.path.startsWith("in/"))).toBe(true);
+    expect(results.every((v) => (v.$path as string).startsWith("in/"))).toBe(true);
   });
 });
 
@@ -215,7 +215,7 @@ describe("query — per-repo sigil exclusion", () => {
     // On notes (server default hidden=["."]), the _-prefixed file is NOT
     // hidden. On custom (override hidden=[".","_"]), it IS hidden.
     const notesResults = await kernel.query(admin, { repo: "notes" });
-    expect(notesResults.map((v) => v.path)).toEqual(["_notes_hidden_by_custom_only.md"]);
+    expect(notesResults.map((v) => v.$path)).toEqual(["_notes_hidden_by_custom_only.md"]);
     const customResults = await kernel.query(admin, { repo: "custom" });
     expect(customResults).toEqual([]);
   });
@@ -235,8 +235,9 @@ describe("query — multi-repo", () => {
     const results = await kernel.query(admin, {
       repo: "team-*",
       filter: "pinned == true",
+      select: ["$repo", "$path"],
     });
-    expect(results.map((v) => `${v.repo}/${v.path}`).sort()).toEqual([
+    expect(results.map((v) => `${v.$repo}/${v.$path}`).sort()).toEqual([
       "team-alpha/one.md",
       "team-beta/two.md",
     ]);
@@ -246,8 +247,8 @@ describe("query — multi-repo", () => {
     await storage.repos_create({ slug: "other", created_at: "2026-08-14T00:00:01Z" });
     await seedDoc("notes", "n1.md", {}, "unique1");
     await seedDoc("other", "o1.md", {}, "unique1");
-    const results = await kernel.query(admin, { text: "unique1" });
-    expect(results.map((v) => v.repo).sort()).toEqual(["notes", "other"]);
+    const results = await kernel.query(admin, { text: "unique1", select: ["$repo"] });
+    expect(results.map((v) => v.$repo).sort()).toEqual(["notes", "other"]);
   });
 });
 
@@ -261,8 +262,8 @@ describe("query — ordering + limit", () => {
     const v1 = await seedDoc("notes", "a.md", {}, "");
     const v2 = await seedDoc("notes", "b.md", {}, "");
     const v3 = await seedDoc("notes", "c.md", {}, "");
-    const results = await kernel.query(admin, { repo: "notes" });
-    expect(results.map((v) => v.version_id)).toEqual([v3, v2, v1]);
+    const results = await kernel.query(admin, { repo: "notes", select: ["$version_id"] });
+    expect(results.map((v) => v.$version_id)).toEqual([v3, v2, v1]);
   });
 
   it("respects limit", async () => {
@@ -276,6 +277,74 @@ describe("query — ordering + limit", () => {
   it("limit=0 returns []", async () => {
     await seedDoc("notes", "a.md", {}, "");
     expect(await kernel.query(admin, { repo: "notes", limit: 0 })).toEqual([]);
+  });
+});
+
+// -----------------------------------------------------------------------------
+// select projection (docs/query-select-plan.md)
+// -----------------------------------------------------------------------------
+
+describe("query — select projection", () => {
+  it("defaults to exactly { $path } per hit", async () => {
+    await seedDoc("notes", "a.md", { title: "A", status: "draft" }, "body text");
+    const results = await kernel.query(admin, { repo: "notes" });
+    expect(results).toEqual([{ $path: "a.md" }]);
+  });
+
+  it("projects intrinsics and bare frontmatter keys", async () => {
+    await seedDoc("notes", "a.md", { title: "A", status: "draft" }, "");
+    const [hit] = await kernel.query(admin, {
+      repo: "notes",
+      select: ["$path", "$repo", "title", "status"],
+    });
+    expect(hit).toEqual({ $path: "a.md", $repo: "notes", title: "A", status: "draft" });
+  });
+
+  it("$body is returned only when selected", async () => {
+    await seedDoc("notes", "a.md", {}, "the body");
+    const [defaultHit] = await kernel.query(admin, { repo: "notes" });
+    expect(defaultHit).not.toHaveProperty("$body");
+    const [bodyHit] = await kernel.query(admin, { repo: "notes", select: ["$path", "$body"] });
+    expect(bodyHit).toEqual({ $path: "a.md", $body: "the body" });
+  });
+
+  it("a frontmatter key named path/repo coexists with $path/$repo", async () => {
+    // The whole point of the $-sigil: a user key literally named `path` must
+    // not collide with the system's `$path`.
+    await seedDoc("notes", "a.md", { path: "user-authored", repo: "user-repo" }, "");
+    const [hit] = await kernel.query(admin, {
+      repo: "notes",
+      select: ["$path", "$repo", "path", "repo"],
+    });
+    expect(hit).toEqual({
+      $path: "a.md",
+      $repo: "notes",
+      path: "user-authored",
+      repo: "user-repo",
+    });
+  });
+
+  it("a missing frontmatter key is simply absent from the hit", async () => {
+    await seedDoc("notes", "a.md", { title: "A" }, "");
+    const [hit] = await kernel.query(admin, {
+      repo: "notes",
+      select: ["$path", "title", "nonexistent"],
+    });
+    expect(hit).toEqual({ $path: "a.md", title: "A" });
+  });
+
+  it("an unknown $name in select is a filter_invalid with the registry-derived message", async () => {
+    try {
+      await kernel.query(admin, { repo: "notes", select: ["$bogus"] });
+      throw new Error("expected throw");
+    } catch (err) {
+      expect((err as KernelError).code).toBe("filter_invalid");
+      const data = (err as KernelError<{ reason: string }>).data;
+      expect(data.reason).toContain("$bogus");
+      // The "expected …" list is derived from the projector registry.
+      expect(data.reason).toContain("$path");
+      expect(data.reason).toContain("$body");
+    }
   });
 });
 
@@ -363,6 +432,6 @@ describe("query — validation", () => {
   it("empty context is trusted end-to-end", async () => {
     await seedDoc("notes", "a.md", {}, "");
     const results = await kernel.query({}, { repo: "notes" });
-    expect(results.map((v) => v.path)).toEqual(["a.md"]);
+    expect(results.map((v) => v.$path)).toEqual(["a.md"]);
   });
 });

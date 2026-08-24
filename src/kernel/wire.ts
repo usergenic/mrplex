@@ -33,6 +33,19 @@ export type PathWarning = {
   reason: string;
 };
 
+/**
+ * A projected `query` hit (docs/query-select-plan.md). `query` names the
+ * fields it wants via `select` and gets back these lean objects rather than
+ * full `Version` rows. Following `GraphDocument`'s precedent, any field that
+ * isn't user-authored frontmatter carries the `$` sigil, so a document whose
+ * frontmatter literally contains a key named `path`/`repo` still round-trips
+ * without colliding with the system's `$path`/`$repo`.
+ */
+export type QueryHit = {
+  [intrinsic: `$${string}`]: unknown; // $path, $version_id, $repo, …
+  [frontmatterKey: string]: unknown; // bare select-ed frontmatter keys
+};
+
 // -----------------------------------------------------------------------------
 // Graph read surface (docs/graph-plan.md). The API transacts in documents and
 // links — no "nodes"/"edges" anywhere on the wire.

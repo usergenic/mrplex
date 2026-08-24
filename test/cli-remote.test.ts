@@ -167,7 +167,7 @@ describe("CLI --server round-trip", () => {
     expect(r.status).toBe(0);
     const parsed = JSON.parse(r.stdout);
     expect(parsed.length).toBe(1);
-    expect(parsed[0].path).toBe("a.md");
+    expect(parsed[0].$path).toBe("a.md");
   });
 
   it("stale_prev over remote surfaces as exit 2 with code", () => {

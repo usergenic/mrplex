@@ -43,7 +43,7 @@ async function fields(...fs: string[]): Promise<void> {
 /** Query with a filter; return the matching paths, sorted. */
 async function q(filter: string, ctx: CallContext = {}): Promise<string[]> {
   const rows = await kernel.query(ctx, { repo: "notes", filter });
-  return rows.map((r) => r.path).sort();
+  return rows.map((r) => r.$path as string).sort();
 }
 
 beforeEach(async () => {

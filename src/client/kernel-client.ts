@@ -21,7 +21,14 @@ import type {
 } from "../kernel/kernel.js";
 import type { PathConfigOverride } from "../kernel/path-config.js";
 import type { QuerySpec } from "../kernel/query/query.js";
-import type { GraphResult, GraphSpec, PathWarning, Repo, Version } from "../kernel/wire.js";
+import type {
+  GraphResult,
+  GraphSpec,
+  PathWarning,
+  QueryHit,
+  Repo,
+  Version,
+} from "../kernel/wire.js";
 import type { LinkConfigOverride } from "../links/link-config.js";
 
 export type HistoryOptions = { limit?: number; before?: string };
@@ -74,7 +81,7 @@ export type KernelClient = {
     stale(repo: string): Promise<StaleLinkWire[]>;
     repair(repo: string, opts?: { dry_run?: boolean }): Promise<RepairResult>;
   };
-  query(spec: QuerySpec): Promise<Version[]>;
+  query(spec: QuerySpec): Promise<QueryHit[]>;
   graph(spec: GraphSpec): Promise<GraphResult>;
 
   /** Release any transport-owned resources. Idempotent. */

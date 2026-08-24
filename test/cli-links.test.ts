@@ -53,8 +53,8 @@ describe("cli links", () => {
     createDoc("moc.md", "- [[alice]]");
     const out = run(["--json", "-r", "notes", "query", "--filter", '$in_static("moc.md")']);
     expect(out.status).toBe(0);
-    const rows = JSON.parse(out.stdout) as { path: string }[];
-    expect(rows.map((r) => r.path)).toEqual(["alice.md"]);
+    const rows = JSON.parse(out.stdout) as { $path: string }[];
+    expect(rows.map((r) => r.$path)).toEqual(["alice.md"]);
   });
 
   it("bare $in works (== $in_static today)", async () => {
@@ -62,7 +62,9 @@ describe("cli links", () => {
     createDoc("moc.md", "- [[alice]]");
     const out = run(["--json", "-r", "notes", "query", "--filter", '$in("moc.md")']);
     expect(out.status).toBe(0);
-    expect((JSON.parse(out.stdout) as { path: string }[]).map((r) => r.path)).toEqual(["alice.md"]);
+    expect((JSON.parse(out.stdout) as { $path: string }[]).map((r) => r.$path)).toEqual([
+      "alice.md",
+    ]);
   });
 
   it("reserved _dyn name errors with a clear message (exit 1)", async () => {

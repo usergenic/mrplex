@@ -1,4 +1,4 @@
-import type { GraphResult, Repo, Version } from "../kernel/wire.js";
+import type { GraphResult, QueryHit, Repo, Version } from "../kernel/wire.js";
 import { join as joinFrontmatter } from "../markdown/frontmatter.js";
 
 /**
@@ -15,10 +15,28 @@ export function renderReposTable(repos: Repo[]): string {
   return renderTable(["REPO", "PATH CONFIG"], rows);
 }
 
-export function renderQueryTable(versions: Version[]): string {
-  if (versions.length === 0) return "(no results)";
-  const rows = versions.map((v) => [v.repo, v.path, v.version_id, v.author, v.created_at]);
-  return renderTable(["REPO", "PATH", "VERSION", "AUTHOR", "CREATED_AT"], rows);
+export function renderQueryTable(hits: QueryHit[]): string {
+  if (hits.length === 0) return "(no results)";
+  // Columns are the union of projected keys, in first-seen order across hits —
+  // `select` decides which fields are present, so the table follows suit.
+  const columns: string[] = [];
+  const seen = new Set<string>();
+  for (const hit of hits) {
+    for (const key of Object.keys(hit)) {
+      if (!seen.has(key)) {
+        seen.add(key);
+        columns.push(key);
+      }
+    }
+  }
+  const rows = hits.map((hit) => columns.map((key) => renderCell(hit[key])));
+  return renderTable(columns, rows);
+}
+
+function renderCell(value: unknown): string {
+  if (value === undefined || value === null) return "";
+  if (typeof value === "string") return value;
+  return JSON.stringify(value);
 }
 
 export function renderHistoryTable(versions: Version[]): string {

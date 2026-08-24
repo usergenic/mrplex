@@ -63,7 +63,7 @@ describe("read forwarding", () => {
     await seed("notes", "secret/hidden.md");
     const k = guardKernel(raw, ent({ read: [{ repo: "notes", paths: ["public.md"] }] }));
     const rows = await k.query(ROOT, { repo: "notes" });
-    expect(rows.map((r) => r.path)).toEqual(["public.md"]);
+    expect(rows.map((r) => r.$path)).toEqual(["public.md"]);
   });
 
   it("docs.get on an out-of-scope path is forbidden by the engine", async () => {
@@ -78,7 +78,7 @@ describe("read forwarding", () => {
     const k = guardKernel(raw, ent({ read: [{ repo: "notes", paths: ["public.md"] }] }));
     // Caller tries to widen its own visibility; the guard overrides it.
     const rows = await k.query({ scope: [{ repo: "*", paths: ["**"] }] }, { repo: "notes" });
-    expect(rows.map((r) => r.path)).toEqual(["public.md"]);
+    expect(rows.map((r) => r.$path)).toEqual(["public.md"]);
   });
 });
 

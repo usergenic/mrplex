@@ -1199,6 +1199,12 @@ function buildProgram(): Command {
     .option("--text <query>", "FTS5 query over body")
     .option("--rank <query>", "semantic rank via embeddings (§5.1); requires an embed hook")
     .option("--limit <n>", "max results (positive integer; default 50)", parsePositiveInt)
+    .option(
+      "-s, --select <field>",
+      "field to project onto each hit ($path/$repo/$body/… or a bare frontmatter key; " +
+        "default $path); repeat to add more",
+      (value: string, prev: string[] | undefined) => [...(prev ?? []), value],
+    )
     .option("--include-hidden", "surface .-prefixed paths", false)
     .option("--include-system", "surface :-prefixed (deleted, etc.) paths", false)
     .action(function (this: Command) {
@@ -1209,6 +1215,7 @@ function buildProgram(): Command {
         text?: string;
         rank?: string;
         limit?: number;
+        select?: string[];
         includeHidden: boolean;
         includeSystem: boolean;
       }>();
@@ -1219,6 +1226,7 @@ function buildProgram(): Command {
           text: localOpts.text,
           rank: localOpts.rank,
           limit: localOpts.limit,
+          select: localOpts.select,
           include_hidden: localOpts.includeHidden,
           include_system: localOpts.includeSystem,
         });

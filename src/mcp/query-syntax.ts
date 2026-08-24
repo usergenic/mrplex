@@ -44,6 +44,21 @@ Ordering: rank score when \`rank\` is present, else text relevance when
 gitignore-style glob (\`"team-*"\`), or a list of either. Omitted = every
 repo the caller can see.
 
+## Result shape — \`select\`
+
+\`query\` returns **lean projected hits**, not full documents. \`select\` names
+the fields you want; each hit is an object of just those fields. Names are
+either bare frontmatter keys (\`title\`, \`status\`) or \`$\`-intrinsics
+(\`$path\`, \`$repo\`, \`$version_id\`, \`$prev_version_id\`, \`$next_version_id\`,
+\`$updated_at\`, \`$author\`, \`$body\`). Any field that isn't user frontmatter
+carries the \`$\` sigil, so a frontmatter key literally named \`path\` never
+collides with the system's \`$path\`.
+
+\`select\` defaults to \`["$path"]\` — the cheapest useful projection. Document
+bodies travel only when you ask for \`$body\`, so listing/filtering is cheap by
+default. When querying more than one repo, add \`$repo\` to tell the paths apart.
+To recover whole documents, use \`docs.get\`.
+
 ## CEL filter basics
 
 Bare identifiers name frontmatter keys: \`status == "published"\`. Nested

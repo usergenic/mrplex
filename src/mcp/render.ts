@@ -8,7 +8,7 @@
  * humans; the MCP text rendering just has to be *readable*, not pretty.
  */
 
-import type { GraphResult, Repo, Version } from "../kernel/wire.js";
+import type { GraphResult, QueryHit, Repo, Version } from "../kernel/wire.js";
 
 export function renderJson(x: unknown): string {
   return JSON.stringify(x, null, 2);
@@ -26,6 +26,28 @@ export function renderVersion(v: Version): string {
 export function renderVersionList(versions: Version[]): string {
   if (versions.length === 0) return "(no results)";
   return versions.map(renderVersion).join("\n");
+}
+
+/**
+ * Text half for `query`'s projected hits. Since `select` decides which fields
+ * are present, render each hit as its `key: value` pairs in projection order —
+ * a compact, readable line per hit rather than a fixed column layout.
+ */
+export function renderQueryHitList(hits: QueryHit[]): string {
+  if (hits.length === 0) return "(no results)";
+  return hits
+    .map((hit) =>
+      Object.entries(hit)
+        .map(([key, value]) => `${key}: ${renderHitValue(value)}`)
+        .join("  "),
+    )
+    .join("\n");
+}
+
+function renderHitValue(value: unknown): string {
+  if (value === null) return "null";
+  if (typeof value === "string") return value;
+  return JSON.stringify(value);
 }
 
 /**

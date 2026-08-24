@@ -19,7 +19,7 @@ import { KernelError } from "../kernel/errors.js";
 import type { Kernel } from "../kernel/kernel.js";
 import type { PathConfigOverride } from "../kernel/path-config.js";
 import type { QuerySpec } from "../kernel/query/query.js";
-import type { GraphSpec, Version } from "../kernel/wire.js";
+import type { GraphSpec, QueryHit, Version } from "../kernel/wire.js";
 import { appendSystemProperty, extractSystemProperties } from "../markdown/frontmatter.js";
 import {
   type ContextForRequest,
@@ -199,16 +199,14 @@ function writePreconditionRequired(res: ServerResponse, reason: string): void {
 }
 
 // -----------------------------------------------------------------------------
-// Query-response ETag — hash of the sorted version_id list (§6.3 [OPEN]
-// resolved by m3-plan decision 8).
+// Query-response ETag — hash of the projected result payload. `query` now
+// returns lean `QueryHit` objects (docs/query-select-plan.md) whose exact
+// shape depends on `select`, so the validator hashes the serialized hits
+// rather than a version_id list (which may not be projected at all).
 // -----------------------------------------------------------------------------
 
-function queryEtag(versions: readonly Version[]): string {
-  const ids = versions
-    .map((v) => v.version_id)
-    .slice()
-    .sort();
-  const h = createHash("sha256").update(ids.join("\n")).digest("hex");
+function queryEtag(hits: readonly QueryHit[]): string {
+  const h = createHash("sha256").update(JSON.stringify(hits)).digest("hex");
   // Short ETag — first 16 hex chars are plenty for collision resistance
   // within a single result set's lifespan (2^64 hashes).
   return h.slice(0, 16);
@@ -777,6 +775,14 @@ function specFromQueryString(query: URLSearchParams): QuerySpec {
   if (limit !== undefined) spec.limit = limit;
   if (query.get("include_hidden") === "true") spec.include_hidden = true;
   if (query.get("include_system") === "true") spec.include_system = true;
+  // `select` is a repeated GET param (`?select=$path&select=title`); a single
+  // comma-separated value is also accepted, mirroring `repo`.
+  const selects = query.getAll("select");
+  if (selects.length > 0) {
+    const flat: string[] = [];
+    for (const s of selects) for (const item of s.split(",")) if (item.length > 0) flat.push(item);
+    spec.select = flat;
+  }
   return spec;
 }
 
