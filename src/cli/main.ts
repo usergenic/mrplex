@@ -1585,7 +1585,7 @@ function buildProgram(): Command {
     )
     .option("--once", "run startup reconciliation once, then exit (no watcher)", false)
     .option("--interval <ms>", "feed poll interval in ms (daemon; default 5000)", parsePositiveInt)
-    .option("--debounce <ms>", "per-path debounce in ms (daemon; default 500)", parsePositiveInt)
+    .option("--debounce <ms>", "burst debounce in ms (daemon; default 5000)", parsePositiveInt)
     .option(
       "--settle <ms>",
       "skip files younger than this many ms (partial saves)",

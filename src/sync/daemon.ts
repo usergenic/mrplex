@@ -56,7 +56,7 @@ export function startDaemon(client: KernelClient, opts: DaemonOptions): Daemon {
   const scope = makeScopeFilter({ include: opts.include, exclude: opts.exclude });
   const map: RemoteMap = new Map();
   const intervalMs = opts.intervalMs ?? 5000;
-  const debounceMs = opts.debounceMs ?? 500;
+  const debounceMs = opts.debounceMs ?? 5000;
 
   let stopped = false;
   let watcher: FSWatcher | undefined;

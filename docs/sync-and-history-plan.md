@@ -317,7 +317,7 @@ mrplex sync <root> [--repo <slug>] [--server <url>]
 Top-level command (peer of `serve`, `query`), thin wiring over `src/sync/`, riding
 `KernelClient` so local SQLite and remote MCP work identically. Flags resolve
 flag → env → config (`src/cli/config.ts`, gaining a nested `sync` block set via
-`mrplex config set-sync`). Defaults: include `**/*.md`, debounce `500ms`, poll
+`mrplex config set-sync`). Defaults: include `**/*.md`, debounce `5000ms`, poll
 interval `5s`. `<root>` paths map to doc paths by relative POSIX path. The
 **same include/exclude globs filter both directions** — the local walk, the index
 items, and the feed refs all pass through one predicate, so the two sides can never
@@ -932,7 +932,7 @@ mrplex sync <root> [--repo <slug>] [--server <url>]
 Top-level command (peer of serve, query), thin wiring over src/sync/, riding
 KernelClient so local SQLite and remote MCP work identically. Flags resolve
 flag → env → config (src/cli/config.ts, gaining a nested sync block set via
-mrplex config set-sync). Defaults: include **/*.md, debounce 500ms, poll
+mrplex config set-sync). Defaults: include **/*.md, debounce 5000ms, poll
 interval 5s. <root> paths map to doc paths by relative POSIX path. The
 same include/exclude globs filter both directions — the local walk, the index
 items, and the feed refs all pass through one predicate, so the two sides can never
