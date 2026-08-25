@@ -346,10 +346,12 @@ async function ackLocalWrite(
   if (now === null) return;
   const current = stripToUserContent(now);
   if (current.body === pushed.body && current.frontmatter_raw === pushed.frontmatter_raw) {
-    await store.write(path, renderMaterialized(v));
+    await store.write(path, renderMaterialized(v), { preserveMtime: true });
     return;
   }
-  await store.write(path, stampProvenance(now, v.version_id, v.content_hash));
+  await store.write(path, stampProvenance(now, v.version_id, v.content_hash), {
+    preserveMtime: true,
+  });
 }
 
 /** The occupied-path rule (§4.4): hash match → adopt; differ → conflict park. */
@@ -364,7 +366,7 @@ async function occupiedPath(
   if (computedHash === current.content_hash) {
     // Clean local copy missing metadata → inject remote provenance in place, no
     // server write. Re-render from the current version so intrinsics are exact.
-    await store.write(path, renderMaterialized(current));
+    await store.write(path, renderMaterialized(current), { preserveMtime: true });
     map.set(path, { version_id: current.version_id, content_hash: current.content_hash });
     return "clean";
   }

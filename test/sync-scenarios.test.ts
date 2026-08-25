@@ -13,6 +13,9 @@
  *   remote-put path body     out-of-band remote edit (other writer)
  *
  * `bodies` = non-ignored path → user body. `ignored` = `$sync: ignore` paths.
+ *
+ * Provenance stamps on disk use preserveMtime so Obsidian Sync / iCloud do not
+ * treat our YAML rewrite as a newer file than the still-typing mobile client.
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";

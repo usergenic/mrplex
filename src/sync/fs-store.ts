@@ -5,7 +5,7 @@
  * also prune it (and dotdirs like `.obsidian/`) during the walk for speed.
  */
 
-import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { toDocPath, toLocalPath } from "./paths.js";
 import type { FileStore } from "./reconcile.js";
@@ -25,10 +25,19 @@ export function createFsStore(root: string): FileStore {
         throw err;
       }
     },
-    async write(docPath: string, text: string): Promise<void> {
+    async write(docPath: string, text: string, opts?: { preserveMtime?: boolean }): Promise<void> {
       const abs = toLocalPath(root, docPath);
       await mkdir(dirname(abs), { recursive: true });
+      let mtime: Date | undefined;
+      if (opts?.preserveMtime) {
+        try {
+          mtime = (await stat(abs)).mtime;
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+        }
+      }
       await writeFile(abs, text, "utf8");
+      if (mtime) await utimes(abs, mtime, mtime);
     },
     async remove(docPath: string): Promise<void> {
       await rm(toLocalPath(root, docPath), { force: true });

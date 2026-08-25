@@ -126,7 +126,7 @@ async function applyRef(
       if (intr.version === ref.version_id) return false;
       if (versionAtOrAhead(intr.version, ref.version_id)) return false;
       const v = await client.docs.get_version(repo, ref.version_id);
-      await store.write(ref.path, renderMaterialized(v));
+      await store.write(ref.path, renderMaterialized(v), { preserveMtime: true });
       return true;
     }
     // Local is at or ahead of this ref (echo of our push, or a replay of an

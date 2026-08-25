@@ -34,8 +34,13 @@ export type FileStore = {
   list(): Promise<string[]>;
   /** File text at a doc path, or null if absent. */
   read(docPath: string): Promise<string | null>;
-  /** Write file text at a doc path (creating parent dirs). */
-  write(docPath: string, text: string): Promise<void>;
+  /**
+   * Write file text at a doc path (creating parent dirs).
+   * `preserveMtime` keeps the previous mtime — provenance stamps must not look
+   * newer than an Obsidian client's still-unsynced buffer or iCloud/Obsidian
+   * Sync will push the stamped snapshot back and clobber in-progress typing.
+   */
+  write(docPath: string, text: string, opts?: { preserveMtime?: boolean }): Promise<void>;
   /** Remove the file at a doc path (no-op if already absent). */
   remove(docPath: string): Promise<void>;
 };
@@ -276,8 +281,10 @@ async function materializeInPlace(
   versionId: string,
 ): Promise<void> {
   // The content already equals the version; re-render from the authoritative
-  // remote version so intrinsics are exact.
-  await materializeVersion(client, store, repo, path, versionId);
+  // remote version so intrinsics are exact. Keep mtime so a metadata-only
+  // stamp cannot win an Obsidian/iCloud race against unsynced typing.
+  const v = await client.docs.get_version(repo, versionId);
+  await store.write(path, renderMaterialized(v), { preserveMtime: true });
 }
 
 async function pushEdit(
@@ -289,7 +296,7 @@ async function pushEdit(
 ): Promise<void> {
   const { frontmatter_raw, body } = await readUserContent(store, path);
   const v = await client.docs.put(repo, prevVersionId, path, { frontmatter_raw, body });
-  await store.write(path, renderMaterialized(v));
+  await store.write(path, renderMaterialized(v), { preserveMtime: true });
 }
 
 async function pushMove(
@@ -302,7 +309,7 @@ async function pushMove(
   const { frontmatter_raw, body } = await readUserContent(store, path);
   // A put whose path differs from prev's path is a move preserving identity.
   const v = await client.docs.put(repo, prevVersionId, path, { frontmatter_raw, body });
-  await store.write(path, renderMaterialized(v));
+  await store.write(path, renderMaterialized(v), { preserveMtime: true });
 }
 
 async function pushCreate(
@@ -314,7 +321,7 @@ async function pushCreate(
   const { frontmatter_raw, body } = await readUserContent(store, path);
   try {
     const v = await client.docs.create(repo, path, { frontmatter_raw, body });
-    await store.write(path, renderMaterialized(v));
+    await store.write(path, renderMaterialized(v), { preserveMtime: true });
   } catch (err) {
     if (err instanceof KernelError && err.code === "create_conflict") {
       // A doc appeared at this path since the index scan; treat the occupied
