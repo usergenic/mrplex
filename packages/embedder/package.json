@@ -1,0 +1,19 @@
+{
+  "name": "@mrplex/embedder",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Local CPU embedding provider for mrplex's --embed-cmd hook (bge-small-en-v1.5 via fastembed). Isolated from mrplex core so fastembed/tar stay out of the core dependency graph.",
+  "type": "module",
+  "bin": {
+    "mrplex-embedder": "./embedder.mjs"
+  },
+  "scripts": {
+    "start": "node embedder.mjs --stdio"
+  },
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "dependencies": {
+    "fastembed": "^2.1.0"
+  }
+}

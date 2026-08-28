@@ -358,6 +358,18 @@ mrplex serve --unsafe --embed-cmd "path/to/embedder --stdio"
 
 Either flag can also come from `MRPLEX_EMBED_URL` / `MRPLEX_EMBED_CMD` env or CLI config. `--embed-url` and `--embed-cmd` are mutually exclusive.
 
+### Local embedder (no service, no GPU)
+
+[`packages/embedder`](packages/embedder) is a ready-to-use `--embed-cmd` provider: a resident Node subprocess running `bge-small-en-v1.5` (384-dim) on CPU via ONNX. It's a **separate package** so its `fastembed` dependency stays out of mrplex's core dependency graph — install it only if you want local embeddings:
+
+```bash
+cd packages/embedder && npm install   # its own deps + lockfile, not mrplex's
+
+mrplex serve --unsafe --embed-cmd "node packages/embedder/embedder.mjs --stdio"
+```
+
+See [packages/embedder/README.md](packages/embedder/README.md) for model flags (`--model`, `--dim`) and a note on the `tar` advisory scope.
+
 Backlog + backfill for retrofitting an existing corpus:
 
 ```bash
