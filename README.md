@@ -343,7 +343,7 @@ server's pins exactly (Auth0 issuers include the trailing slash).
 
 ## Embeddings
 
-mrplex ships **no** embedding provider — you wire one up. Two hook shapes:
+mrplex never calls an embedding provider itself — you wire one up. It doesn't install one by default either, but it does bundle a ready-to-use local provider ([`packages/embedder`](packages/embedder), see [below](#local-embedder-no-service-no-gpu)) you can opt into, and rolling your own is just implementing one of two hook shapes:
 
 ```bash
 # HTTP endpoint — server POSTs { chunks: [...] } and expects
