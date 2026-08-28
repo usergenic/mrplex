@@ -636,6 +636,8 @@ function buildProgram(): Command {
     .option("--oidc-audience <aud>", "OIDC audience for --token verification")
     .option("--oidc-jwks-uri <url>", "JWKS endpoint (default: <issuer>/.well-known/jwks.json)")
     .option("--audit <file>", "append a JSONL audit line per call (--policy only)")
+    .option("--embed-url <url>", "HTTP embedding endpoint (§5.3)")
+    .option("--embed-cmd <cmd>", "subprocess embedding command (JSON-lines over stdio)")
     .action(function (this: Command) {
       const gopts = this.optsWithGlobals<GlobalOpts>();
       const localOpts = this.opts<{
@@ -648,18 +650,46 @@ function buildProgram(): Command {
         oidcAudience?: string;
         oidcJwksUri?: string;
         audit?: string;
+        embedUrl?: string;
+        embedCmd?: string;
       }>();
       (async () => {
         try {
           assertServeGate(localOpts.policy, localOpts.unsafe);
           const database = resolveDatabase(gopts);
+          const embedCfg = resolveEmbedConfig({
+            embed_url: localOpts.embedUrl,
+            embed_cmd: localOpts.embedCmd,
+          });
+          const hook = createHookFromConfig(embedCfg);
 
           if (localOpts.policy === undefined) {
             // Unsafe: raw kernel, launch-time --author/--scope pin the context.
             const storage = await openStorage(database);
-            const kernel = createKernel(storage);
+            const kernel = createKernel({
+              storage,
+              onVersionCommitted: async (versionId) => {
+                await storage.backlog_enqueue(versionId);
+              },
+              queryEmbed: hook
+                ? async (rank: string) => {
+                    const resp = await hook.embed([rank]);
+                    const vector = resp.vectors[0];
+                    if (!vector) throw new Error("embed hook returned no vector for query string");
+                    return { vector, model: resp.model, dim: resp.dim };
+                  }
+                : undefined,
+            });
+            const worker = hook ? createWorker({ storage, hook }) : null;
+            worker?.start();
             const mount = await startMcpStdio({ kernel, context: resolveContext(gopts) });
-            wireStdioShutdown(mount.close, storage.close.bind(storage));
+            wireStdioShutdown(
+              async () => {
+                await mount.close();
+                if (worker) await worker.stop();
+              },
+              storage.close.bind(storage),
+            );
             return;
           }
 
@@ -674,7 +704,22 @@ function buildProgram(): Command {
           );
           const oidc = buildOidcVerifier(localOpts);
           const storage = await openStorage(database);
-          const kernel = createKernel(storage);
+          const kernel = createKernel({
+            storage,
+            onVersionCommitted: async (versionId) => {
+              await storage.backlog_enqueue(versionId);
+            },
+            queryEmbed: hook
+              ? async (rank: string) => {
+                  const resp = await hook.embed([rank]);
+                  const vector = resp.vectors[0];
+                  if (!vector) throw new Error("embed hook returned no vector for query string");
+                  return { vector, model: resp.model, dim: resp.dim };
+                }
+              : undefined,
+          });
+          const worker = hook ? createWorker({ storage, hook }) : null;
+          worker?.start();
           const mount = await startShellStdio({
             kernel,
             policy,
@@ -684,7 +729,13 @@ function buildProgram(): Command {
               ? (principal) => fileAuditSink(localOpts.audit as string, principal)
               : undefined,
           });
-          wireStdioShutdown(mount.close, storage.close.bind(storage));
+          wireStdioShutdown(
+            async () => {
+              await mount.close();
+              if (worker) await worker.stop();
+            },
+            storage.close.bind(storage),
+          );
         } catch (err) {
           reportError(err);
         }
