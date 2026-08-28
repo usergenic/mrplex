@@ -1509,14 +1509,14 @@ function buildProgram(): Command {
   embed
     .command("backfill")
     .description("re-chunk + re-embed current versions missing chunks (§5.3)")
-    .requiredOption("-r, --repo <slug>", "repo to backfill")
     .option("--embed-url <url>", "HTTP embedding endpoint")
     .option("--embed-cmd <cmd>", "subprocess embedding command (JSON-lines over stdio)")
     .action(function (this: Command) {
-      const localOpts = this.opts<{ repo: string; embedUrl?: string; embedCmd?: string }>();
+      const localOpts = this.opts<{ embedUrl?: string; embedCmd?: string }>();
       const gopts = this.optsWithGlobals<GlobalOpts>();
       (async () => {
         try {
+          const repo = resolveRepoSlug(gopts);
           const embedCfg = resolveEmbedConfig({
             embed_url: localOpts.embedUrl,
             embed_cmd: localOpts.embedCmd,
@@ -1536,14 +1536,14 @@ function buildProgram(): Command {
           const storage = await openStorage(resolveDatabase(gopts));
           const worker = createWorker({ storage, hook });
           try {
-            const report = await backfillRepo(storage, localOpts.repo, worker, (m) =>
+            const report = await backfillRepo(storage, repo, worker, (m) =>
               process.stderr.write(`${m}\n`),
             );
             if (gopts.json) {
               process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
             } else {
               process.stdout.write(
-                `backfill ${localOpts.repo}: enqueued=${report.enqueued} processed=${report.processed} failed=${report.failed} skipped=${report.skipped}\n`,
+                `backfill ${repo}: enqueued=${report.enqueued} processed=${report.processed} failed=${report.failed} skipped=${report.skipped}\n`,
               );
             }
             if (report.failed > 0) process.exit(1);
