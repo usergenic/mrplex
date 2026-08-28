@@ -109,4 +109,9 @@ describe("the reference doc mentions every documented name", () => {
   it("list() polymorphism", () => {
     expect(QUERY_SYNTAX_DOC).toContain("in list(");
   });
+
+  it("default select is $path-only", () => {
+    expect(QUERY_SYNTAX_DOC).toContain('["$path"]');
+    expect(QUERY_SYNTAX_DOC).toContain("that is all you get");
+  });
 });

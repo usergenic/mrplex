@@ -22,6 +22,7 @@ import type {
 import type { PathConfigOverride } from "../kernel/path-config.js";
 import type { QuerySpec } from "../kernel/query/query.js";
 import type {
+  DocGetManyResult,
   GraphResult,
   GraphSpec,
   HistoryIndexPage,
@@ -57,6 +58,7 @@ export type KernelClient = {
   };
   docs: {
     get(repo: string, path: string, opts?: DocGetOptions): Promise<Version>;
+    get_many(repo: string, paths: string[], opts?: DocGetOptions): Promise<DocGetManyResult>;
     get_version(repo: string, version_id: string, opts?: DocGetOptions): Promise<Version>;
     history(repo: string, path: string, opts?: HistoryOptions): Promise<Version[]>;
     diff(

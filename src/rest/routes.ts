@@ -341,6 +341,27 @@ async function dispatchRepos(
     return;
   }
 
+  // /repos/{repo}/docs:get — batch current-version fetch (POST only).
+  if (segments.length === 3 && segments[2] === "docs:get") {
+    if (method !== "POST") return methodNotAllowed(res, method, ["POST"]);
+    const body = parseJsonBody(await readBody(req)) as { paths?: unknown; raw?: unknown };
+    const result = await kernel.docs.get_many(ctx, repoSlug, body.paths as never);
+    const mode = body.raw === true ? "raw" : systemPropsMode(query);
+    const items =
+      mode === "raw"
+        ? result.items
+        : result.items.map((v) => ({
+            ...v,
+            frontmatter_raw: appendSystemProperty(
+              appendSystemProperty(v.frontmatter_raw, "version", v.version_id),
+              "content_hash",
+              v.content_hash,
+            ),
+          }));
+    writeJson(res, 200, { items, errors: result.errors });
+    return;
+  }
+
   // /repos/{repo}/docs/{path...}
   if (segments[2] === "docs") {
     const pathSegs = segments.slice(3);

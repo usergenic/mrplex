@@ -360,6 +360,24 @@ class PostgresStorage implements Storage {
     });
   }
 
+  async versions_current_by_paths(
+    repo_id: number,
+    paths: readonly string[],
+  ): Promise<VersionRow[]> {
+    if (paths.length === 0) return [];
+    const norms = paths.map(normalizeKey);
+    return this.withClient(async (c) => {
+      const res = await c.query<VersionRawRow>(
+        `select id, document_id, repo_id, prev_id, next_id, path,
+                frontmatter_raw, frontmatter, body, author, created_at, content_hash
+         from versions
+         where repo_id = $1 and next_id is null and path_norm = ANY($2::text[])`,
+        [repo_id, norms],
+      );
+      return res.rows as VersionRow[];
+    });
+  }
+
   async version_current(repo_id: number, path: string): Promise<VersionRow | null> {
     return this.withClient(async (c) => {
       // Case-insensitive identity: fold the query key to path_norm (§3.5.1).

@@ -28,6 +28,19 @@ export function renderVersionList(versions: Version[]): string {
   return versions.map(renderVersion).join("\n");
 }
 
+/** Text half for `docs_get_many`: versions plus a trailing errors block. */
+export function renderDocGetManyText(
+  items: Version[],
+  errors: { path: string; code: string }[],
+): string {
+  const parts = [renderVersionList(items)];
+  if (errors.length > 0) {
+    parts.push("errors:");
+    for (const e of errors) parts.push(`${e.path}: ${e.code}`);
+  }
+  return parts.join("\n");
+}
+
 /**
  * Text half for `query`'s projected hits. Since `select` decides which fields
  * are present, render each hit as its `key: value` pairs in projection order —

@@ -37,15 +37,16 @@ afterEach(async () => {
 });
 
 describe("MCP lifecycle + tools/list", () => {
-  it("lists 23 tools (no user/token tools after noauth; links_* + set_link_config + query_syntax + graph + history_since/index/list)", async () => {
+  it("lists 24 tools (no user/token tools after noauth; links_* + set_link_config + query_syntax + graph + history_since/index/list + docs_get_many)", async () => {
     const r = await client.listTools();
-    expect(r.tools.length).toBe(23);
+    expect(r.tools.length).toBe(24);
     // Sample the important names.
     const names = new Set(r.tools.map((t) => t.name));
     for (const name of [
       "repos_list",
       "repos_create",
       "docs_get",
+      "docs_get_many",
       "docs_create",
       "docs_put",
       "docs_delete",
@@ -78,20 +79,38 @@ describe("MCP lifecycle + tools/list", () => {
   it("initialize surfaces server instructions covering the key conventions", async () => {
     const instructions = client.getInstructions();
     expect(instructions).toBeDefined();
-    for (const needle of ["$version", "stale_prev", "query_syntax", "frontmatter_raw"]) {
+    for (const needle of [
+      "$version",
+      "$content_hash",
+      "stale_prev",
+      "query_syntax",
+      "frontmatter_raw",
+      '["$path"]',
+      "docs_get",
+      "docs_get_many",
+    ]) {
       expect(instructions).toContain(needle);
     }
   });
 
-  it("the query tool description teaches the filter language and points at query_syntax", async () => {
+  it("the query tool description teaches the filter language, default $path-only select, and points at query_syntax", async () => {
     const r = await client.listTools();
     const query = r.tools.find((t) => t.name === "query");
     expect(query?.description).toContain("query_syntax");
     expect(query?.description).toContain("$path");
+    expect(query?.description).toContain('["$path"]');
+    expect(query?.description).toContain("docs_get");
+    expect(query?.description).toContain("NOT full");
     const filterDesc = (query?.inputSchema.properties as Record<string, { description?: string }>)
       .filter?.description;
     expect(filterDesc).toContain("list(");
     expect(filterDesc).toContain("$backlinks()");
+    expect(filterDesc).toContain("$content_hash");
+    const selectDesc = (query?.inputSchema.properties as Record<string, { description?: string }>)
+      .select?.description;
+    expect(selectDesc).toContain('["$path"]');
+    expect(selectDesc).toContain("ALL you get");
+    expect(selectDesc).toContain("$content_hash");
   });
 });
 
@@ -118,6 +137,35 @@ describe("MCP tools/call round-trip", () => {
       arguments: { repo: "notes", path: "a.md" },
     });
     expect((fetched.structuredContent as { version_id: string }).version_id).toBe("v1");
+  });
+
+  it("docs_get_many returns items and per-path errors; isError is false on partial miss", async () => {
+    await client.callTool({ name: "repos_create", arguments: { repo: "notes" } });
+    await client.callTool({
+      name: "docs_create",
+      arguments: { repo: "notes", path: "a.md", body: "a\n", frontmatter: {} },
+    });
+    await client.callTool({
+      name: "docs_create",
+      arguments: { repo: "notes", path: "b.md", body: "b\n", frontmatter: {} },
+    });
+    const r = await client.callTool({
+      name: "docs_get_many",
+      arguments: { repo: "notes", paths: ["a.md", "missing.md", "b.md"] },
+    });
+    expect(r.isError).toBeFalsy();
+    const result = r.structuredContent as {
+      items: { path: string; frontmatter_raw: string }[];
+      errors: { path: string; code: string }[];
+    };
+    expect(result.items.map((v) => v.path)).toEqual(["a.md", "b.md"]);
+    expect(result.errors).toEqual([
+      { path: "missing.md", code: "doc_not_found", data: { repo: "notes", path: "missing.md" } },
+    ]);
+    expect(result.items[0]?.frontmatter_raw).toContain("$version:");
+    const text = ((r.content as { text: string }[])[0] as { text: string }).text;
+    expect(text).toContain("errors:");
+    expect(text).toContain("missing.md: doc_not_found");
   });
 
   it("list results wrap as { items: [...] } (structuredContent must be an object)", async () => {
@@ -349,7 +397,16 @@ describe("MCP query round-trip", () => {
     const r = await client.callTool({ name: "query_syntax", arguments: {} });
     expect(r.isError).toBeFalsy();
     const reference = (r.structuredContent as { reference: string }).reference;
-    for (const needle of ["$path", "$updated_at", "$body", "list(", "$in(", "$backlinks()"]) {
+    for (const needle of [
+      "$path",
+      "$updated_at",
+      "$body",
+      "$content_hash",
+      '["$path"]',
+      "list(",
+      "$in(",
+      "$backlinks()",
+    ]) {
       expect(reference).toContain(needle);
     }
     // The text content mirrors the structured form so text-only clients

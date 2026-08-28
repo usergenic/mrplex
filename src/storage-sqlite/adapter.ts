@@ -328,6 +328,24 @@ class SqliteStorage implements Storage {
     return row ? hydrateVersion(row) : null;
   }
 
+  async versions_current_by_paths(
+    repo_id: number,
+    paths: readonly string[],
+  ): Promise<VersionRow[]> {
+    if (paths.length === 0) return [];
+    const norms = paths.map(normalizeKey);
+    const ph = norms.map(() => "?").join(",");
+    const rows = this.db
+      .prepare(
+        `select id, document_id, repo_id, prev_id, next_id, path,
+                frontmatter_raw, frontmatter, body, author, created_at, content_hash
+         from versions
+         where repo_id = ? and next_id is null and path_norm in (${ph})`,
+      )
+      .all(repo_id, ...norms) as VersionRawRow[];
+    return rows.map(hydrateVersion);
+  }
+
   async versions_live_by_repo(repo_id: number): Promise<VersionRow[]> {
     const rows = this.db
       .prepare(

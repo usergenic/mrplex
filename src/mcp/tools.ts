@@ -24,6 +24,7 @@ import type { LinkConfigOverride } from "../links/link-config.js";
 import { appendSystemProperty, extractSystemProperties } from "../markdown/frontmatter.js";
 import { QUERY_SYNTAX_DOC } from "./query-syntax.js";
 import {
+  renderDocGetManyText,
   renderGraphSummary,
   renderJson,
   renderQueryHitList,
@@ -127,6 +128,14 @@ function argBoolOpt(args: Record<string, unknown>, key: string): boolean | undef
   return v;
 }
 
+function argStrArray(args: Record<string, unknown>, key: string): string[] {
+  const v = args[key];
+  if (!Array.isArray(v) || v.length === 0 || !v.every((x) => typeof x === "string")) {
+    throw new Error(`tool arg "${key}" must be a non-empty array of strings`);
+  }
+  return v as string[];
+}
+
 function argIntOpt(args: Record<string, unknown>, key: string): number | undefined {
   const v = args[key];
   if (v === undefined || v === null) return undefined;
@@ -206,7 +215,7 @@ const REPO_SCHEMA: JsonSchema = {
 
 const VERSION_SCHEMA: JsonSchema = {
   type: "object",
-  description: "A document version (wire shape §6.4).",
+  description: "A document version (wire shape).",
   properties: {
     version_id: {
       type: "string",
@@ -227,12 +236,17 @@ const VERSION_SCHEMA: JsonSchema = {
     frontmatter_raw: {
       type: "string",
       description:
-        "Verbatim YAML frontmatter. Reads append a server-injected `$version: <id>` line " +
+        "Verbatim YAML frontmatter. Reads append `$version: <id>` then `$content_hash: <sha256>` " +
         "unless raw: true.",
     },
     body: { type: "string", description: "Markdown body." },
     author: { type: "string", description: "Opaque author string." },
     created_at: { type: "string", description: "ISO-8601 UTC." },
+    content_hash: {
+      type: "string",
+      description:
+        "SHA-256 (bare hex) of canonical content (frontmatter stripped of $*, plus body).",
+    },
   },
   required: [
     "version_id",
@@ -245,7 +259,36 @@ const VERSION_SCHEMA: JsonSchema = {
     "body",
     "author",
     "created_at",
+    "content_hash",
   ],
+};
+
+const DOC_GET_MANY_ERROR_SCHEMA: JsonSchemaProp = {
+  type: "object",
+  description: "Per-path failure from a batch get — the call still succeeds.",
+  properties: {
+    path: { type: "string" },
+    code: { type: "string" },
+    data: { type: "object", additionalProperties: true },
+  },
+  required: ["path", "code", "data"],
+};
+
+const DOC_GET_MANY_RESULT_SCHEMA: JsonSchema = {
+  type: "object",
+  properties: {
+    items: {
+      type: "array",
+      items: VERSION_SCHEMA,
+      description: "Found current versions, in request order.",
+    },
+    errors: {
+      type: "array",
+      items: DOC_GET_MANY_ERROR_SCHEMA,
+      description: "Per-path failures (doc_not_found, forbidden), in request order.",
+    },
+  },
+  required: ["items", "errors"],
 };
 
 const DIFF_SCHEMA: JsonSchema = {
@@ -339,10 +382,11 @@ const SET_LINK_CONFIG_RESULT_SCHEMA: JsonSchema = {
 const QUERY_HIT_SCHEMA: JsonSchemaProp = {
   type: "object",
   description:
-    "A projected query hit (docs/query-select-plan.md). `$`-keys are system intrinsics selected " +
+    "A projected query hit — not a full document. `$`-keys are system intrinsics selected " +
     "via `select` ($path, $repo, $version_id, $prev_version_id, $next_version_id, $updated_at, " +
-    "$author, $body); any other keys are `select`-projected frontmatter. A key appears only when " +
-    "selected (and, for frontmatter, present). Default `select` yields just `$path`.",
+    "$author, $body, $content_hash); any other keys are `select`-projected frontmatter. A key " +
+    'appears only when selected (and, for frontmatter, present). Default `select` is ["$path"], ' +
+    'so a hit is `{ "$path": "…" }` only unless you ask for more.',
   // Which keys appear depends entirely on `select`, so none are required and
   // both intrinsics and bare frontmatter keys ride additionalProperties.
   additionalProperties: true,
@@ -475,7 +519,8 @@ export const TOOL_REGISTRY: ToolEntry[] = [
   // ---- repos ----
   {
     name: "repos_list",
-    description: "List repos the caller can address (§6.2).",
+    description:
+      "List repos the caller can address. Deleted (system-namespaced) repos are omitted unless `include_system` is true.",
     inputSchema: {
       type: "object",
       properties: {
@@ -495,7 +540,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
   },
   {
     name: "repos_get",
-    description: "Show a repo by slug.",
+    description: "Fetch a repo by slug. Missing or out-of-scope slugs raise not-found.",
     inputSchema: {
       type: "object",
       properties: { repo: { type: "string", description: "Repo slug." } },
@@ -509,7 +554,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
   },
   {
     name: "repos_create",
-    description: "Create a new repo (admin).",
+    description: "Create a new repo. Fails with slug_taken if the slug is already in use.",
     inputSchema: {
       type: "object",
       properties: { repo: { type: "string", description: "New repo slug." } },
@@ -523,7 +568,8 @@ export const TOOL_REGISTRY: ToolEntry[] = [
   },
   {
     name: "repos_rename",
-    description: "Rename a repo (admin).",
+    description:
+      "Rename a repo slug (recasing the same repo is allowed). Fails with slug_taken on collision.",
     inputSchema: {
       type: "object",
       properties: {
@@ -540,7 +586,8 @@ export const TOOL_REGISTRY: ToolEntry[] = [
   },
   {
     name: "repos_delete",
-    description: "Delete a repo — renames slug into the system namespace (§3.4; admin).",
+    description:
+      "Soft-delete a repo by renaming its slug into the system namespace (`:deleted-…`). Idempotent if already system-namespaced.",
     inputSchema: {
       type: "object",
       properties: { repo: { type: "string" } },
@@ -555,7 +602,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
   {
     name: "repos_set_path_config",
     description:
-      "Set (or clear) a repo's path config override (§3.5). Pass config = null to clear.",
+      "Set or clear a repo's path-config override (disallowed chars, system/hidden sigils). Pass `config: null` to clear. Existing live paths that violate the new config are returned as warnings, not rejected.",
     inputSchema: {
       type: "object",
       properties: {
@@ -565,7 +612,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
             {
               type: "object",
               additionalProperties: true,
-              description: "PathConfig override — see §3.5.",
+              description: "PathConfig override (disallowed_chars, system_sigils, hidden_sigils).",
             },
             { type: "null" },
           ],
@@ -583,7 +630,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
   {
     name: "repos_set_link_config",
     description:
-      "Set (or clear) a repo's link-extraction config override (§11.2); re-extracts the repo under the new config. Pass config = null to clear.",
+      "Set or clear a repo's link-extraction config (syntaxes / fields / resolution) and re-extract the whole repo under the new config. Pass `config: null` to clear.",
     inputSchema: {
       type: "object",
       properties: {
@@ -593,7 +640,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
             {
               type: "object",
               additionalProperties: true,
-              description: "LinkConfig override — syntaxes / fields / resolution (§11.2).",
+              description: "LinkConfig override — syntaxes / fields / resolution.",
             },
             { type: "null" },
           ],
@@ -616,7 +663,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
   {
     name: "docs_get",
     description:
-      "Read the current version of a document at (repo, path). Returned `frontmatter_raw` has `$version: <version_id>` appended so a subsequent `docs_put` can reuse it as `prev_version_id` (unless `raw: true`).",
+      "Read the current version of a document at (repo, path) — the way to recover a full document after `query`. Returned `frontmatter_raw` has `$version: <version_id>` then `$content_hash: <sha256>` appended so a subsequent `docs_put` can reuse `$version` as `prev_version_id` (unless `raw: true`). A missing path raises doc_not_found (unlike `query`, which omits unmatched paths). For several paths at once, use `docs_get_many`.",
     inputSchema: {
       type: "object",
       properties: {
@@ -637,8 +684,41 @@ export const TOOL_REGISTRY: ToolEntry[] = [
     },
   },
   {
+    name: "docs_get_many",
+    description:
+      "Read the current versions of several documents at once — the batch recover path after `query`. " +
+      "Returns `{ items, errors }`: found docs are full `Version`s (same injection as `docs_get` unless " +
+      "`raw: true`); per-path misses land in `errors` without failing the call. Duplicate paths are " +
+      "collapsed (first-seen). Max 50 unique paths.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string" },
+        paths: {
+          type: "array",
+          items: { type: "string" },
+          description: "Non-empty list of document paths to fetch.",
+        },
+        raw: {
+          type: "boolean",
+          description: "Suppress server-injected `$*` system properties in frontmatter_raw.",
+        },
+      },
+      required: ["repo", "paths"],
+    },
+    outputSchema: DOC_GET_MANY_RESULT_SCHEMA,
+    handler: async (kernel, ctx, args) => {
+      const raw = args.raw === true;
+      const result = await kernel.docs.get_many(ctx, argStr(args, "repo"), argStrArray(args, "paths"));
+      const items = result.items.map((v) => withInjectedSystemProps(v, raw));
+      const structured = { items, errors: result.errors };
+      return { structured, text: renderDocGetManyText(items, result.errors) };
+    },
+  },
+  {
     name: "docs_get_version",
-    description: "Read a specific version by id.",
+    description:
+      "Read a specific version by opaque `version_id` (current or historical). Same `$version` / `$content_hash` injection into `frontmatter_raw` as `docs_get` unless `raw: true`.",
     inputSchema: {
       type: "object",
       properties: {
@@ -665,13 +745,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
   {
     name: "history_list",
     description:
-      "Scoped, document-spanning version history (sync/history plan §3.5). Where docs_history lists " +
-      "one literal path, this takes a `path` GLOB (omitted = the whole repo) and interleaves the " +
-      "matching documents' versions by version-log position. `ever: false` (default) anchors on the " +
-      "LIVE set — history of what lives at the glob now, riding existing indexes; `ever: true` also " +
-      "includes documents that once matched but moved away or were deleted (whole chains). `since`/" +
-      "`until` are opaque version-id bounds; `order` is desc (newest-first) by default. This " +
-      "subsumes docs_history — a single literal `path` reproduces it.",
+      "Scoped, document-spanning version history. Where `docs_history` lists one literal path, this takes a `path` GLOB (omitted = the whole repo) and interleaves matching documents' versions by version-log position. `ever: false` (default) anchors on the LIVE set — history of what lives at the glob now; `ever: true` also includes documents that once matched but moved away or were deleted. `since`/`until` are opaque version-id bounds; `order` is desc (newest-first) by default. A single literal `path` reproduces `docs_history`.",
     inputSchema: {
       type: "object",
       properties: {
@@ -718,7 +792,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
   {
     name: "docs_history",
     description:
-      "Deprecated: use history_list (a literal `path` reproduces this). List versions of a document newest-first.",
+      "Deprecated: use `history_list` (a literal `path` reproduces this). List versions of one document newest-first.",
     inputSchema: {
       type: "object",
       properties: {
@@ -767,7 +841,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
   {
     name: "docs_create",
     description:
-      "Create a new document. Provide exactly one of `frontmatter` (JSON map) or `frontmatter_raw` (verbatim YAML). §3.2.",
+      "Create a new document at (repo, path). Fails with create_conflict if the path is occupied. Provide exactly one of `frontmatter` (JSON map) or `frontmatter_raw` (verbatim YAML).",
     inputSchema: {
       type: "object",
       properties: {
@@ -801,7 +875,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
   {
     name: "docs_put",
     description:
-      "Update or move a document. `path` may differ from prev's path (= move). Exactly one of `frontmatter` | `frontmatter_raw` if changing frontmatter; both may be omitted to keep prev's frontmatter (§3.2). `prev_version_id` may be omitted if `frontmatter_raw` embeds `$version: <id>` (from a prior docs_get).",
+      "Update or move a document (optimistic concurrency). `path` may differ from prev's path (= move). Exactly one of `frontmatter` | `frontmatter_raw` if changing frontmatter; both may be omitted to keep prev's. `prev_version_id` may be omitted if `frontmatter_raw` embeds `$version: <id>` from a prior `docs_get`. Conflicts: stale_prev (someone else wrote first — re-read and retry), path_taken (move onto an occupied path).",
     inputSchema: {
       type: "object",
       properties: {
@@ -862,7 +936,8 @@ export const TOOL_REGISTRY: ToolEntry[] = [
   },
   {
     name: "docs_delete",
-    description: "Delete a document — moves to `<system-sigil>deleted/...`; idempotent (§3.4).",
+    description:
+      "Delete a document — moves it to `:deleted/…` (system namespace). Requires `prev_version_id` of the current version. Idempotent if already deleted. Conflicts with stale_prev if someone else wrote first.",
     inputSchema: {
       type: "object",
       properties: {
@@ -889,7 +964,8 @@ export const TOOL_REGISTRY: ToolEntry[] = [
   // ---- links (§11.2) ----
   {
     name: "links_backfill",
-    description: "Rebuild the link index for a repo (backfill / config change). Admin.",
+    description:
+      "Rebuild the link index for a repo (after a link-config change, or to repair a missing index).",
     inputSchema: {
       type: "object",
       properties: { repo: { type: "string" } },
@@ -907,7 +983,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
   {
     name: "links_stale",
     description:
-      "List live docs whose written link text is stale vs. the target's current path (§11.2).",
+      "List live docs whose written link text is stale vs. the target's current path (e.g. after a rename). Each row is (source_path, written, current).",
     inputSchema: {
       type: "object",
       properties: { repo: { type: "string" } },
@@ -925,7 +1001,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
   {
     name: "links_repair",
     description:
-      "Rewrite stale link text as optimistic docs.put; dry_run plans only. Conflicts skipped.",
+      "Rewrite stale link text in place via optimistic `docs_put`. `dry_run: true` plans only (no writes). Per-document conflicts are skipped, not fatal.",
     inputSchema: {
       type: "object",
       properties: { repo: { type: "string" }, dry_run: { type: "boolean" } },
@@ -945,15 +1021,21 @@ export const TOOL_REGISTRY: ToolEntry[] = [
   {
     name: "query",
     description:
-      "Query documents. Three composable modes that intersect when combined: `filter` (a CEL " +
-      "boolean expression over frontmatter fields and $-prefixed intrinsics), `text` (full-text " +
-      "search over bodies), and `rank` (semantic similarity via embeddings). Returns lean " +
-      "projected hits (see `select`) for current versions only, ordered by rank score, else text " +
-      "relevance, else last-update time descending. Filter examples: " +
+      "Search current documents (history is not searched). Returns lean projected hits, NOT full " +
+      'documents: default `select` is ["$path"], so each hit is only `{ "$path": "…" }` — no ' +
+      "body, no frontmatter, no version id. Pass `select` to project more (`$body`, `$repo`, " +
+      "`$version_id`, `$content_hash`, `$updated_at`, `$author`, `$prev_version_id`, " +
+      "`$next_version_id`, or bare frontmatter keys like `title`). Include `$repo` when querying " +
+      "more than one repo. To recover whole documents, call `docs_get` (one path) or `docs_get_many` " +
+      "(batch). Unmatched paths are " +
+      "omitted, not errors. Default `limit` is 50. " +
+      "Three composable modes that intersect (AND) when combined: `filter` (CEL over frontmatter " +
+      "and $-intrinsics), `text` (full-text over bodies), `rank` (semantic similarity). Ordered by " +
+      "rank score, else text relevance, else last-update time descending. Filter examples: " +
       `status == "published" && "pricing" in list(tags)` +
       " (list() matches scalar-or-list frontmatter uniformly) — " +
       `$path.startsWith("guides/")` +
-      " ($-intrinsics: $path, $updated_at, $body) — " +
+      " ($-intrinsics: $path, $updated_at, $body, $content_hash) — " +
       `$in("moc/**") && !$in("moc/contractors.md")` +
       " (link-graph membership) — " +
       "$links().size() == 0" +
@@ -973,7 +1055,8 @@ export const TOOL_REGISTRY: ToolEntry[] = [
           type: "string",
           description:
             "CEL boolean expression. Bare identifiers are frontmatter keys (a missing key never " +
-            "matches); `$path` / `$updated_at` (ISO-8601 UTC) / `$body` are document intrinsics; " +
+            "matches); `$path` / `$updated_at` (ISO-8601 UTC) / `$body` / `$content_hash` are " +
+            "document intrinsics; " +
             '`"x" in list(field)` handles scalar-or-list frontmatter; `$in(glob)` / `$has(glob)` ' +
             "/ `$backlinks()` / `$links()` query the link graph. String functions: contains, " +
             "startsWith, endsWith, matches, size. Full reference: the `query_syntax` tool.",
@@ -987,7 +1070,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
         rank: {
           type: "string",
           description:
-            'Semantic rank via embeddings (§5.1) — a natural-language query, e.g. "tiered SaaS ' +
+            'Semantic rank via embeddings — a natural-language query, e.g. "tiered SaaS ' +
             'pricing". Requires an embed hook on the server; else rank_unavailable.',
         },
         limit: { type: "integer", minimum: 0, description: "Max results (default 50)." },
@@ -1005,10 +1088,11 @@ export const TOOL_REGISTRY: ToolEntry[] = [
           type: "array",
           items: { type: "string" },
           description:
-            'Fields to project onto each hit (default ["$path"]). Bare keys name frontmatter ' +
-            "(a missing key is simply absent); `$`-intrinsics name system fields: $path, $repo, " +
-            "$version_id, $prev_version_id, $next_version_id, $updated_at, $author, $body. Document " +
-            "bodies travel only when `$body` is selected — this is how you list without shipping content.",
+            'Fields to project onto each hit. Default ["$path"] — that is ALL you get unless you ' +
+            "pass this. Bare keys name frontmatter (a missing key is simply absent); `$`-intrinsics " +
+            "name system fields: $path, $repo, $version_id, $prev_version_id, $next_version_id, " +
+            "$updated_at, $author, $body, $content_hash. Document bodies travel only when `$body` is " +
+            "selected. This is how you list cheaply; call `docs_get` or `docs_get_many` for full document(s).",
         },
         scope: {
           type: "array",
@@ -1043,14 +1127,16 @@ export const TOOL_REGISTRY: ToolEntry[] = [
     name: "graph",
     description:
       "Explore how documents connect. BFS neighborhood expansion over the link graph: from a set " +
-      "of `roots`, expand outward under a `direction` lens up to `degrees` hops, returning the " +
-      "reached `documents` AND the `links` between them. Where `query` answers *which* documents " +
-      "match, `graph` answers *how* documents connect. `filter` is CEL evaluated as VISIBILITY " +
-      "(not selection): a non-matching document is hidden AND blocks paths through itself — plus " +
-      "the graph-only `$degrees` intrinsic (min hops from the nearest root). Killer pattern: " +
-      '`$degrees <= 1 || type == "person"` — expand everything one hop, but keep following person ' +
-      "docs. Results are deterministic. Continue past the `frontier` by re-rooting a follow-up call " +
-      "at chosen frontier paths (no cursors). See the `query_syntax` tool for the filter language.",
+      "of `roots`, expand under a `direction` lens up to `degrees` hops, returning the reached " +
+      "`documents` AND the `links` between them. Where `query` answers *which* documents match, " +
+      "`graph` answers *how* they connect. Unlike `query`, every document always includes `$path`, " +
+      "`$degrees`, `$links`, `$backlinks`; `select` only adds bare frontmatter keys (default " +
+      '["title"]). `filter` is CEL evaluated as VISIBILITY (not selection): a non-matching ' +
+      "document is hidden AND blocks paths through itself — plus the graph-only `$degrees` " +
+      'intrinsic (min hops from the nearest root). Killer pattern: `$degrees <= 1 || type == "person"` ' +
+      "— expand everything one hop, but keep following person docs. Results are deterministic. " +
+      "Continue past the `frontier` by re-rooting a follow-up call at chosen frontier paths (no " +
+      "cursors). See the `query_syntax` tool for the filter language.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1139,13 +1225,14 @@ export const TOOL_REGISTRY: ToolEntry[] = [
   {
     name: "history_since",
     description:
-      "The global change feed (sync/history plan §3.3). Given an opaque cursor `after_version`, " +
-      "returns the longest GAP-FREE contiguous run of change refs after it, plus `next_since` to " +
-      "resume. Each ref is a lightweight pointer — `version_id`, `prev_version_id`, `repo`, `path`, " +
-      "`prev_path` (both ends of a move/delete), `content_hash` (skip a fetch when you already have " +
-      "these bytes), a server-derived `op` (create/update/move/delete), and `created_at`. Fetch " +
-      "bodies via `docs_get_version` only when needed. Persist exactly `next_since`; feed it back to " +
-      "poll. A short/empty page means caught-up or waiting on an in-flight write — just poll again.",
+      "The global change feed. Given an opaque cursor `after_version`, returns the longest " +
+      "GAP-FREE contiguous run of change refs after it, plus `next_since` to resume. Each ref is a " +
+      "lightweight pointer — `version_id`, `prev_version_id`, `repo`, `path`, `prev_path` (both ends " +
+      "of a move/delete), `content_hash` (skip a fetch when you already have these bytes), a " +
+      "server-derived `op` (create/update/move/delete), and `created_at`. Fetch bodies via " +
+      "`docs_get_version` only when needed. Persist exactly `next_since`; feed it back to poll. A " +
+      "short/empty page means caught-up or waiting on an in-flight write — just poll again. Pass " +
+      '`after_version: ""` to start from the beginning of the log.',
     inputSchema: {
       type: "object",
       properties: {
@@ -1191,14 +1278,14 @@ export const TOOL_REGISTRY: ToolEntry[] = [
   {
     name: "history_index",
     description:
-      "Page the live document set of one repo as of a safe head R (sync/history plan §3.4) — the " +
-      "startup/reconciliation enumeration a sync client runs before tailing. Returns lightweight " +
-      "{path, version_id, content_hash} tuples in current-version-id order, keyset-paginated and " +
-      "bounded through R. On the first call omit `through_version`; the server captures R and " +
-      "echoes it — pass it back (plus `after_version` = the previous page's last version_id) on " +
-      "subsequent pages. System (`:deleted/`) and hidden (`.`-prefixed) paths are excluded, as " +
-      "`query` defaults. The handoff is exact: a base scan over (cursor, R] plus history_since(R) " +
-      "is gap-free, so a doc updated mid-pagination simply arrives later on the feed.",
+      "Page the live document set of one repo as of a safe head R — the startup/reconciliation " +
+      "enumeration a sync client runs before tailing. Returns lightweight {path, version_id, " +
+      "content_hash} tuples in current-version-id order, keyset-paginated and bounded through R. " +
+      "On the first call omit `through_version`; the server captures R and echoes it — pass it back " +
+      "(plus `after_version` = the previous page's last version_id) on subsequent pages. System " +
+      "(`:deleted/`) and hidden (`.`-prefixed) paths are excluded, as `query` defaults. The handoff " +
+      "is exact: a base scan over (cursor, R] plus `history_since`(R) is gap-free, so a doc updated " +
+      "mid-pagination simply arrives later on the feed.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1264,10 +1351,12 @@ export const TOOL_REGISTRY: ToolEntry[] = [
   {
     name: "query_syntax",
     description:
-      "Reference documentation for the `query` tool's filter language: CEL syntax, $-intrinsics " +
-      "($path, $updated_at, $body), list() scalar-or-list polymorphism, link-graph predicates " +
-      "($in, $has, $backlinks(), $links()), text-search syntax, and rank mode. Call this before " +
-      "writing a non-trivial filter, or after a filter_invalid error.",
+      "Reference documentation for the `query` / `graph` filter language and `query`'s result " +
+      "shape: CEL syntax, $-intrinsics ($path, $updated_at, $body, $content_hash), `select` " +
+      '(default ["$path"] only — not full documents), list() scalar-or-list polymorphism, ' +
+      "link-graph predicates ($in, $has, $backlinks(), $links()), graph-only `$degrees`, " +
+      "text-search syntax, and rank mode. Call this before writing a non-trivial filter, or after " +
+      "a filter_invalid error.",
     inputSchema: { type: "object", properties: {} },
     outputSchema: {
       type: "object",

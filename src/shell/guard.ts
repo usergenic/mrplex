@@ -156,6 +156,8 @@ export function guardKernel(kernel: Kernel, entitlement: Entitlement, audit?: Au
     docs: {
       get: (_ctx, repo, path) =>
         forward("docs.get", { repo, path }, () => kernel.docs.get(readCtx(), repo, path)),
+      get_many: (_ctx, repo, paths) =>
+        forward("docs.get_many", { repo }, () => kernel.docs.get_many(readCtx(), repo, paths)),
       get_version: (_ctx, repo, versionId) =>
         forward("docs.get_version", { repo }, () =>
           kernel.docs.get_version(readCtx(), repo, versionId),

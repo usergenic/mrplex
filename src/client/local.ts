@@ -73,6 +73,14 @@ function buildClient(
     docs: {
       get: async (repo, path, opts) =>
         maybeInjectVersion(await kernel.docs.get(ctx, repo, path), opts),
+      get_many: async (repo, paths, opts) => {
+        const result = await kernel.docs.get_many(ctx, repo, paths);
+        if (opts?.raw) return result;
+        return {
+          items: result.items.map((v) => maybeInjectVersion(v, opts)),
+          errors: result.errors,
+        };
+      },
       get_version: async (repo, vid, opts) =>
         maybeInjectVersion(await kernel.docs.get_version(ctx, repo, vid), opts),
       history: (repo, path, opts) => kernel.docs.history(ctx, repo, path, opts),

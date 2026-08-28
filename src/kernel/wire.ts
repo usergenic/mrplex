@@ -3,6 +3,8 @@
  * Integer ids never appear here; version_ids are opaque strings.
  */
 
+import type { KernelErrorCode } from "./errors.js";
+
 export type PathConfig = {
   disallowed_chars?: string[];
   system_sigils?: string[];
@@ -153,4 +155,17 @@ export type GraphResult = {
   complete_degrees: number;
   /** True iff `max_documents` or the links ceiling elided anything. */
   truncated: boolean;
+};
+
+/** Per-path failure from `docs.get_many` — the call still succeeds. */
+export type DocGetManyError = {
+  path: string;
+  code: KernelErrorCode;
+  data: Record<string, unknown>;
+};
+
+/** Result of `docs.get_many` — found versions plus per-path errors. */
+export type DocGetManyResult = {
+  items: Version[];
+  errors: DocGetManyError[];
 };

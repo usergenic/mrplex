@@ -26,6 +26,7 @@ import type {
 import type { PathConfigOverride } from "../kernel/path-config.js";
 import type { QuerySpec } from "../kernel/query/query.js";
 import type {
+  DocGetManyResult,
   GraphResult,
   GraphSpec,
   HistoryIndexPage,
@@ -152,6 +153,12 @@ function buildRemoteClient(client: Client): KernelClient {
     docs: {
       get: (repo, path, opts) =>
         call<Version>("docs_get", { repo, path, ...(opts?.raw && { raw: true }) }),
+      get_many: (repo, paths, opts) =>
+        call<DocGetManyResult>("docs_get_many", {
+          repo,
+          paths,
+          ...(opts?.raw && { raw: true }),
+        }),
       get_version: (repo, vid, opts) =>
         call<Version>("docs_get_version", {
           repo,

@@ -50,14 +50,16 @@ repo the caller can see.
 the fields you want; each hit is an object of just those fields. Names are
 either bare frontmatter keys (\`title\`, \`status\`) or \`$\`-intrinsics
 (\`$path\`, \`$repo\`, \`$version_id\`, \`$prev_version_id\`, \`$next_version_id\`,
-\`$updated_at\`, \`$author\`, \`$body\`). Any field that isn't user frontmatter
-carries the \`$\` sigil, so a frontmatter key literally named \`path\` never
-collides with the system's \`$path\`.
+\`$updated_at\`, \`$author\`, \`$body\`, \`$content_hash\`). Any field that isn't
+user frontmatter carries the \`$\` sigil, so a frontmatter key literally named
+\`path\` never collides with the system's \`$path\`.
 
-\`select\` defaults to \`["$path"]\` — the cheapest useful projection. Document
-bodies travel only when you ask for \`$body\`, so listing/filtering is cheap by
-default. When querying more than one repo, add \`$repo\` to tell the paths apart.
-To recover whole documents, use \`docs.get\`.
+\`select\` defaults to \`["$path"]\` — **that is all you get** unless you pass
+\`select\`. Each default hit is \`{ "$path": "…" }\` only: no body, no
+frontmatter, no version id. Document bodies travel only when you ask for
+\`$body\`, so listing/filtering is cheap by default. When querying more than
+one repo, add \`$repo\` to tell the paths apart. To recover whole documents,
+use \`docs.get\` (one path) or \`docs.get_many\` (batch).
 
 ## CEL filter basics
 

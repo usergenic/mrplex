@@ -36,6 +36,7 @@ import {
   claimsGrantRepo,
   normalizeClaims,
 } from "./auth/scope.js";
+import { normalizeKey } from "./casefold.js";
 import { type CallContext, resolveAuthor } from "./context.js";
 import { deletionPath, pathIsInSystemNamespace } from "./deletion.js";
 import { type UnifiedDiff, runDiff } from "./diff.js";
@@ -64,10 +65,12 @@ import {
   pathWarning,
   validateRepoOverride,
 } from "./path-config.js";
-import { type QuerySpec, runQuery } from "./query/query.js";
+import { type QuerySpec, DEFAULT_QUERY_LIMIT, runQuery } from "./query/query.js";
 import { validatePath, validateSlug } from "./validation.js";
 import { decodeVersionId, encodeVersionId } from "./version-id.js";
 import type {
+  DocGetManyError,
+  DocGetManyResult,
   GraphResult,
   GraphSpec,
   HistoryIndexPage,
@@ -107,6 +110,9 @@ export type RepairResult = {
   skipped: { path: string; reason: string }[];
 };
 
+/** Hard cap on named paths per `docs.get_many` call (after dedupe). */
+export const GET_MANY_MAX_PATHS = DEFAULT_QUERY_LIMIT;
+
 export type Kernel = {
   repos: {
     list(ctx: CallContext, opts?: { include_system?: boolean }): Promise<Repo[]>;
@@ -127,6 +133,7 @@ export type Kernel = {
   };
   docs: {
     get(ctx: CallContext, repo: string, path: string): Promise<Version>;
+    get_many(ctx: CallContext, repo: string, paths: string[]): Promise<DocGetManyResult>;
     get_version(ctx: CallContext, repo: string, version_id: string): Promise<Version>;
     history(
       ctx: CallContext,
@@ -295,6 +302,35 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
     if (!claimsGrantRead(claims, repoSlug, path)) throw forbidden();
   }
 
+  function dedupeGetManyPaths(paths: unknown): string[] {
+    if (!Array.isArray(paths) || paths.length === 0) {
+      throw new KernelError("filter_invalid", {
+        reason: "paths must be a non-empty array of strings",
+      });
+    }
+    const unique: string[] = [];
+    const seen = new Set<string>();
+    for (const p of paths) {
+      if (typeof p !== "string") {
+        throw new KernelError("filter_invalid", {
+          reason: "paths must be a non-empty array of strings",
+        });
+      }
+      if (!seen.has(p)) {
+        seen.add(p);
+        unique.push(p);
+      }
+    }
+    if (unique.length > GET_MANY_MAX_PATHS) {
+      throw new KernelError("payload_too_large", {
+        limit: GET_MANY_MAX_PATHS,
+        got: unique.length,
+        reason: `paths exceeds ${GET_MANY_MAX_PATHS}`,
+      });
+    }
+    return unique;
+  }
+
   function currentPathForStaleError(
     claims: ClaimMatcher[] | null,
     repoSlug: string,
@@ -430,6 +466,29 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
         const row = await storage.version_current(repo.id, path);
         if (!row) throw docNotFound(repoSlug, path);
         return toVersionWire(row, repoSlug);
+      },
+
+      async get_many(ctx, repoSlug, paths) {
+        const repo = await resolveRepo(ctx, repoSlug);
+        const uniquePaths = dedupeGetManyPaths(paths);
+        const rows = await storage.versions_current_by_paths(repo.id, uniquePaths);
+        const byNorm = new Map(rows.map((r) => [normalizeKey(r.path), r]));
+        const claims = claimsFor(ctx);
+        const items: Version[] = [];
+        const errors: DocGetManyError[] = [];
+        for (const path of uniquePaths) {
+          if (claims !== null && !claimsGrantRead(claims, repo.slug, path)) {
+            errors.push({ path, code: "forbidden", data: {} });
+            continue;
+          }
+          const row = byNorm.get(normalizeKey(path));
+          if (!row) {
+            errors.push({ path, code: "doc_not_found", data: { repo: repoSlug, path } });
+            continue;
+          }
+          items.push(toVersionWire(row, repoSlug));
+        }
+        return { items, errors };
       },
 
       async get_version(ctx, repoSlug, versionId) {

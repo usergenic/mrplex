@@ -30,7 +30,7 @@ import { createKernel } from "../kernel/kernel.js";
 import type { GraphSpec } from "../kernel/wire.js";
 import { extractSystemProperties, split as splitFrontmatter } from "../markdown/frontmatter.js";
 import { backfillContentHashes } from "../markdown/hash-backfill.js";
-import { renderGraphSummary } from "../mcp/render.js";
+import { renderDocGetManyText, renderGraphSummary } from "../mcp/render.js";
 import { startMcpStdio } from "../mcp/server.js";
 import { startServer } from "../server/serve.js";
 import { fileAuditSink } from "../shell/audit.js";
@@ -1028,6 +1028,32 @@ function buildProgram(): Command {
       withClient(this, async (client, opts) => {
         const result = await client.docs.get(repo, path, { raw: localOpts.raw === true });
         emit(result, opts, renderVersionAsMarkdown(result));
+      }).catch(reportError);
+    });
+
+  docs
+    .command("get-many <path...>")
+    .description("read the current versions of several paths at once")
+    .option(
+      "--raw",
+      "suppress server-injected $version (and other $* system properties) in the output",
+      false,
+    )
+    .action(function (this: Command, paths: string[]) {
+      const localOpts = this.opts<{ raw?: boolean }>();
+      const globals = this.optsWithGlobals<GlobalOpts>();
+      let repo: string;
+      try {
+        repo = resolveRepoSlug(globals);
+      } catch (err) {
+        reportError(err);
+      }
+      if (paths.length === 0) {
+        reportError(new KernelError("filter_invalid", { reason: "at least one path is required" }));
+      }
+      withClient(this, async (client, opts) => {
+        const result = await client.docs.get_many(repo, paths, { raw: localOpts.raw === true });
+        emit(result, opts, renderDocGetManyText(result.items, result.errors));
       }).catch(reportError);
     });
 

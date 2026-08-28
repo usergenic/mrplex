@@ -176,6 +176,75 @@ export function runKernelSuite(factory: AdapterFactory): void {
       });
     });
 
+    describe("docs.get_many", () => {
+      it("returns found versions and per-path errors without failing the call", async () => {
+        const r = await kernel.docs.get_many(ROOT, "notes", [
+          "welcome.md",
+          "missing.md",
+          "readme.md",
+        ]);
+        expect(r.items.map((v) => v.path)).toEqual(["welcome.md", "readme.md"]);
+        expect(r.errors).toEqual([
+          { path: "missing.md", code: "doc_not_found", data: { repo: "notes", path: "missing.md" } },
+        ]);
+      });
+
+      it("all-miss is still success", async () => {
+        const r = await kernel.docs.get_many(ROOT, "notes", ["nope-a.md", "nope-b.md"]);
+        expect(r.items).toEqual([]);
+        expect(r.errors).toHaveLength(2);
+      });
+
+      it("collapses exact duplicate paths (first-seen)", async () => {
+        const r = await kernel.docs.get_many(ROOT, "notes", ["welcome.md", "welcome.md"]);
+        expect(r.items).toHaveLength(1);
+        expect(r.errors).toEqual([]);
+      });
+
+      it("throws filter_invalid for empty paths", async () => {
+        await expect(kernel.docs.get_many(ROOT, "notes", [])).rejects.toMatchObject({
+          code: "filter_invalid",
+        });
+      });
+
+      it("throws payload_too_large when over the cap", async () => {
+        const paths = Array.from({ length: 51 }, (_, i) => `p${i}.md`);
+        await expect(kernel.docs.get_many(ROOT, "notes", paths)).rejects.toMatchObject({
+          code: "payload_too_large",
+        });
+      });
+
+      it("throws repo_not_found for an unknown repo", async () => {
+        await expect(kernel.docs.get_many(ROOT, "nope", ["welcome.md"])).rejects.toMatchObject({
+          code: "repo_not_found",
+        });
+      });
+
+      it("case-folds path lookup like docs.get", async () => {
+        const actor: CallContext = { author: "bob" };
+        await kernel.docs.create(actor, "notes", "people/bob.MD", {
+          body: "hi\n",
+          frontmatter_raw: "",
+        });
+        const r = await kernel.docs.get_many(ROOT, "notes", ["people/bob.md"]);
+        expect(r.items[0]?.path).toBe("people/bob.MD");
+        expect(r.errors).toEqual([]);
+      });
+
+      it("forbidden for out-of-scope paths without leaking existence", async () => {
+        await kernel.docs.create(ROOT, "notes", "secret/hidden.md", {
+          body: "s\n",
+          frontmatter_raw: "",
+        });
+        const scoped: CallContext = {
+          scope: [{ repo: "notes", paths: ["welcome.md", "readme.md"] }],
+        };
+        const r = await kernel.docs.get_many(scoped, "notes", ["welcome.md", "secret/hidden.md"]);
+        expect(r.items.map((v) => v.path)).toEqual(["welcome.md"]);
+        expect(r.errors).toEqual([{ path: "secret/hidden.md", code: "forbidden", data: {} }]);
+      });
+    });
+
     describe("docs.get_version", () => {
       it("returns a historical version by id", async () => {
         const current = await kernel.docs.get(ROOT, "notes", "welcome.md");

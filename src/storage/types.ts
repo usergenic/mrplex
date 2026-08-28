@@ -254,6 +254,12 @@ export type Storage = {
 
   version_by_id(id: number): Promise<VersionRow | null>;
   version_current(repo_id: number, path: string): Promise<VersionRow | null>;
+  /**
+   * Current-version rows for a batch of live paths in `repo_id`. Lookup is by
+   * `path_norm` (same folding as `version_current`); paths with no live row are
+   * simply absent.
+   */
+  versions_current_by_paths(repo_id: number, paths: readonly string[]): Promise<VersionRow[]>;
   version_history(document_id: number, opts?: HistoryOptions): Promise<VersionRow[]>;
 
   /**
