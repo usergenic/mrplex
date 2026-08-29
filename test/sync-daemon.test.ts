@@ -177,13 +177,21 @@ describe("sync daemon", () => {
       }
     });
     renameSync(join(vault, "Untitled.md"), join(vault, "brand-new-idea.md"));
+    // A rename is detected as a move only when chokidar delivers unlink(old)+
+    // add(new) inside one debounce burst, so pushBurst can suppress the delete
+    // (§4.7). Under the full parallel suite's CPU load those fs events can be
+    // delayed or split across bursts, in which case the move completes via the
+    // slower recoverStalePut restore-from-`:deleted` path. This case runs in
+    // ~90ms in isolation but can blow past the default 8s deadline when a
+    // vitest worker is starved, so give it extra headroom (under the 30s
+    // testTimeout). Not a daemon bug — purely event-scheduling latency.
     const moved = await waitFor(async () => {
       try {
         return await client.docs.get("notes", "brand-new-idea.md");
       } catch {
         return undefined;
       }
-    });
+    }, 20_000);
     expect(moved.prev_version_id).toBe(v1.version_id);
     expect(moved.body).toBe("This is a brand new idea.\n");
     await expect(client.docs.get("notes", "Untitled.md")).rejects.toThrow();
