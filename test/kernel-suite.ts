@@ -958,32 +958,39 @@ export function runKernelSuite(factory: AdapterFactory): void {
         expect(await paths(actor, '$has_static("a.md")')).toEqual(["note.md"]);
       });
 
-      it("repos.set_link_config enables frontmatter-field extraction + re-extracts", async () => {
+      it("repos.set_link_config toggles frontmatter extraction + re-extracts", async () => {
         const actor = await aliceActor();
         await mk(actor, "moc/employees.md", "team");
-        await mk(actor, "alice.md", "hi", { parent: "moc/employees.md" });
-        // Default config: no frontmatter fields → the parent edge isn't indexed.
-        expect(await paths(actor, '$has_static("moc/employees.md", "parent")')).toEqual([]);
-
-        // Opt into the `parent` field; the op re-extracts the whole repo.
-        const res = await kernel.repos.set_link_config(actor, "notes", { fields: ["parent"] });
-        expect(res.repo.repo).toBe("notes");
-        expect(res.reindexed.documents).toBeGreaterThanOrEqual(2);
-
-        // Now the field edge is queryable.
+        await mk(actor, "alice.md", "hi", { parent: "/moc/employees.md" });
         expect(await paths(actor, '$has_static("moc/employees.md", "parent")')).toEqual([
           "alice.md",
         ]);
 
-        // Clearing the override re-extracts back to defaults (edge gone).
-        await kernel.repos.set_link_config(actor, "notes", null);
+        const res = await kernel.repos.set_link_config(actor, "notes", {
+          frontmatter: {
+            inline: false,
+            reference: false,
+            autolink: false,
+            wikilink: false,
+            fullpath: false,
+          },
+        });
+        expect(res.repo.repo).toBe("notes");
+        expect(res.reindexed.documents).toBeGreaterThanOrEqual(2);
         expect(await paths(actor, '$has_static("moc/employees.md", "parent")')).toEqual([]);
+
+        await kernel.repos.set_link_config(actor, "notes", null);
+        expect(await paths(actor, '$has_static("moc/employees.md", "parent")')).toEqual([
+          "alice.md",
+        ]);
       });
 
       it("repos.set_link_config rejects an invalid override", async () => {
         const actor = await aliceActor();
         try {
-          await kernel.repos.set_link_config(actor, "notes", { fields: ["bad index[0]"] });
+          await kernel.repos.set_link_config(actor, "notes", {
+            body: { inline: "nope" as unknown as boolean },
+          });
           throw new Error("expected throw");
         } catch (err) {
           expect((err as KernelError).code).toBe("link_config_invalid");

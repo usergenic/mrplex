@@ -30,15 +30,7 @@ async function fresh(): Promise<Storage> {
   });
 }
 
-// A repo whose link config opts into two frontmatter reference fields, so
-// frontmatter-edge extraction is exercised too.
-async function withFrontmatterFields(): Promise<void> {
-  await storage.repos_set_link_config(repoId, JSON.stringify({ fields: ["parent", "related"] }));
-}
-
-async function withFields(...fields: string[]): Promise<void> {
-  await storage.repos_set_link_config(repoId, JSON.stringify({ fields }));
-}
+// Frontmatter fullpath links use defaults — no per-repo field opt-in.
 
 beforeEach(async () => {
   storage = await fresh();
@@ -120,11 +112,10 @@ describe("outbound extraction on create", () => {
     expect(edges[0]?.target_id).toBe(await docIdAt("alice.md"));
   });
 
-  it("records frontmatter-field edges when the repo opts in", async () => {
-    await withFrontmatterFields();
+  it("records frontmatter fullpath edges by default", async () => {
     await create("moc/employees.md", { body: "team" });
     await create("alice.md", {
-      frontmatter: { parent: "moc/employees.md", related: ["bob.md"] },
+      frontmatter: { parent: "/moc/employees.md", related: ["/bob.md"] },
       body: "hi",
     });
     const edges = await edgesFrom("alice.md");
@@ -132,16 +123,14 @@ describe("outbound extraction on create", () => {
       { field: "parent", target: "moc/employees.md" },
       { field: "related", target: "bob.md" },
     ]);
-    // parent resolves (target exists); related is dangling (bob.md absent).
     expect(edges[0]?.target_id).toBe(await docIdAt("moc/employees.md"));
     expect(edges[1]?.target_id).toBeNull();
   });
 
-  it("resolves a nested-object frontmatter field (project.lead) to identity", async () => {
-    await withFields("project.lead");
+  it("resolves a nested-object frontmatter fullpath (project.lead) to identity", async () => {
     await create("people/lead.md", { body: "the lead" });
     await create("proj.md", {
-      frontmatter: { project: { lead: "people/lead.md" } },
+      frontmatter: { project: { lead: "/people/lead.md" } },
       body: "a project",
     });
     const edges = await edgesFrom("proj.md");
@@ -150,25 +139,10 @@ describe("outbound extraction on create", () => {
     expect(edges[0]?.target_id).toBe(await docIdAt("people/lead.md"));
   });
 
-  it("resolves a frontmatter reference RELATIVE to the source doc's directory", async () => {
-    // A bare (non-absolute) frontmatter path resolves like a CommonMark
-    // relative link — against the source's own directory, not the repo root.
-    await withFields("parent");
-    await create("team/lead.md", { body: "lead" });
-    await create("team/alice.md", {
-      frontmatter: { parent: "lead.md" }, // relative → team/lead.md
-      body: "alice",
-    });
-    const edges = await edgesFrom("team/alice.md");
-    expect(edges[0]?.target_raw).toBe("team/lead.md");
-    expect(edges[0]?.target_id).toBe(await docIdAt("team/lead.md"));
-  });
-
-  it("resolves a repo-absolute frontmatter reference (leading slash) from the root", async () => {
-    await withFields("parent");
+  it("resolves a repo-absolute frontmatter fullpath from the root", async () => {
     await create("moc.md", { body: "root moc" });
     await create("deep/nested/note.md", {
-      frontmatter: { parent: "/moc.md" }, // absolute → moc.md at root
+      frontmatter: { parent: "/moc.md" },
       body: "note",
     });
     const edges = await edgesFrom("deep/nested/note.md");
@@ -176,8 +150,7 @@ describe("outbound extraction on create", () => {
     expect(edges[0]?.target_id).toBe(await docIdAt("moc.md"));
   });
 
-  it("a dangling frontmatter field re-binds when its target is created", async () => {
-    await withFields("parent");
+  it("a dangling frontmatter fullpath re-binds when its target is created", async () => {
     await create("child.md", { frontmatter: { parent: "/hub.md" }, body: "c" });
     expect((await edgesFrom("child.md"))[0]?.target_id).toBeNull();
     await create("hub.md", { body: "hub" });
@@ -222,9 +195,8 @@ describe("self-links are never indexed (noise suppression)", () => {
     expect(await edgesFrom("alice.md")).toEqual([]);
   });
 
-  it("drops a self-link via a frontmatter field", async () => {
-    await withFields("canonical");
-    await create("page.md", { frontmatter: { canonical: "page.md" }, body: "x" });
+  it("drops a self-link via a frontmatter fullpath", async () => {
+    await create("page.md", { frontmatter: { canonical: "/page.md" }, body: "x" });
     expect(await edgesFrom("page.md")).toEqual([]);
   });
 
@@ -274,17 +246,16 @@ describe("re-extraction on put (in-place update)", () => {
   });
 
   it("re-extracts frontmatter edges when frontmatter changes", async () => {
-    await withFrontmatterFields();
     await create("p1.md", { body: "1" });
     await create("p2.md", { body: "2" });
     const v1 = await create("child.md", {
-      frontmatter: { parent: "p1.md" },
+      frontmatter: { parent: "/p1.md" },
       body: "c",
     });
     expect((await edgesFrom("child.md"))[0]?.target_id).toBe(await docIdAt("p1.md"));
 
     await kernel.docs.put({}, "notes", v1.version_id, "child.md", {
-      frontmatter: { parent: "p2.md" },
+      frontmatter: { parent: "/p2.md" },
     });
     const edges = await edgesFrom("child.md");
     expect(edges).toHaveLength(1);

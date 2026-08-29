@@ -8,6 +8,8 @@ commander: /crew/aria-okonkwo.md
 crew:
   - /crew/dax-thorne.md
   - /crew/bexley-orr.md
+$version: v23
+$content_hash: 0e18426fee240bc2be1fc3cec30b081fa5894039ffbd402abfba2fdb5d9b6f21
 ---
 
 # The Cinder Run

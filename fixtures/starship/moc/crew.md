@@ -1,6 +1,8 @@
 ---
 title: MOC — Crew Roster
 type: moc
+$version: v27
+$content_hash: ccdf4f513a98942bbfd67a0b9d047592824ee54e8de35dec152708ba53a78acf
 ---
 
 # Crew Roster

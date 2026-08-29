@@ -4,18 +4,9 @@
  *   HARDCODED_DEFAULTS  → server config  → per-repo override
  *      (in code)          (operator)       (repos.link_config JSON)
  *
- * A structural twin of kernel/path-config.ts: non-null replaces the *field
- * it sets*, not deep-merged. A repo that sets `fields: ["parent"]` sees
- * exactly that; `syntaxes` and `resolution` still inherit from the server.
- *
- * `syntaxes` is one field — an override that sets it must restate every
- * syntax it wants on (whole-object replace, links-plan.md §5 decision 7).
- * This keeps one merge rule everywhere, matching path-config's field-level
- * semantics.
- *
- * The effective config drives deterministic extraction (WS2). Disabling a
- * syntax removes it from extraction entirely; a config change triggers a
- * repo-wide re-extraction on the backfill path (WS3), never synchronously.
+ * Body and frontmatter each declare which link *syntaxes* are recognized in
+ * that region. Frontmatter string values are scanned automatically — no
+ * per-field opt-in list.
  */
 
 import { KernelError } from "../kernel/errors.js";
@@ -28,12 +19,17 @@ import { KernelError } from "../kernel/errors.js";
  * Which link syntaxes extraction recognizes. Each is a boolean knob; the
  * `!` embed/transclusion prefix is NOT a syntax — it's a rendering hint
  * captured as an ordinary edge from its base syntax (§1.1).
+ *
+ * `fullpath` matches repo-root paths written as `/dir/doc.md` (optional
+ * `#anchor`). In the document body, matches may appear inline in prose; in
+ * frontmatter, only a string value that *is* such a path (after trim) counts.
  */
 export type LinkSyntaxes = {
   inline: boolean; // [text](path)
   reference: boolean; // [text][id] + [id]: path
   autolink: boolean; // <path>
   wikilink: boolean; // [[page]], [[page|display]]
+  fullpath: boolean; // /repo/root/path.md
 };
 
 /**
@@ -49,9 +45,10 @@ export type LinkResolution = {
 
 /** The full config after merging tiers — every field populated. */
 export type LinkConfig = {
-  syntaxes: LinkSyntaxes;
-  /** Frontmatter reference fields — CEL field paths, opt-in per repo. */
-  fields: string[];
+  /** Syntaxes recognized in the Markdown body. */
+  body: LinkSyntaxes;
+  /** Syntaxes recognized inside frontmatter string values. */
+  frontmatter: LinkSyntaxes;
   resolution: LinkResolution;
 };
 
@@ -61,24 +58,37 @@ export type LinkConfig = {
  * "inherit"; setting it means "replace the inherited value wholesale."
  */
 export type LinkConfigOverride = {
-  syntaxes?: LinkSyntaxes;
-  fields?: string[];
+  body?: LinkSyntaxes;
+  frontmatter?: LinkSyntaxes;
   resolution?: LinkResolution;
 };
 
+const SYNTAX_KEYS = ["inline", "reference", "autolink", "wikilink", "fullpath"] as const;
+
+/** All body syntaxes on — the default document-body profile. */
+export const DEFAULT_BODY_SYNTAXES: LinkSyntaxes = {
+  inline: true,
+  reference: true,
+  autolink: true,
+  wikilink: true,
+  fullpath: true,
+};
+
 /**
- * Hardcoded defaults (§11.2 "Recognized syntaxes and defaults"). One
- * constant, source of truth. All body syntaxes on; frontmatter fields
- * opt-in (empty).
+ * Frontmatter profile: whole-value `/…/*.md` paths plus embedded wikilinks
+ * and inline links. Reference/autolink off — uncommon inside YAML scalars.
  */
+export const DEFAULT_FRONTMATTER_SYNTAXES: LinkSyntaxes = {
+  inline: true,
+  reference: false,
+  autolink: false,
+  wikilink: true,
+  fullpath: true,
+};
+
 export const HARDCODED_DEFAULTS: LinkConfig = {
-  syntaxes: {
-    inline: true,
-    reference: true,
-    autolink: true,
-    wikilink: true,
-  },
-  fields: [],
+  body: DEFAULT_BODY_SYNTAXES,
+  frontmatter: DEFAULT_FRONTMATTER_SYNTAXES,
   resolution: {
     wikilink_elision: true,
     preserve_anchors: true,
@@ -90,29 +100,15 @@ export const HARDCODED_DEFAULTS: LinkConfig = {
 // Merging.
 // -----------------------------------------------------------------------------
 
-/**
- * Replace-not-merge per field (§1.2): if override.X is set, result.X =
- * override.X; otherwise result.X inherits from base. `syntaxes` and
- * `resolution` are whole-object fields (decision 7) — no per-key merge.
- */
 export function mergeConfig(base: LinkConfig, override: LinkConfigOverride | null): LinkConfig {
   if (!override) return base;
   return {
-    syntaxes: override.syntaxes ?? base.syntaxes,
-    fields: override.fields ?? base.fields,
+    body: override.body ?? base.body,
+    frontmatter: override.frontmatter ?? base.frontmatter,
     resolution: override.resolution ?? base.resolution,
   };
 }
 
-/**
- * Compute the effective config for a repo:
- *
- *   effective = merge(server, repo_override)  where server = merge(defaults, server_override)
- *
- * `serverConfig` is expected to already be validated (validateConfig at
- * startup). Does NOT re-validate — a caller taking an override from
- * `repos.set_link_config` must validate the merge before persisting.
- */
 export function effectiveLinkConfig(
   serverConfig: LinkConfig,
   repoOverride: LinkConfigOverride | null,
@@ -120,7 +116,6 @@ export function effectiveLinkConfig(
   return mergeConfig(serverConfig, repoOverride);
 }
 
-/** Parse the JSON text stored in `repos.link_config`. Null → null. */
 export function parseRepoOverride(json: string | null): LinkConfigOverride | null {
   if (json === null) return null;
   const parsed = JSON.parse(json) as unknown;
@@ -135,11 +130,6 @@ export function parseRepoOverride(json: string | null): LinkConfigOverride | nul
 // Startup invariants.
 // -----------------------------------------------------------------------------
 
-/**
- * Thrown at startup when server config violates an invariant. Not a
- * KernelError — a configuration error the operator must fix before the
- * server starts, mirroring path-config's ConfigError.
- */
 export class ConfigError extends Error {
   constructor(message: string) {
     super(message);
@@ -147,50 +137,17 @@ export class ConfigError extends Error {
   }
 }
 
-/**
- * CEL field path (§11.2 "Field paths"): a leading identifier, followed by
- * zero or more `.identifier` or `["quoted"]` accessors. No array indices;
- * `$body` and other `$`-sentinels are not legal declared fields.
- *
- *   parent · project.lead · owners["team-lead"] · data["2024-Q3"].value
- */
-const IDENT = "[A-Za-z_][A-Za-z0-9_]*";
-const BRACKET = '\\["(?:[^"\\\\]|\\\\.)*"\\]';
-const FIELD_PATH = new RegExp(`^${IDENT}(?:\\.${IDENT}|${BRACKET})*$`);
-
-function isValidFieldPath(path: string): boolean {
-  if (path.length === 0) return false;
-  if (path.startsWith("$")) return false; // '$body' etc. are sentinels, not fields
-  return FIELD_PATH.test(path);
+function validateSyntaxes(label: string, syn: LinkSyntaxes): void {
+  for (const key of SYNTAX_KEYS) {
+    if (typeof syn[key] !== "boolean") {
+      throw new ConfigError(`${label}.${key} must be a boolean, got ${JSON.stringify(syn[key])}`);
+    }
+  }
 }
 
-/**
- * Validate a fully-merged LinkConfig:
- *
- *   • syntaxes has exactly the four boolean knobs.
- *   • fields entries are non-empty, valid CEL field paths (not sentinels).
- *   • resolution.index_basename is a non-empty string.
- *
- * Throws ConfigError on the first violation, with a human-readable message.
- */
 export function validateConfig(config: LinkConfig): void {
-  const syn = config.syntaxes;
-  for (const key of ["inline", "reference", "autolink", "wikilink"] as const) {
-    if (typeof syn[key] !== "boolean") {
-      throw new ConfigError(`syntaxes.${key} must be a boolean, got ${JSON.stringify(syn[key])}`);
-    }
-  }
-
-  if (!Array.isArray(config.fields)) {
-    throw new ConfigError(`fields must be an array, got ${typeof config.fields}`);
-  }
-  for (const field of config.fields) {
-    if (typeof field !== "string" || !isValidFieldPath(field)) {
-      throw new ConfigError(
-        `fields entry must be a valid CEL field path, got ${JSON.stringify(field)}`,
-      );
-    }
-  }
+  validateSyntaxes("body", config.body);
+  validateSyntaxes("frontmatter", config.frontmatter);
 
   if (
     typeof config.resolution.index_basename !== "string" ||
@@ -209,13 +166,6 @@ export function validateConfig(config: LinkConfig): void {
   }
 }
 
-/**
- * Validate a LinkConfigOverride BEFORE merging — used by
- * `repos.set_link_config`. The merged result must be a valid config.
- * Surfaces as a KernelError so the API returns a clean 4xx (path-config's
- * validateRepoOverride throws ConfigError at startup, but repo overrides
- * are runtime input, so we wrap the message as filter-style config_invalid).
- */
 export function validateRepoOverride(override: LinkConfigOverride, serverConfig: LinkConfig): void {
   try {
     validateConfig(mergeConfig(serverConfig, override));

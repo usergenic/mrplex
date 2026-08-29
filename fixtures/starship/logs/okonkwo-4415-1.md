@@ -4,6 +4,8 @@ type: log
 stardate: 4415.1
 author: /crew/aria-okonkwo.md
 mission: /missions/the-hollow-signal.md
+$version: v17
+$content_hash: c465ddce0d1b824f22339d88601251d0222473a11d5785a65be1d9c967d31724
 ---
 
 # Command Log — Okonkwo, 4415.1

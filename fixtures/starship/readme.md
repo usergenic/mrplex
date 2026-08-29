@@ -1,8 +1,12 @@
+---
+$version: v30
+$content_hash: bc08bdb28445c0cc3547c899ece402842ef762ad5761a85dc5352056748cc342
+---
 # USS Meridian — Ship's Knowledge Base
 
 A sample mrplex repository: the operational notes, crew files, mission records, encounter logs, and equipment status of a fictional survey starship. Every entry is deliberately short — one idea, one to three paragraphs, zettelkasten-style — so the repo reads as a connected graph rather than a handful of long documents.
 
-It exists to exercise mrplex end to end: links, backlinks, frontmatter reference-fields, graph queries, filters, and full-text search all have something real to bite on here.
+It exists to exercise mrplex end to end: links, backlinks, frontmatter paths, graph queries, filters, and full-text search all have something real to bite on here.
 
 ## Layout
 
@@ -16,19 +20,13 @@ It exists to exercise mrplex end to end: links, backlinks, frontmatter reference
 
 ## Link configuration
 
-This repo opts the following frontmatter fields into the link graph:
-
-```json
-{ "fields": ["reports_to", "commander", "crew", "author", "mission", "maintainer", "related"] }
-```
-
-Body links use wikilinks (`[[crew/kestrel-vance]]`) and inline links; frontmatter fields use repo-absolute paths (`/crew/kestrel-vance.md`).
+Body links and frontmatter string values each honor a `body` / `frontmatter` syntax profile (inline, reference, wikilink, fullpath, …). Defaults index wikilinks and `/repo/root/path.md` values in YAML automatically. Per-repo overrides via `mrplex repos set-link-config` toggle syntaxes — see `src/links/link-config.ts`.
 
 ## Example queries
 
 ```bash
 # Who reports directly to the captain?
-mrplex -r starship query --filter '$in_static("crew/kestrel-vance.md", "reports_to")'
+mrplex -r starship query --filter '$has_static("crew/kestrel-vance.md", "reports_to")'
 
 # Which officer does the whole ship reference? (the hubs)
 mrplex -r starship query --filter '$backlinks_static().size() >= 4'

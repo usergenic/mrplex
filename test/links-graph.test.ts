@@ -36,9 +36,6 @@ function create(
   return kernel.docs.create({}, "notes", path, { ...fm, body: input.body ?? "" });
 }
 
-async function fields(...fs: string[]): Promise<void> {
-  await storage.repos_set_link_config(repoId, JSON.stringify({ fields: fs }));
-}
 
 /** Query with a filter; return the matching paths, sorted. */
 async function q(filter: string, ctx: CallContext = {}): Promise<string[]> {
@@ -144,23 +141,19 @@ describe("$has_static — me → others (X is in my set)", () => {
 
 describe("field restriction (optional 2nd argument)", () => {
   it("$has_static(glob, field) restricts to a frontmatter field edge", async () => {
-    await fields("parent", "related");
     await create("moc/employees.md");
     await create("alice.md", {
-      frontmatter: { parent: "moc/employees.md" },
-      body: "[e](/moc/employees.md)", // also a body edge to the same target
+      frontmatter: { parent: "/moc/employees.md" },
+      body: "[e](/moc/employees.md)",
     });
-    await create("bob.md", { frontmatter: { related: "moc/employees.md" } });
-    // Only docs naming employees.md via their `parent` field (alice, not bob
-    // who uses `related`, and the restriction excludes alice's body edge).
+    await create("bob.md", { frontmatter: { related: "/moc/employees.md" } });
     expect(await q('$has_static("moc/employees.md", "parent")')).toEqual(["alice.md"]);
   });
 
   it('$has_static(glob, "$body") restricts to body-derived edges', async () => {
-    await fields("parent");
     await create("target.md");
     await create("viabody.md", { body: "[t](target.md)" });
-    await create("viafm.md", { frontmatter: { parent: "target.md" } });
+    await create("viafm.md", { frontmatter: { parent: "/target.md" } });
     expect(await q('$has_static("target.md", "$body")')).toEqual(["viabody.md"]);
   });
 });

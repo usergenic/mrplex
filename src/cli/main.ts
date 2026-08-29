@@ -20,6 +20,7 @@ import { parseDocument as parseYamlDocument } from "yaml";
 import type { KernelClient } from "../client/kernel-client.js";
 import { openLocalClient } from "../client/local.js";
 import { openRemoteClient } from "../client/remote-mcp.js";
+import { VERSION } from "../version.js";
 import {
   backfillRepo } from "../embed/backfill.js";
 import {
@@ -481,7 +482,7 @@ function buildProgram(): Command {
   const program = new Command()
     .name("mrplex")
     .description("Markdown Repos, plexed — CLI (M3)")
-    .version("0.0.0")
+    .version(VERSION)
     .addOption(
       new Option("--database <url>", "sqlite:./path.db or postgres://…").env("MRPLEX_DATABASE"),
     )

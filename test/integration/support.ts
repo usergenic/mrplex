@@ -19,11 +19,6 @@ import { type Kernel, createKernel } from "../../src/kernel/kernel.js";
 import { sqliteAdapter } from "../../src/storage-sqlite/adapter.js";
 import type { Storage } from "../../src/storage/types.js";
 
-/** Link config the shipped starship fixture opts into (see fixtures/starship/readme.md). */
-export const STARSHIP_LINK_CONFIG = {
-  fields: ["reports_to", "commander", "crew", "author", "mission", "maintainer", "related"],
-};
-
 export type Session = {
   kernel: Kernel;
   storage: Storage;
@@ -53,7 +48,6 @@ export async function seededSession(
   await seedRepo(storage, {
     fixtureDir: opts.fixtureDir ?? repoSlug,
     repoSlug,
-    linkConfig: opts.linkConfig,
     ...opts,
   });
 
@@ -79,7 +73,7 @@ export async function seededSession(
   };
 }
 
-/** Convenience: a starship session with the fixture's link config applied. */
+/** Convenience: a starship session from the shipped fixture corpus. */
 export function starshipSession(): Promise<Session> {
-  return seededSession("starship", { linkConfig: STARSHIP_LINK_CONFIG });
+  return seededSession("starship");
 }

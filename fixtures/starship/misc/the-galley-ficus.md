@@ -2,6 +2,8 @@
 title: The Galley Ficus
 type: note
 status: active
+$version: v22
+$content_hash: 16771fe731955d2a5798bc0ad860df9905c3567164618d7451f6be71387ea2c6
 ---
 
 # The Galley Ficus

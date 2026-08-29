@@ -1,13 +1,39 @@
 {
   "name": "mrplex",
-  "version": "0.0.0",
-  "description": "Markdown Repos, plexed. A hub for versioned markdown.",
+  "version": "0.0.1",
+  "description": "Markdown Repos, plexed. Turn Markdown folders into queryable, versioned, graph-aware knowledge stores.",
   "type": "module",
+  "license": "MIT",
+  "author": "Brendan Baldwin <brendan@usergenic.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/usergenic/mrplex.git"
+  },
+  "homepage": "https://github.com/usergenic/mrplex#readme",
+  "bugs": {
+    "url": "https://github.com/usergenic/mrplex/issues"
+  },
+  "keywords": [
+    "markdown",
+    "knowledge-base",
+    "notes",
+    "versioning",
+    "graph",
+    "backlinks",
+    "wikilinks",
+    "cel",
+    "mcp",
+    "semantic-search"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "bin": {
     "mrplex": "./dist/cli/main.js"
   },
   "files": ["dist/"],
   "scripts": {
+    "prepack": "npm run build",
     "build": "tsc -p tsconfig.build.json && node scripts/copy-assets.mjs && node scripts/set-script-permissions.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",

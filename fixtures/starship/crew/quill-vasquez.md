@@ -5,6 +5,8 @@ department: medical
 species: human
 status: active
 reports_to: /crew/kestrel-vance.md
+$version: v6
+$content_hash: bc4b7879acc7d44bde7e1d2492826ed596cd504d191dc2d443026169f387d078
 ---
 
 # Doctor Quill Vasquez

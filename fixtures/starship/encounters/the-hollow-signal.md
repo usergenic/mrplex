@@ -7,6 +7,8 @@ stardate: 4415.7
 mission: /missions/the-hollow-signal.md
 related:
   - /crew/soren-halloway.md
+$version: v9
+$content_hash: c4ab90bd59e3dee421ef4fa283def09ec7727e068497f9eb30fb1dfd7ed96d54
 ---
 
 # The Hollow Signal

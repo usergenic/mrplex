@@ -4,6 +4,8 @@ type: equipment
 status: operational
 deck: 7
 maintainer: /crew/bexley-orr.md
+$version: v11
+$content_hash: e98fb123a3a9162f2d2b4aa78072308f654f9b996a048455cb79b67f4fcdb190
 ---
 
 # Coolant Loop B

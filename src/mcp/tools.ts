@@ -634,7 +634,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
   {
     name: "repos_set_link_config",
     description:
-      "Set or clear a repo's link-extraction config (syntaxes / fields / resolution) and re-extract the whole repo under the new config. Pass `config: null` to clear.",
+      "Set or clear a repo's link-extraction config (body / frontmatter syntax profiles and resolution) and re-extract the whole repo under the new config. Pass `config: null` to clear.",
     inputSchema: {
       type: "object",
       properties: {
@@ -644,7 +644,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
             {
               type: "object",
               additionalProperties: true,
-              description: "LinkConfig override — syntaxes / fields / resolution.",
+              description: "LinkConfig override — body / frontmatter syntax profiles / resolution.",
             },
             { type: "null" },
           ],

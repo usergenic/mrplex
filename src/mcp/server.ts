@@ -22,6 +22,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import type { CallContext } from "../kernel/context.js";
 import { KernelError } from "../kernel/errors.js";
 import type { Kernel } from "../kernel/kernel.js";
+import { VERSION } from "../version.js";
 import {
   type ContextForRequest,
   type KernelForRequest,
@@ -133,7 +134,7 @@ Conventions:
  */
 function buildMcpServer(kernel: Kernel, getContext: () => CallContext): McpLowLevelServer {
   const server = new McpLowLevelServer(
-    { name: "mrplex", version: "0.0.0" },
+    { name: "mrplex", version: VERSION },
     { capabilities: { tools: {} }, instructions: SERVER_INSTRUCTIONS },
   );
 

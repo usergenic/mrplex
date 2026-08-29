@@ -8,6 +8,8 @@ commander: /crew/kestrel-vance.md
 crew:
   - /crew/isolde-marsh.md
   - /crew/quill-vasquez.md
+$version: v24
+$content_hash: ae87457c2844755c83b8cb16c9b3758a4cf15faa08d46eb5bd6f4eb5df1ce27e
 ---
 
 # Answering the Drift Choir

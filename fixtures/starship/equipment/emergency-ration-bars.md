@@ -3,6 +3,8 @@ title: Emergency Ration Bars, Case Lot
 type: equipment
 status: operational
 deck: 4
+$version: v12
+$content_hash: f60e5e38f14686e6f2242c5b23c7859b4b1977bef1e8b770e916e5053575e016
 ---
 
 # Emergency Ration Bars, Case Lot

@@ -5,6 +5,8 @@ department: engineering
 species: human
 status: active
 reports_to: /crew/kestrel-vance.md
+$version: v3
+$content_hash: 7c181dcd547b031af7069e40834b3cfb3206ac1f443ed0952c89e6bc8999ae95
 ---
 
 # Lieutenant Commander Dax Thorne

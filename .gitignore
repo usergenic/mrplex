@@ -1,5 +1,6 @@
 .claude/settings.local.json
 .DS_Store
+.mrplex
 node_modules/
 dist/
 coverage/

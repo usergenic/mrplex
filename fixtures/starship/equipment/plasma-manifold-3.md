@@ -6,6 +6,8 @@ deck: 7
 maintainer: /crew/bexley-orr.md
 related:
   - /equipment/coolant-loop-b.md
+$version: v14
+$content_hash: 3c184eab58b5e4b25a150dd0d015d1091cf59a1bdfc446f2332fea786bb037af
 ---
 
 # Number Three Plasma Manifold

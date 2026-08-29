@@ -5,6 +5,8 @@ department: engineering
 species: human
 status: active
 reports_to: /crew/dax-thorne.md
+$version: v2
+$content_hash: f95b30e1a61fbc7c3570a63b6de1b76d810c8c72e0f5d47e021d6bce777f1a5c
 ---
 
 # Ensign Bexley Orr

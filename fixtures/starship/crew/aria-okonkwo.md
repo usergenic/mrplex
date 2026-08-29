@@ -5,6 +5,8 @@ department: command
 species: human
 status: active
 reports_to: /crew/kestrel-vance.md
+$version: v1
+$content_hash: 8c6c3f074eeae849db697be331a156a0414891ebe952729d0772e75c02498739
 ---
 
 # Commander Aria Okonkwo

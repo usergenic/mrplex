@@ -37,6 +37,7 @@ import type {
   Version,
 } from "../kernel/wire.js";
 import type { LinkConfigOverride } from "../links/link-config.js";
+import { VERSION } from "../version.js";
 import type { HistoryOptions, KernelClient, SetPathConfigResult } from "./kernel-client.js";
 
 export type RemoteClientConfig = {
@@ -62,7 +63,7 @@ export type RemoteClientConfig = {
  */
 export async function openRemoteClient(config: RemoteClientConfig): Promise<KernelClient> {
   const url = new URL(joinUrl(config.server, "/mcp"));
-  const client = new Client({ name: "mrplex-cli", version: "0.0.0" });
+  const client = new Client({ name: "mrplex-cli", version: VERSION });
   const headers: Record<string, string> = {};
   if (config.token) headers.Authorization = `Bearer ${config.token}`;
   if (config.context?.author) headers["X-Mrplex-Author"] = config.context.author;

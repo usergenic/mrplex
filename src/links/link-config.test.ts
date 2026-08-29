@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import { KernelError } from "../kernel/errors.js";
 import {
   ConfigError,
+  DEFAULT_BODY_SYNTAXES,
+  DEFAULT_FRONTMATTER_SYNTAXES,
   HARDCODED_DEFAULTS,
   type LinkConfig,
   type LinkConfigOverride,
@@ -13,10 +15,10 @@ import {
 } from "./link-config.js";
 
 describe("HARDCODED_DEFAULTS", () => {
-  it("matches the §11.2 defaults (body syntaxes on, fields opt-in)", () => {
+  it("enables all body syntaxes and a frontmatter profile with fullpath + wikilink + inline", () => {
     expect(HARDCODED_DEFAULTS).toEqual({
-      syntaxes: { inline: true, reference: true, autolink: true, wikilink: true },
-      fields: [],
+      body: DEFAULT_BODY_SYNTAXES,
+      frontmatter: DEFAULT_FRONTMATTER_SYNTAXES,
       resolution: { wikilink_elision: true, preserve_anchors: true, index_basename: "index" },
     });
   });
@@ -31,32 +33,29 @@ describe("mergeConfig (replace-not-merge)", () => {
     expect(mergeConfig(HARDCODED_DEFAULTS, null)).toEqual(HARDCODED_DEFAULTS);
   });
 
-  it("replaces fields wholesale, leaving syntaxes + resolution inherited", () => {
-    const result = mergeConfig(HARDCODED_DEFAULTS, { fields: ["parent", "related"] });
-    expect(result.fields).toEqual(["parent", "related"]);
-    expect(result.syntaxes).toEqual(HARDCODED_DEFAULTS.syntaxes);
+  it("replaces frontmatter wholesale, leaving body + resolution inherited", () => {
+    const result = mergeConfig(HARDCODED_DEFAULTS, {
+      frontmatter: { inline: false, reference: false, autolink: false, wikilink: false, fullpath: false },
+    });
+    expect(result.frontmatter.fullpath).toBe(false);
+    expect(result.body).toEqual(HARDCODED_DEFAULTS.body);
     expect(result.resolution).toEqual(HARDCODED_DEFAULTS.resolution);
   });
 
-  it("replaces the whole syntaxes object (decision 7 — no per-key merge)", () => {
+  it("replaces the whole body object (no per-key merge)", () => {
     const result = mergeConfig(HARDCODED_DEFAULTS, {
-      syntaxes: { inline: true, reference: false, autolink: false, wikilink: false },
+      body: { inline: true, reference: false, autolink: false, wikilink: false, fullpath: false },
     });
-    expect(result.syntaxes).toEqual({
-      inline: true,
-      reference: false,
-      autolink: false,
-      wikilink: false,
-    });
-    // fields + resolution still inherited
-    expect(result.fields).toEqual([]);
-    expect(result.resolution).toEqual(HARDCODED_DEFAULTS.resolution);
+    expect(result.body.wikilink).toBe(false);
+    expect(result.frontmatter).toEqual(HARDCODED_DEFAULTS.frontmatter);
   });
 });
 
 describe("effectiveLinkConfig", () => {
   it("is a shortcut for mergeConfig", () => {
-    const override: LinkConfigOverride = { fields: ["parent"] };
+    const override: LinkConfigOverride = {
+      frontmatter: { ...DEFAULT_FRONTMATTER_SYNTAXES, fullpath: false },
+    };
     expect(effectiveLinkConfig(HARDCODED_DEFAULTS, override)).toEqual(
       mergeConfig(HARDCODED_DEFAULTS, override),
     );
@@ -64,11 +63,13 @@ describe("effectiveLinkConfig", () => {
 
   it("layers server over defaults, then repo over server", () => {
     const server = mergeConfig(HARDCODED_DEFAULTS, {
-      syntaxes: { inline: true, reference: true, autolink: true, wikilink: false },
+      body: { inline: true, reference: true, autolink: true, wikilink: false, fullpath: true },
     });
-    const effective = effectiveLinkConfig(server, { fields: ["parent"] });
-    expect(effective.syntaxes.wikilink).toBe(false); // from server
-    expect(effective.fields).toEqual(["parent"]); // from repo
+    const effective = effectiveLinkConfig(server, {
+      frontmatter: { ...DEFAULT_FRONTMATTER_SYNTAXES, wikilink: false },
+    });
+    expect(effective.body.wikilink).toBe(false);
+    expect(effective.frontmatter.wikilink).toBe(false);
   });
 });
 
@@ -80,7 +81,9 @@ describe("parseRepoOverride", () => {
     expect(parseRepoOverride("null")).toBeNull();
   });
   it("parses a valid object", () => {
-    expect(parseRepoOverride('{"fields":["parent"]}')).toEqual({ fields: ["parent"] });
+    expect(parseRepoOverride('{"frontmatter":{"fullpath":false}}')).toEqual({
+      frontmatter: { fullpath: false },
+    });
   });
   it("rejects non-object JSON", () => {
     expect(() => parseRepoOverride('["nope"]')).toThrow(/expected object/);
@@ -92,36 +95,13 @@ describe("validateConfig", () => {
     expect(() => validateConfig(HARDCODED_DEFAULTS)).not.toThrow();
   });
 
-  it("accepts declared frontmatter field paths (dot + bracket)", () => {
+  it("rejects a non-boolean syntax knob", () => {
     const cfg: LinkConfig = {
       ...HARDCODED_DEFAULTS,
-      fields: ["parent", "project.lead", 'owners["team-lead"]', "stakeholders.name"],
-    };
-    expect(() => validateConfig(cfg)).not.toThrow();
-  });
-
-  it("rejects a non-boolean syntax knob", () => {
-    const cfg = {
-      ...HARDCODED_DEFAULTS,
-      syntaxes: { ...HARDCODED_DEFAULTS.syntaxes, inline: "yes" as unknown as boolean },
+      body: { ...HARDCODED_DEFAULTS.body, inline: "yes" as unknown as boolean },
     };
     expect(() => validateConfig(cfg)).toThrow(ConfigError);
-    expect(() => validateConfig(cfg)).toThrow(/syntaxes.inline must be a boolean/);
-  });
-
-  it("rejects an empty field path", () => {
-    const cfg: LinkConfig = { ...HARDCODED_DEFAULTS, fields: [""] };
-    expect(() => validateConfig(cfg)).toThrow(/valid CEL field path/);
-  });
-
-  it("rejects a '$body' declared field (sentinel, not a field)", () => {
-    const cfg: LinkConfig = { ...HARDCODED_DEFAULTS, fields: ["$body"] };
-    expect(() => validateConfig(cfg)).toThrow(/valid CEL field path/);
-  });
-
-  it("rejects a field path with an array index", () => {
-    const cfg: LinkConfig = { ...HARDCODED_DEFAULTS, fields: ["stakeholders[0].name"] };
-    expect(() => validateConfig(cfg)).toThrow(/valid CEL field path/);
+    expect(() => validateConfig(cfg)).toThrow(/body.inline must be a boolean/);
   });
 
   it("rejects an empty index_basename", () => {
@@ -135,12 +115,17 @@ describe("validateConfig", () => {
 
 describe("validateRepoOverride", () => {
   it("accepts an override that merges cleanly", () => {
-    expect(() => validateRepoOverride({ fields: ["parent"] }, HARDCODED_DEFAULTS)).not.toThrow();
+    expect(() =>
+      validateRepoOverride({ frontmatter: { ...DEFAULT_FRONTMATTER_SYNTAXES, fullpath: false } }, HARDCODED_DEFAULTS),
+    ).not.toThrow();
   });
 
   it("throws link_config_invalid (KernelError) on a bad merge", () => {
     try {
-      validateRepoOverride({ fields: ["bad index[0]"] }, HARDCODED_DEFAULTS);
+      validateRepoOverride(
+        { body: { ...DEFAULT_BODY_SYNTAXES, inline: "nope" as unknown as boolean } },
+        HARDCODED_DEFAULTS,
+      );
       throw new Error("expected throw");
     } catch (err) {
       expect(err).toBeInstanceOf(KernelError);

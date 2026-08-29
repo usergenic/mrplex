@@ -35,9 +35,6 @@ function create(
   return kernel.docs.create({}, "notes", path, { ...fm, body: input.body ?? "" });
 }
 
-async function fields(...fs: string[]): Promise<void> {
-  await storage.repos_set_link_config(repoId, JSON.stringify({ fields: fs }));
-}
 
 function g(spec: Partial<GraphSpec> & { roots: string | string[] }, ctx: CallContext = {}) {
   return kernel.graph(ctx, { repo: "notes", ...spec });
@@ -209,12 +206,10 @@ describe("$degrees as visibility (§2.1, decision 5)", () => {
 
 describe("fields restrict traversal and output links (§2.1)", () => {
   beforeEach(async () => {
-    await fields("parent");
-    // root has a body link AND a frontmatter `parent` link (plain path value).
     await create("viaBody.md");
     await create("viaField.md");
     await create("root.md", {
-      frontmatter: { parent: "viaField.md" },
+      frontmatter: { parent: "/viaField.md" },
       body: "[b](viaBody.md)",
     });
   });

@@ -114,20 +114,19 @@ describe("backfillRepoLinks", () => {
     expect(second).toEqual(first);
   });
 
-  it("re-extracts under a changed config (frontmatter fields opted in)", async () => {
+  it("re-extracts under a changed config (frontmatter fullpath toggled off)", async () => {
     await create("moc.md", { body: "m" });
-    await create("child.md", { frontmatter: { parent: "moc.md" }, body: "c" });
-    // Default config has no frontmatter fields, so no parent edge yet.
-    expect(await storage.links_by_source(await docIdAt("child.md"))).toEqual([]);
+    await create("child.md", { frontmatter: { parent: "/moc.md" }, body: "c" });
+    expect(await storage.links_by_source(await docIdAt("child.md"))).toHaveLength(1);
 
-    // Opt in and re-backfill under the new config.
-    await storage.repos_set_link_config(repoId, JSON.stringify({ fields: ["parent"] }));
+    await storage.repos_set_link_config(
+      repoId,
+      JSON.stringify({
+        frontmatter: { inline: false, reference: false, autolink: false, wikilink: false, fullpath: false },
+      }),
+    );
     await backfillRepoLinks(storage, repoId, await effectiveConfig());
-
-    const edges = await storage.links_by_source(await docIdAt("child.md"));
-    expect(edges).toHaveLength(1);
-    expect(edges[0]?.field).toBe("parent");
-    expect(edges[0]?.target_id).toBe(await docIdAt("moc.md"));
+    expect(await storage.links_by_source(await docIdAt("child.md"))).toEqual([]);
   });
 
   it("reports zero for an empty repo", async () => {
