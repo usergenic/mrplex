@@ -348,7 +348,7 @@ server's pins exactly (Auth0 issuers include the trailing slash).
 
 ## Embeddings
 
-mrplex never calls an embedding provider itself — you wire one up. It doesn't install one by default either, but it does bundle a ready-to-use local provider ([`packages/embedder`](packages/embedder), see [below](#local-embedder-no-service-no-gpu)) you can opt into, and rolling your own is just implementing one of two hook shapes:
+mrplex never calls an embedding provider itself — you wire one up. It doesn't install one by default either, but it does bundle a ready-to-use local provider ([`@mrplex/embedder`](packages/embedder), see [below](#local-embedder-no-service-no-gpu)) you can opt into, and rolling your own is just implementing one of two hook shapes:
 
 ```bash
 # HTTP endpoint — server POSTs { chunks: [...] } and expects
@@ -365,13 +365,16 @@ Either flag can also come from `MRPLEX_EMBED_URL` / `MRPLEX_EMBED_CMD` env or CL
 
 ### Local embedder (no service, no GPU)
 
-[`packages/embedder`](packages/embedder) is a ready-to-use `--embed-cmd` provider: a resident Node subprocess running `bge-small-en-v1.5` (384-dim) on CPU via ONNX. It's a **separate package** so its `fastembed` dependency stays out of mrplex's core dependency graph — install it only if you want local embeddings:
+[`@mrplex/embedder`](packages/embedder) is a ready-to-use `--embed-cmd` provider: a resident Node subprocess running `bge-small-en-v1.5` (384-dim) on CPU via ONNX. It's a **separate package** so its `fastembed` dependency stays out of mrplex's core dependency graph — install it only if you want local embeddings:
 
 ```bash
-cd packages/embedder && npm install   # its own deps + lockfile, not mrplex's
+npm install -g @mrplex/embedder
 
-mrplex serve --unsafe --embed-cmd "node packages/embedder/embedder.mjs --stdio"
+mrplex serve --unsafe --embed-cmd "mrplex-embedder --stdio"
 ```
+
+For development from this repo, `cd packages/embedder && npm install` and use
+`node packages/embedder/embedder.mjs --stdio` instead of the global binary.
 
 See [packages/embedder/README.md](packages/embedder/README.md) for model flags (`--model`, `--dim`) and a note on the `tar` advisory scope.
 

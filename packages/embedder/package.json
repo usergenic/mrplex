@@ -1,14 +1,40 @@
 {
   "name": "@mrplex/embedder",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.0",
   "description": "Local CPU embedding provider for mrplex's --embed-cmd hook (bge-small-en-v1.5 via fastembed). Isolated from mrplex core so fastembed/tar stay out of the core dependency graph.",
   "type": "module",
+  "license": "MIT",
+  "author": "Brendan Baldwin <brendan@usergenic.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/usergenic/mrplex.git",
+    "directory": "packages/embedder"
+  },
+  "homepage": "https://github.com/usergenic/mrplex/tree/main/packages/embedder",
+  "bugs": {
+    "url": "https://github.com/usergenic/mrplex/issues"
+  },
+  "keywords": [
+    "mrplex",
+    "embeddings",
+    "semantic-search",
+    "fastembed",
+    "onnx",
+    "bge"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "bin": {
     "mrplex-embedder": "./embedder.mjs"
   },
+  "files": [
+    "embedder.mjs",
+    "README.md"
+  ],
   "scripts": {
-    "start": "node embedder.mjs --stdio"
+    "start": "node embedder.mjs --stdio",
+    "test": "node --test test/*.test.mjs"
   },
   "engines": {
     "node": ">=20.11.0"
