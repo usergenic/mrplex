@@ -70,7 +70,7 @@ export function httpStatusFor(code: KernelErrorCode): number {
     case "filter_invalid":
     case "link_config_invalid":
       return 400;
-    case "rank_unavailable":
+    case "semantic_unavailable":
       return 503;
     default: {
       const _exhaustive: never = code;

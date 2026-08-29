@@ -25,12 +25,12 @@ export type KernelErrorCode =
   // on `code`. M3 added both.
   | "precondition_required" // REST: PUT/DELETE without If-Match / If-None-Match (§m3-plan decision 5)
   | "payload_too_large" // REST: body exceeded MAX_BODY_BYTES
-  // M4 (m4-plan §5 decision 4): rank query arrived with no hook
+  // M4 (m4-plan §5 decision 4): semantic query arrived with no hook
   // configured, OR the hook failed at query time. Distinct from
   // filter_invalid (the query is well-formed) and from write-path
   // embedding failure (which never errors — backlog absorbs it).
   // Maps to HTTP 503.
-  | "rank_unavailable";
+  | "semantic_unavailable";
 
 export class KernelError<D = Record<string, unknown>> extends Error {
   constructor(
@@ -66,7 +66,7 @@ export const KERNEL_ERROR_CODES: ReadonlySet<KernelErrorCode> = new Set<KernelEr
   "forbidden",
   "precondition_required",
   "payload_too_large",
-  "rank_unavailable",
+  "semantic_unavailable",
 ]);
 
 /** Type guard — check whether an arbitrary string is a known catalog code. */

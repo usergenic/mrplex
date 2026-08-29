@@ -25,7 +25,7 @@ export type LocalClientConfig = {
    */
   context?: CallContext;
   /**
-   * Optional embed hook for rank queries in embedded-CLI mode. Also
+   * Optional embed hook for semantic queries in embedded-CLI mode. Also
    * enables write-time backlog enqueue so writes done via the local
    * client contribute to backlog like serve's do.
    */
@@ -42,8 +42,8 @@ export async function openLocalClient(config: LocalClientConfig): Promise<Kernel
       await storage.backlog_enqueue(versionId);
     },
     queryEmbed: hook
-      ? async (rank: string) => {
-          const resp = await hook.embed([rank]);
+      ? async (semantic: string) => {
+          const resp = await hook.embed([semantic]);
           const vector = resp.vectors[0];
           if (!vector) throw new Error("embed hook returned no vector for query string");
           return { vector, model: resp.model, dim: resp.dim };

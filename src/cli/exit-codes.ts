@@ -33,7 +33,7 @@ export function exitCodeForKernelError(code: KernelErrorCode): number {
     case "version_not_in_document":
     case "precondition_required":
     case "payload_too_large":
-    case "rank_unavailable":
+    case "semantic_unavailable":
       return 1;
     default:
       return 1;

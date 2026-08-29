@@ -440,7 +440,7 @@ export type Storage = {
 
   /**
    * Chunks + vectors (design §3.2, §5.3, §7.2.2). Written by the
-   * backlog worker; read by kernel.query's `rank` branch.
+   * backlog worker; read by kernel.query's `semantic` branch.
    *
    * `chunks_upsert` replaces all chunks for `version_id` in one tx.
    * All vectors in the input must share `model` and the same

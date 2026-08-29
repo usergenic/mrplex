@@ -295,7 +295,7 @@ function resolveRepoSlug(opts: GlobalOpts): string {
  * m3-plan decision that --database and --server are mutually exclusive.
  *
  * In local mode we also resolve an embed hook (from --embed-url/--embed-cmd
- * or env/config) — needed for CLI-local rank queries and for backlog
+ * or env/config) — needed for CLI-local semantic queries and for backlog
  * enqueue on writes done through the CLI.
  */
 async function openClient(
@@ -680,8 +680,8 @@ function buildProgram(): Command {
                 await storage.backlog_enqueue(versionId);
               },
               queryEmbed: hook
-                ? async (rank: string) => {
-                    const resp = await hook.embed([rank]);
+                ? async (semantic: string) => {
+                    const resp = await hook.embed([semantic]);
                     const vector = resp.vectors[0];
                     if (!vector) throw new Error("embed hook returned no vector for query string");
                     return { vector, model: resp.model, dim: resp.dim };
@@ -718,8 +718,8 @@ function buildProgram(): Command {
               await storage.backlog_enqueue(versionId);
             },
             queryEmbed: hook
-              ? async (rank: string) => {
-                  const resp = await hook.embed([rank]);
+              ? async (semantic: string) => {
+                  const resp = await hook.embed([semantic]);
                   const vector = resp.vectors[0];
                   if (!vector) throw new Error("embed hook returned no vector for query string");
                   return { vector, model: resp.model, dim: resp.dim };
@@ -1290,7 +1290,7 @@ function buildProgram(): Command {
   // -------- query --------
   program
     .command("query")
-    .description("search documents — CEL filter + FTS text + rank (design §5)")
+    .description("search documents — CEL filter + FTS text + semantic (design §5)")
     .option(
       "-r, --repo <slug-or-glob>",
       "repo slug or glob; repeat the flag to query multiple (default: all in scope)",
@@ -1302,7 +1302,7 @@ function buildProgram(): Command {
       "gitignore-style path glob (bare name → any depth, leading `/` → root)",
     )
     .option("--text <query>", "FTS5 query over body")
-    .option("--rank <query>", "semantic rank via embeddings (§5.1); requires an embed hook")
+    .option("--semantic <query>", "semantic search via embeddings (§5.1); requires an embed hook")
     .option("--limit <n>", "max results (positive integer; default 50)", parsePositiveInt)
     .option(
       "-s, --select <field>",
@@ -1318,7 +1318,7 @@ function buildProgram(): Command {
         filter?: string;
         path?: string;
         text?: string;
-        rank?: string;
+        semantic?: string;
         limit?: number;
         select?: string[];
         includeHidden: boolean;
@@ -1329,7 +1329,7 @@ function buildProgram(): Command {
           repo: localOpts.repo,
           filter: combinePathAndFilter(localOpts.path, localOpts.filter),
           text: localOpts.text,
-          rank: localOpts.rank,
+          semantic: localOpts.semantic,
           limit: localOpts.limit,
           select: localOpts.select,
           include_hidden: localOpts.includeHidden,

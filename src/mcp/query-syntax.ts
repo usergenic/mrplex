@@ -34,10 +34,10 @@ intersect (AND):
 - \`filter\` — a CEL boolean expression over frontmatter fields and
   \`$\`-prefixed intrinsics
 - \`text\` — full-text search over document bodies
-- \`rank\` — semantic similarity over embeddings
+- \`semantic\` — semantic similarity over embeddings
 
 Results are **current document versions only** (history is not searched).
-Ordering: rank score when \`rank\` is present, else text relevance when
+Ordering: semantic score when \`semantic\` is present, else text relevance when
 \`text\` is present, else \`$updated_at\` descending. Default \`limit\` is 50.
 
 \`repo\` selects which repos to search: a slug (\`"notes"\`), a
@@ -50,7 +50,7 @@ repo the caller can see.
 the fields you want; each hit is an object of just those fields. Names are
 either bare frontmatter keys (\`title\`, \`status\`) or \`$\`-intrinsics
 (\`$path\`, \`$repo\`, \`$version_id\`, \`$prev_version_id\`, \`$next_version_id\`,
-\`$updated_at\`, \`$author\`, \`$body\`, \`$content_hash\`). Any field that isn't
+\`$updated_at\`, \`$author\`, \`$body\`, \`$content_hash\`, \`$semantic_score\`). Any field that isn't
 user frontmatter carries the \`$\` sigil, so a frontmatter key literally named
 \`path\` never collides with the system's \`$path\`.
 
@@ -172,12 +172,16 @@ AND) and \`"quoted phrases"\`. Anything fancier (OR, NEAR, prefix \`*\`)
 is backend-specific — it may error or behave differently between SQLite
 FTS5 and Postgres.
 
-## rank — semantic search
+## semantic — embedding search
 
-\`rank: "tiered SaaS pricing"\` retrieves by embedding similarity and
+\`semantic: "tiered SaaS pricing"\` retrieves by embedding similarity and
 composes with \`filter\`/\`text\` (they prune its candidates). Requires
 the server to be configured with an embedding hook; otherwise the query
-fails with \`rank_unavailable\`.
+fails with \`semantic_unavailable\`.
+
+When \`semantic\` is active, \`$semantic_score\` in \`select\` projects the
+cosine similarity used for ordering (1 = identical, -1 = opposite). Result
+array order is the final ordinal rank.
 
 ## Visibility flags
 

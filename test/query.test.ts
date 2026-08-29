@@ -349,24 +349,24 @@ describe("query — select projection", () => {
 });
 
 // -----------------------------------------------------------------------------
-// Validation + rank_unavailable (M4)
+// Validation + semantic_unavailable (M4)
 // -----------------------------------------------------------------------------
 
 describe("query — validation", () => {
-  it("rank field without a hook returns rank_unavailable (m4-plan §5 decision 4)", async () => {
+  it("semantic field without a hook returns semantic_unavailable (m4-plan §5 decision 4)", async () => {
     try {
-      await kernel.query(admin, { rank: "anything" });
+      await kernel.query(admin, { semantic: "anything" });
       throw new Error("expected throw");
     } catch (err) {
-      expect((err as KernelError).code).toBe("rank_unavailable");
+      expect((err as KernelError).code).toBe("semantic_unavailable");
       const data = (err as KernelError<{ reason: string }>).data;
       expect(data.reason).toMatch(/hook/);
     }
   });
 
-  it("rank empty string returns filter_invalid (malformed)", async () => {
+  it("semantic empty string returns filter_invalid (malformed)", async () => {
     try {
-      await kernel.query(admin, { rank: "  " });
+      await kernel.query(admin, { semantic: "  " });
       throw new Error("expected throw");
     } catch (err) {
       expect((err as KernelError).code).toBe("filter_invalid");

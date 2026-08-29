@@ -75,7 +75,7 @@ export type SearchPlan = {
   /**
    * Optional candidate id whitelist (rank branch, m4-plan §5.1).
    * When present, adapter restricts results to these ids AND returns
-   * them in the order given so the kernel's rank-score sort is stable.
+   * them in the order given so the kernel's semantic-score sort is stable.
    */
   candidate_ids?: readonly number[];
   /**

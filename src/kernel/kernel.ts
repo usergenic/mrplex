@@ -228,7 +228,7 @@ export type KernelConfig = {
    * worker's backlog_enqueue is one cheap UPSERT and doesn't throw.
    */
   onVersionCommitted?: (version_id: number) => Promise<void> | void;
-  queryEmbed?: (rank: string) => Promise<{ vector: number[]; model: string; dim: number }>;
+  queryEmbed?: (semantic: string) => Promise<{ vector: number[]; model: string; dim: number }>;
 };
 
 export function createKernel(config: KernelConfig | Storage): Kernel {

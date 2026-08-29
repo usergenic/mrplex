@@ -96,6 +96,8 @@ describe("MCP lifecycle + tools/list", () => {
   it("the query tool description teaches the filter language, default $path-only select, and points at query_syntax", async () => {
     const r = await client.listTools();
     const query = r.tools.find((t) => t.name === "query");
+    expect(query?.description).toContain("semantic");
+    expect(query?.description).toContain("$semantic_score");
     expect(query?.description).toContain("query_syntax");
     expect(query?.description).toContain("$path");
     expect(query?.description).toContain('["$path"]');
@@ -111,6 +113,11 @@ describe("MCP lifecycle + tools/list", () => {
     expect(selectDesc).toContain('["$path"]');
     expect(selectDesc).toContain("ALL you get");
     expect(selectDesc).toContain("$content_hash");
+    expect(selectDesc).toContain("$semantic_score");
+    const semanticDesc = (query?.inputSchema.properties as Record<string, { description?: string }>)
+      .semantic?.description;
+    expect(semanticDesc).toContain("$semantic_score");
+    expect(semanticDesc).toContain("semantic_unavailable");
   });
 });
 

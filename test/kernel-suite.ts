@@ -484,7 +484,7 @@ export function runKernelSuite(factory: AdapterFactory): void {
       });
     });
 
-    describe("query — rank (deterministic stub vectors)", () => {
+    describe("query — semantic (deterministic stub vectors)", () => {
       it("orders results by cosine distance to the query vector", async () => {
         const actor = await aliceActor();
         // Create three docs whose vectors are the standard basis.
@@ -516,18 +516,18 @@ export function runKernelSuite(factory: AdapterFactory): void {
           storage,
           queryEmbed: async () => ({ vector: [0.9, 0.1, 0], model, dim: 3 }),
         });
-        const rows = await rankKernel.query(actor, { repo: "notes", rank: "close to x" });
+        const rows = await rankKernel.query(actor, { repo: "notes", semantic: "close to x" });
         expect(rows.map((r) => r.$path)).toEqual(["x.md", "y.md", "z.md"]);
       });
 
-      it("rank without a hook → rank_unavailable", async () => {
+      it("semantic without a hook → semantic_unavailable", async () => {
         const actor = await aliceActor();
         try {
-          await kernel.query(actor, { repo: "notes", rank: "anything" });
+          await kernel.query(actor, { repo: "notes", semantic: "anything" });
           throw new Error("expected throw");
         } catch (err) {
           expect(err).toBeInstanceOf(KernelError);
-          expect((err as KernelError).code).toBe("rank_unavailable");
+          expect((err as KernelError).code).toBe("semantic_unavailable");
         }
       });
     });

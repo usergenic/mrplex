@@ -114,4 +114,10 @@ describe("the reference doc mentions every documented name", () => {
     expect(QUERY_SYNTAX_DOC).toContain('["$path"]');
     expect(QUERY_SYNTAX_DOC).toContain("that is all you get");
   });
+
+  it("semantic mode and $semantic_score", () => {
+    expect(QUERY_SYNTAX_DOC).toContain("`semantic`");
+    expect(QUERY_SYNTAX_DOC).toContain("$semantic_score");
+    expect(QUERY_SYNTAX_DOC).toContain("semantic_unavailable");
+  });
 });

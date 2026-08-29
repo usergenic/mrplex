@@ -32,7 +32,7 @@ export type ServeConfig = {
   serverPathConfig?: PathConfig;
   /**
    * Embedding hook config (m4-plan §5.3). Absent = worker idles, rank
-   * queries return `rank_unavailable`. See design §5.3 resolved [OPEN].
+   * queries return `semantic_unavailable`. See design §5.3 resolved [OPEN].
    */
   embed?: EmbedConfig;
   /** Log function for the "serving on http://…" banner. Defaults to console.error. */
@@ -73,8 +73,8 @@ export async function startServer(config: ServeConfig): Promise<ServeHandle> {
       await storage.backlog_enqueue(versionId);
     },
     queryEmbed: hook
-      ? async (rank: string) => {
-          const resp = await hook.embed([rank]);
+      ? async (semantic: string) => {
+          const resp = await hook.embed([semantic]);
           const vector = resp.vectors[0];
           if (!vector) {
             throw new Error("embed hook returned no vector for query string");

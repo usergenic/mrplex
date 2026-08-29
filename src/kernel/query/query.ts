@@ -4,7 +4,7 @@
  * The kernel resolves repo access, parses CEL eagerly (so
  * `filter_invalid` surfaces before storage), and builds a structured
  * `SearchPlan` the adapter compiles into its dialect's SQL (m5-plan
- * WS2). Rank mode composes vector_search → SearchPlan with a
+ * WS2). Semantic mode composes vector_search → SearchPlan with a
  * candidate-id whitelist.
  */
 
@@ -24,7 +24,7 @@ export type QuerySpec = {
   repo?: string | string[];
   filter?: string;
   text?: string;
-  rank?: string;
+  semantic?: string;
   limit?: number;
   include_hidden?: boolean;
   include_system?: boolean;
@@ -41,7 +41,7 @@ const KNOWN_SPEC_FIELDS = new Set<keyof QuerySpec>([
   "repo",
   "filter",
   "text",
-  "rank",
+  "semantic",
   "limit",
   "include_hidden",
   "include_system",
@@ -55,7 +55,7 @@ const KNOWN_SPEC_FIELDS = new Set<keyof QuerySpec>([
  * a `$name` to the value read off the already-built `Version` wire object.
  * `select` validates against this registry and rejects unknown `$names`.
  */
-const INTRINSIC_PROJECTORS: Record<string, (v: Version) => unknown> = {
+const VERSION_INTRINSIC_PROJECTORS: Record<string, (v: Version) => unknown> = {
   $path: (v) => v.path,
   $repo: (v) => v.repo,
   $version_id: (v) => v.version_id,
@@ -67,6 +67,12 @@ const INTRINSIC_PROJECTORS: Record<string, (v: Version) => unknown> = {
   $content_hash: (v) => v.content_hash,
 };
 
+/** All `$`-intrinsics valid in `select` (includes semantic-mode-only fields). */
+const SELECTABLE_INTRINSICS = new Set([
+  ...Object.keys(VERSION_INTRINSIC_PROJECTORS),
+  "$semantic_score",
+]);
+
 /** Identity default — the cheapest useful projection (§2). */
 const DEFAULT_SELECT = ["$path"] as const;
 
@@ -75,10 +81,10 @@ export type QueryDeps = {
   serverPathConfig: PathConfig;
   toVersionWire: (row: VersionRow, repoSlug: string) => Version;
   /**
-   * Optional rank-time embed hook. When absent and `spec.rank` is set,
-   * runQuery throws `rank_unavailable` (m4-plan §5 decision 4).
+   * Optional semantic-query embed hook. When absent and `spec.semantic` is set,
+   * runQuery throws `semantic_unavailable` (m4-plan §5 decision 4).
    */
-  queryEmbed?: (rank: string) => Promise<{ vector: number[]; model: string; dim: number }>;
+  queryEmbed?: (semantic: string) => Promise<{ vector: number[]; model: string; dim: number }>;
 };
 
 /** M2 default when the spec omits limit. */
@@ -126,40 +132,40 @@ export async function runQuery(
   const userLimit = spec.limit ?? DEFAULT_QUERY_LIMIT;
   if (userLimit <= 0) return [];
 
-  // 5. Rank branch (M4): vector_search → candidate whitelist → SearchPlan.
-  if (spec.rank !== undefined) {
+  // 5. Semantic branch (M4): vector_search → candidate whitelist → SearchPlan.
+  if (spec.semantic !== undefined) {
     if (!deps.queryEmbed) {
-      throw new KernelError("rank_unavailable", {
+      throw new KernelError("semantic_unavailable", {
         reason: "no embedding hook configured on this server",
       });
     }
     let embed: { vector: number[]; model: string; dim: number };
     try {
-      embed = await deps.queryEmbed(spec.rank);
+      embed = await deps.queryEmbed(spec.semantic);
     } catch (err) {
-      throw new KernelError("rank_unavailable", {
+      throw new KernelError("semantic_unavailable", {
         reason: `embedding hook failed at query time: ${
           err instanceof Error ? err.message : String(err)
         }`,
       });
     }
     if (embed.vector.length !== embed.dim) {
-      throw new KernelError("rank_unavailable", {
+      throw new KernelError("semantic_unavailable", {
         reason: `embedding hook returned vector.length ${embed.vector.length} != dim ${embed.dim}`,
       });
     }
 
-    const rankK = Math.min(userLimit * 4, 200);
+    const semanticK = Math.min(userLimit * 4, 200);
     const hits = await deps.storage.vector_search(
       targetRepos.map((r) => r.id),
       embed.model,
       embed.vector,
-      rankK,
+      semanticK,
     );
     if (hits.length === 0) return [];
 
     const candidateIds = hits.map((h) => h.version_id);
-    const scoreById = new Map(hits.map((h) => [h.version_id, h.score]));
+    const distanceById = new Map(hits.map((h) => [h.version_id, h.score]));
     const plan: SearchPlan = {
       repo_ids: targetRepos.map((r) => r.id),
       limit: candidateIds.length,
@@ -170,14 +176,17 @@ export async function runQuery(
       candidate_ids: candidateIds,
     };
     const rows = await deps.storage.versions_search(plan);
-    rows.sort((a, b) => (scoreById.get(a.id) ?? 1) - (scoreById.get(b.id) ?? 1));
+    rows.sort((a, b) => (distanceById.get(a.id) ?? 1) - (distanceById.get(b.id) ?? 1));
     return rows.slice(0, userLimit).map((row) => {
       const repoSlug = (reposById.get(row.repo_id) as RepoRow).slug;
-      return projectHit(deps.toVersionWire(row, repoSlug), select);
+      const distance = distanceById.get(row.id);
+      return projectHit(deps.toVersionWire(row, repoSlug), select, {
+        semanticScore: distance === undefined ? undefined : cosineDistanceToSimilarity(distance),
+      });
     });
   }
 
-  // 6. Non-rank path.
+  // 6. Non-semantic path.
   const plan: SearchPlan = {
     repo_ids: targetRepos.map((r) => r.id),
     limit: userLimit,
@@ -200,11 +209,27 @@ export async function runQuery(
  * bare names read frontmatter (a missing key is simply absent, matching
  * `graph`'s `select`). Order follows `select` for deterministic key order.
  */
-function projectHit(v: Version, select: readonly string[]): QueryHit {
+type HitContext = {
+  /** Cosine similarity in [-1, 1]; present only on semantic-query hits. */
+  semanticScore?: number;
+};
+
+/** Cosine similarity from storage cosine distance (0 = identical, 2 = opposite). */
+function cosineDistanceToSimilarity(distance: number): number {
+  return 1 - distance;
+}
+
+function projectHit(v: Version, select: readonly string[], ctx: HitContext = {}): QueryHit {
   const hit: QueryHit = {};
   for (const name of select) {
+    if (name === "$semantic_score") {
+      if (ctx.semanticScore !== undefined) {
+        hit.$semantic_score = ctx.semanticScore;
+      }
+      continue;
+    }
     if (name.startsWith("$")) {
-      hit[name as `$${string}`] = INTRINSIC_PROJECTORS[name]!(v);
+      hit[name as `$${string}`] = VERSION_INTRINSIC_PROJECTORS[name]!(v);
     } else if (v.frontmatter[name] !== undefined) {
       hit[name] = v.frontmatter[name];
     }
@@ -224,10 +249,10 @@ function validateSpec(spec: QuerySpec): void {
       });
     }
   }
-  if (spec.rank !== undefined) {
-    if (typeof spec.rank !== "string" || spec.rank.trim().length === 0) {
+  if (spec.semantic !== undefined) {
+    if (typeof spec.semantic !== "string" || spec.semantic.trim().length === 0) {
       throw new KernelError("filter_invalid", {
-        reason: "the `rank` mode requires a non-empty query string",
+        reason: "the `semantic` mode requires a non-empty query string",
       });
     }
   }
@@ -243,10 +268,10 @@ function validateSpec(spec: QuerySpec): void {
       throw new KernelError("filter_invalid", { reason: "select must be an array of strings" });
     }
     for (const name of spec.select) {
-      if (name.startsWith("$") && !(name in INTRINSIC_PROJECTORS)) {
+      if (name.startsWith("$") && !SELECTABLE_INTRINSICS.has(name)) {
         // Derive the "expected" list from the registry so the message can't
         // drift from the code (mirrors the filter compiler's intrinsic error).
-        const expected = Object.keys(INTRINSIC_PROJECTORS).join(", ");
+        const expected = [...SELECTABLE_INTRINSICS].sort().join(", ");
         throw new KernelError("filter_invalid", {
           reason: `unknown intrinsic ${name} in select (expected ${expected})`,
         });

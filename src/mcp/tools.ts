@@ -384,7 +384,7 @@ const QUERY_HIT_SCHEMA: JsonSchemaProp = {
   description:
     "A projected query hit — not a full document. `$`-keys are system intrinsics selected " +
     "via `select` ($path, $repo, $version_id, $prev_version_id, $next_version_id, $updated_at, " +
-    "$author, $body, $content_hash); any other keys are `select`-projected frontmatter. A key " +
+    "$author, $body, $content_hash, $semantic_score); any other keys are `select`-projected frontmatter. A key " +
     'appears only when selected (and, for frontmatter, present). Default `select` is ["$path"], ' +
     'so a hit is `{ "$path": "…" }` only unless you ask for more.',
   // Which keys appear depends entirely on `select`, so none are required and
@@ -1030,8 +1030,12 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       "(batch). Unmatched paths are " +
       "omitted, not errors. Default `limit` is 50. " +
       "Three composable modes that intersect (AND) when combined: `filter` (CEL over frontmatter " +
-      "and $-intrinsics), `text` (full-text over bodies), `rank` (semantic similarity). Ordered by " +
-      "rank score, else text relevance, else last-update time descending. Filter examples: " +
+      "and $-intrinsics), `text` (full-text over bodies), `semantic` (embedding similarity — a " +
+      'natural-language string, e.g. "tiered SaaS pricing"). Ordered by semantic score when ' +
+      "`semantic` is present, else text relevance, else last-update time descending. When `semantic` " +
+      "is active, add `$semantic_score` to `select` to project cosine similarity (1 = identical, " +
+      "-1 = opposite); result order is the final rank. Requires an embed hook; else " +
+      "`semantic_unavailable`. Filter examples: " +
       `status == "published" && "pricing" in list(tags)` +
       " (list() matches scalar-or-list frontmatter uniformly) — " +
       `$path.startsWith("guides/")` +
@@ -1067,11 +1071,14 @@ export const TOOL_REGISTRY: ToolEntry[] = [
             "Full-text search over document bodies. Portable syntax: space-separated terms " +
             '(implicit AND) and "quoted phrases"; other operators are storage-backend-specific.',
         },
-        rank: {
+        semantic: {
           type: "string",
           description:
-            'Semantic rank via embeddings — a natural-language query, e.g. "tiered SaaS ' +
-            'pricing". Requires an embed hook on the server; else rank_unavailable.',
+            'Semantic search via embeddings — a natural-language query, e.g. "tiered SaaS pricing". ' +
+            "Composes with filter and text (AND). Requires an embed hook on the server; else " +
+            "semantic_unavailable. Add $semantic_score to select to project cosine similarity per " +
+            "hit (1 = identical, -1 = opposite). See query_syntax for the full semantic mode " +
+            "reference.",
         },
         limit: { type: "integer", minimum: 0, description: "Max results (default 50)." },
         include_hidden: {
@@ -1091,7 +1098,8 @@ export const TOOL_REGISTRY: ToolEntry[] = [
             'Fields to project onto each hit. Default ["$path"] — that is ALL you get unless you ' +
             "pass this. Bare keys name frontmatter (a missing key is simply absent); `$`-intrinsics " +
             "name system fields: $path, $repo, $version_id, $prev_version_id, $next_version_id, " +
-            "$updated_at, $author, $body, $content_hash. Document bodies travel only when `$body` is " +
+            "$updated_at, $author, $body, $content_hash, $semantic_score (semantic queries only). " +
+            "Document bodies travel only when `$body` is " +
             "selected. This is how you list cheaply; call `docs_get` or `docs_get_many` for full document(s).",
         },
         scope: {
@@ -1355,8 +1363,8 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       "shape: CEL syntax, $-intrinsics ($path, $updated_at, $body, $content_hash), `select` " +
       '(default ["$path"] only — not full documents), list() scalar-or-list polymorphism, ' +
       "link-graph predicates ($in, $has, $backlinks(), $links()), graph-only `$degrees`, " +
-      "text-search syntax, and rank mode. Call this before writing a non-trivial filter, or after " +
-      "a filter_invalid error.",
+      "text-search syntax, semantic mode (`semantic` query param, `$semantic_score` in `select`). " +
+      "Call this before writing a non-trivial filter, or after a filter_invalid error.",
     inputSchema: { type: "object", properties: {} },
     outputSchema: {
       type: "object",

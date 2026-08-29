@@ -16,7 +16,7 @@ Two layers: a **full-trust kernel** (no in-engine auth — whoever reaches it ca
   - **`$in` today means links you wrote; later it will also include dynamic membership.** A document denotes a set — the docs it links to — and a future release lets a document *also* define members via embedded queries. When that lands, `$in` (and `$has`/`$backlinks()`/`$links()`) transparently widen to the union of written links **and** query-derived membership. If you want to match **only** statically-written links, now and forever, use the `_static` forms (`$in_static`, `--in-static`); they never widen. The `_dyn`-only forms are reserved until that release.
 - **Graph exploration** — where a CEL query answers *which* documents match, `graph` answers *how* documents connect: a read-only BFS neighborhood expansion over the link index. From a root set, expand outward under a direction lens (`out`/`in`/`both`) up to N hops, returning the reached **documents** and the **links** between them, a `frontier` for cursorless continuation, and truncation metadata. `filter` is *visibility* (a non-matching doc is hidden and blocks paths through it) and gains a graph-only `$degrees` intrinsic — e.g. `$degrees <= 1 || type == "person"` expands everything one hop but keeps following person docs. Kernel op, `graph` MCP tool, `/repos/{repo}/graph` REST route (GET + POST), and `mrplex graph --render summary|yaml|mermaid|json` CLI. See §11.3 / `docs/archive/graph-plan.md`.
 - **Full-text search** over document body — SQLite FTS5 (porter+unicode61) or Postgres `websearch_to_tsquery`. Composes with filter via AND. Portable syntax subset across both engines: bare terms and quoted phrases.
-- **Semantic rank via embeddings** — pluggable hook (`--embed-url` HTTP or `--embed-cmd` subprocess); mrplex never calls a provider itself. Chunker + backlog worker + brute-force cosine k-NN over `sqlite-vec`; results current-version only, deduped by content hash. Composes with filter/text/scope/sigil-exclusion. No hook configured → `rank_unavailable` (no zero-vector default — silent garbage is worse than a visible gap).
+- **Semantic search via embeddings** — pluggable hook (`--embed-url` HTTP or `--embed-cmd` subprocess); mrplex never calls a provider itself. Chunker + backlog worker + brute-force cosine k-NN over `sqlite-vec`; results current-version only, deduped by content hash. Composes with filter/text/scope/sigil-exclusion. Project `$semantic_score` via `select` to see cosine similarity. No hook configured → `semantic_unavailable` (no zero-vector default — silent garbage is worse than a visible gap).
 - **Full-trust kernel — no in-engine auth.** mrplex authenticates nothing: any caller that can reach the engine can do anything. Authentication, users, and tokens live in a *shell* around it — the OS process boundary for local/stdio use, or a fronting proxy for networked deployments (never expose mrplex directly to an untrusted network). Identity is one opaque `author` string per write (default `"mrplex"`; convention is git's `Full Name <email>`). Read visibility can still be narrowed per call with a `ScopeClaim[]` — repo/path globs (gitignore-style, with negation) evaluated at call time.
 - **HTTP surfaces.** Protocol-true MCP server at `/mcp` (Streamable HTTP + optional STDIO), and a resource-oriented REST surface with `If-Match` / `If-None-Match`, content negotiation (`application/json` or `text/markdown`), `MOVE`, and sibling `/versions` / `/history` / `/diff` roots. Query responses carry ETags for `If-None-Match` → 304.
 - **`mrplex` CLI** — thin client over MCP. `--database` for local embedded mode; `--server` for remote mode against a running server. Every command works identically over both transports.
@@ -102,7 +102,7 @@ authenticating shell instead of the raw kernel — see
 [Authentication](#authentication) below and [docs/security.md](docs/archive/security.md).
 Never expose the raw kernel (`serve --unsafe`) directly to an untrusted network.
 
-Query — CEL filters + FTS + rank composed:
+Query — CEL filters + FTS + semantic composed:
 
 ```bash
 # Filter only
@@ -130,12 +130,16 @@ mrplex query --repo notes --path 'drafts/**'      # anywhere under drafts/
 # --path composes with --filter (AND)
 mrplex query --repo notes --path '*.md' --filter 'status == "published"'
 
-# Semantic rank (requires an embedding hook — see below)
-mrplex query --repo notes --rank 'tiered SaaS pricing'
+# Semantic search (requires an embedding hook — see below)
+mrplex query --repo notes --semantic 'tiered SaaS pricing'
+
+# Project similarity scores alongside paths
+mrplex query --repo notes --semantic 'tiered SaaS pricing' \
+    --select '$path' --select '$semantic_score'
 
 # All three composed
 mrplex query --repo notes \
-    --filter 'status == "published"' --text pricing --rank 'subscription fees'
+    --filter 'status == "published"' --text pricing --semantic 'subscription fees'
 ```
 
 Diff any two versions of a document — history + diff give you the versioned reader:
@@ -386,18 +390,20 @@ For dev + tests, `scripts/stub-embedder.mjs` speaks both hook shapes with determ
 node scripts/stub-embedder.mjs --http 8399
 ```
 
-Writes done while a hook is configured trigger the in-process worker automatically; a hookless server still enqueues each write so a later `embed backfill` doesn't have to walk history. Rank queries with no hook return `rank_unavailable` — there is no zero-vector fallback (design §5.3).
+Writes done while a hook is configured trigger the in-process worker automatically; a hookless server still enqueues each write so a later `embed backfill` doesn't have to walk history. Semantic queries with no hook return `semantic_unavailable` — there is no zero-vector fallback (design §5.3).
 
 ## Development
 
 ```bash
-npm test          # invariants, kernel suite, writes, read scopes, query, rank, diff, chunker, worker, HTTP surfaces, CLI
+npm test          # invariants, kernel suite, writes, read scopes, query, semantic, diff, chunker, worker, HTTP surfaces, CLI
 npm run typecheck # tsc --noEmit, strict
 npm run lint      # biome check
 npm run build     # emit dist/
 ```
 
 CI runs typecheck + lint + tests on Ubuntu & macOS × Node 20 & 22, plus a `ci-postgres` job that spins up a `pgvector/pgvector:pg17` service and runs the shared kernel suite against a live Postgres. `sqlite-vec` is loaded via better-sqlite3's `loadExtension` on every cell; if a platform gap ever appears, the fallback is computing cosine distance in a JS UDF — invisible above the adapter.
+
+If tests fail immediately with a `NODE_MODULE_VERSION` error from `better-sqlite3`, your Node version changed since the last install — run `npm rebuild better-sqlite3` and retry.
 
 ### Postgres locally
 

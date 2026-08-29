@@ -795,8 +795,8 @@ function specFromQueryString(query: URLSearchParams): QuerySpec {
   if (filter !== null) spec.filter = filter;
   const text = query.get("text");
   if (text !== null) spec.text = text;
-  const rank = query.get("rank");
-  if (rank !== null) spec.rank = rank;
+  const semantic = query.get("semantic");
+  if (semantic !== null) spec.semantic = semantic;
   const limit = readOptionalIntQueryParam(query, "limit");
   if (limit !== undefined) spec.limit = limit;
   if (query.get("include_hidden") === "true") spec.include_hidden = true;
