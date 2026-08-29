@@ -6,6 +6,8 @@
 
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { once } from "node:events";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,6 +16,8 @@ import { describe, it, before, after } from "node:test";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const EMBEDDER = join(ROOT, "embedder.mjs");
+const TEST_CACHE = mkdtempSync(join(tmpdir(), "mrplex-embedder-test-"));
+const EMBEDDER_ENV = { ...process.env, MRPLEX_EMBEDDER_CACHE: TEST_CACHE };
 const require = createRequire(import.meta.url);
 
 function hasFastembed() {
@@ -36,14 +40,26 @@ if (!FASTEMBED) {
 }
 
 /** Spawn embedder with args; wait until stderr signals readiness. */
-async function spawnEmbedder(args) {
+async function spawnEmbedder(args, env = EMBEDDER_ENV) {
   const proc = spawn(process.execPath, [EMBEDDER, ...args], {
     stdio: ["pipe", "pipe", "pipe"],
+    env,
   });
-  const ready = once(proc.stderr, "data").then(([chunk]) => {
-    const text = String(chunk);
-    assert.match(text, /embedder stdio model=/);
-    return text;
+  const ready = new Promise((resolve, reject) => {
+    let err = "";
+    proc.stderr.setEncoding("utf8");
+    proc.stderr.on("data", (chunk) => {
+      err += chunk;
+      if (/embedder stdio model=/.test(err)) {
+        assert.match(err, new RegExp(`cache=${TEST_CACHE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+        resolve(err);
+      }
+    });
+    proc.on("exit", (code) => {
+      if (!/embedder stdio model=/.test(err)) {
+        reject(new Error(`embedder exited (${code}) before ready; stderr:\n${err}`));
+      }
+    });
   });
   const exit = once(proc, "exit");
   return { proc, ready, exit };

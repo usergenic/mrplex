@@ -19,8 +19,9 @@ embeddings.
 npm install -g @mrplex/embedder
 ```
 
-The model (~130 MB) auto-downloads and caches on first run (typically under
-`~/.cache/huggingface` or fastembed's cache directory).
+The model (~130 MB) auto-downloads on first run and caches under
+`~/.cache/mrplex/embedder` (or `$XDG_CACHE_HOME/mrplex/embedder`). Override with
+`MRPLEX_EMBEDDER_CACHE` or `--cache-dir PATH`.
 
 **From the mrplex monorepo** (development):
 
@@ -74,6 +75,9 @@ mrplex-embedder --list-models
 - `--dim N` — truncate + re-normalize each vector to `N` dims (for Matryoshka
   models). The truncation is encoded into the reported model string
   (`<key>@<N>`) so mrplex treats a dim change as a model change and re-embeds.
+- `--cache-dir PATH` — where ONNX model archives are stored. Default
+  `$MRPLEX_EMBEDDER_CACHE`, else `$XDG_CACHE_HOME/mrplex/embedder` or
+  `~/.cache/mrplex/embedder`.
 - `--stdio` — optional no-op; stdio is the default transport (one JSON line
   per batch over stdin/stdout).
 - `--list-models` — print supported `--model` keys and exit.

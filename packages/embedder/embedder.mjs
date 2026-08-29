@@ -17,9 +17,17 @@
  */
 
 import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { createInterface } from "node:readline";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+
+/** Where fastembed stores downloaded ONNX model archives (not HuggingFace hub). */
+function defaultCacheDir() {
+  if (process.env.MRPLEX_EMBEDDER_CACHE) return process.env.MRPLEX_EMBEDDER_CACHE;
+  const xdgCache = process.env.XDG_CACHE_HOME || join(homedir(), ".cache");
+  return join(xdgCache, "mrplex", "embedder");
+}
 
 const pkg = JSON.parse(
   readFileSync(join(dirname(fileURLToPath(import.meta.url)), "package.json"), "utf8"),
@@ -38,12 +46,13 @@ function printHelp() {
 Local CPU embedding provider for mrplex's --embedder hook.
 
 Usage:
-  mrplex-embedder [--model KEY] [--dim N]
+  mrplex-embedder [--model KEY] [--dim N] [--cache-dir PATH]
 
 Options:
   --stdio          optional; stdio is the default (one JSON line per batch over stdin/stdout)
   --model KEY      fastembed model key (default: fast-bge-small-en-v1.5)
   --dim N          truncate + re-normalize to N dims (Matryoshka models only)
+  --cache-dir PATH model download cache (default: $MRPLEX_EMBEDDER_CACHE or ~/.cache/mrplex/embedder)
   --list-models    print supported --model keys and exit
   --help, -h       show this help
   --version, -V    print version
@@ -63,6 +72,7 @@ if (has("--version") || has("-V")) {
 
 const modelKey = flag("--model", "fast-bge-small-en-v1.5");
 const truncateDim = argv.includes("--dim") ? Number.parseInt(flag("--dim", ""), 10) : null;
+const cacheDir = argv.includes("--cache-dir") ? flag("--cache-dir", "") : defaultCacheDir();
 
 if (truncateDim !== null && (!Number.isInteger(truncateDim) || truncateDim <= 0)) {
   console.error(`embedder: --dim must be a positive integer (got ${flag("--dim", "")})`);
@@ -99,7 +109,7 @@ if (!model) {
 }
 
 // maxLength covers the chunker's 2000-char cap (~512 tokens); bge tops out at 512.
-const embedder = await FlagEmbedding.init({ model, maxLength: 512 });
+const embedder = await FlagEmbedding.init({ model, maxLength: 512, cacheDir });
 
 /** Truncate a unit vector to `n` dims and re-normalize (Matryoshka). */
 function truncate(vec, n) {
@@ -181,5 +191,5 @@ rl.on("line", (line) => {
 });
 
 console.error(
-  `embedder stdio model=${modelKey}${truncateDim !== null ? ` dim=${truncateDim}` : ""}`,
+  `embedder stdio model=${modelKey}${truncateDim !== null ? ` dim=${truncateDim}` : ""} cache=${cacheDir}`,
 );
