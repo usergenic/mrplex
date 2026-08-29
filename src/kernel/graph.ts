@@ -27,6 +27,7 @@ import { type PathConfig, effectivePathConfig, parseRepoOverride } from "./path-
 import type { CelExpr } from "./query/ast.js";
 import { parseCel } from "./query/cel-parse.js";
 import { bindDegrees } from "./query/degrees.js";
+import { isPathGlobPattern, normalizeExactDocumentPath } from "./validation.js";
 import type { GraphDirection, GraphDocument, GraphLink, GraphResult, GraphSpec } from "./wire.js";
 
 // Defaults + caps (§8). Following query's constant-default style rather than
@@ -40,6 +41,8 @@ export const LINKS_CEILING = 5000;
 export type GraphDeps = {
   storage: Storage;
   serverPathConfig: PathConfig;
+  /** Effective path config for the target repo (for exact root normalization). */
+  pathConfig: PathConfig;
 };
 
 type Internal = {
@@ -67,7 +70,7 @@ export async function runGraph(
 
   const internal = buildInternal(claims, spec, deps, repo);
 
-  const rootPatterns = normalizeRoots(spec.roots);
+  const rootPatterns = normalizeRoots(spec.roots, deps.pathConfig);
   const emptyResult: GraphResult = {
     documents: [],
     links: [],
@@ -210,14 +213,16 @@ function buildInternal(
   };
 }
 
-function normalizeRoots(roots: string | string[]): string[] {
+function normalizeRoots(roots: string | string[], pathConfig: PathConfig): string[] {
   const list = Array.isArray(roots) ? roots : [roots];
   if (list.length === 0 || list.some((r) => typeof r !== "string")) {
     throw new KernelError("filter_invalid", {
       reason: "roots must be a path/glob string or a non-empty array of them",
     });
   }
-  return list;
+  return list.map((r) =>
+    isPathGlobPattern(r) ? r : normalizeExactDocumentPath(r, pathConfig),
+  );
 }
 
 /**

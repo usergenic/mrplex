@@ -3,6 +3,8 @@ import { KernelError } from "./errors.js";
 import {
   type EffectivePathConfig,
   SLUG_MAX_LENGTH,
+  isPathGlobPattern,
+  normalizeExactDocumentPath,
   pathHasSigilSegment,
   validatePath,
   validateSlug,
@@ -37,6 +39,64 @@ function expectSlugInvalid(fn: () => void, expectedReasonSubstring: string): voi
     expect(ke.data.reason).toContain(expectedReasonSubstring);
   }
 }
+
+describe("normalizeExactDocumentPath", () => {
+  it("accepts canonical slashless paths unchanged", () => {
+    expect(normalizeExactDocumentPath("projects/foo.md", DEFAULT_CONFIG)).toBe("projects/foo.md");
+  });
+
+  it("strips exactly one leading slash (repository-root alias)", () => {
+    expect(normalizeExactDocumentPath("/AGENTS.md", DEFAULT_CONFIG)).toBe("AGENTS.md");
+    expect(normalizeExactDocumentPath("/projects/foo.md", DEFAULT_CONFIG)).toBe("projects/foo.md");
+  });
+
+  it("is idempotent", () => {
+    for (const p of ["foo.md", "/foo.md", "a/b/c.md"]) {
+      const once = normalizeExactDocumentPath(p, DEFAULT_CONFIG);
+      expect(normalizeExactDocumentPath(once, DEFAULT_CONFIG)).toBe(once);
+    }
+  });
+
+  it("normalizes alias and canonical to the same identity key", () => {
+    expect(normalizeExactDocumentPath("foo.md", DEFAULT_CONFIG)).toBe(
+      normalizeExactDocumentPath("/foo.md", DEFAULT_CONFIG),
+    );
+  });
+
+  describe("rejections", () => {
+    it("rejects empty and lone slash", () => {
+      expectPathInvalid(() => normalizeExactDocumentPath("", DEFAULT_CONFIG), "empty");
+      expectPathInvalid(() => normalizeExactDocumentPath("/", DEFAULT_CONFIG), "empty");
+    });
+    it("rejects multiple leading slashes", () => {
+      expectPathInvalid(() => normalizeExactDocumentPath("//foo.md", DEFAULT_CONFIG), "multiple");
+    });
+    it("rejects backslashes", () => {
+      expectPathInvalid(() => normalizeExactDocumentPath("foo\\bar.md", DEFAULT_CONFIG), "backslash");
+    });
+    it("rejects traversal and reserved segments after alias strip", () => {
+      expectPathInvalid(() => normalizeExactDocumentPath("/../foo.md", DEFAULT_CONFIG), "reserved");
+      expectPathInvalid(() => normalizeExactDocumentPath("./foo.md", DEFAULT_CONFIG), "reserved");
+    });
+    it("rejects system sigil paths regardless of leading slash", () => {
+      expectPathInvalid(
+        () => normalizeExactDocumentPath("/:deleted/foo.md", DEFAULT_CONFIG),
+        "system sigil",
+      );
+    });
+  });
+});
+
+describe("isPathGlobPattern", () => {
+  it("detects glob metacharacters", () => {
+    expect(isPathGlobPattern("/projects/*.md")).toBe(true);
+    expect(isPathGlobPattern("people/?.md")).toBe(true);
+  });
+  it("treats literal paths as non-patterns", () => {
+    expect(isPathGlobPattern("projects/foo.md")).toBe(false);
+    expect(isPathGlobPattern("/AGENTS.md")).toBe(false);
+  });
+});
 
 describe("validatePath", () => {
   describe("accepts", () => {
