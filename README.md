@@ -16,7 +16,7 @@ Two layers: a **full-trust kernel** (no in-engine auth — whoever reaches it ca
   - **`$in` today means links you wrote; later it will also include dynamic membership.** A document denotes a set — the docs it links to — and a future release lets a document *also* define members via embedded queries. When that lands, `$in` (and `$has`/`$backlinks()`/`$links()`) transparently widen to the union of written links **and** query-derived membership. If you want to match **only** statically-written links, now and forever, use the `_static` forms (`$in_static`, `--in-static`); they never widen. The `_dyn`-only forms are reserved until that release.
 - **Graph exploration** — where a CEL query answers *which* documents match, `graph` answers *how* documents connect: a read-only BFS neighborhood expansion over the link index. From a root set, expand outward under a direction lens (`out`/`in`/`both`) up to N hops, returning the reached **documents** and the **links** between them, a `frontier` for cursorless continuation, and truncation metadata. `filter` is *visibility* (a non-matching doc is hidden and blocks paths through it) and gains a graph-only `$degrees` intrinsic — e.g. `$degrees <= 1 || type == "person"` expands everything one hop but keeps following person docs. Kernel op, `graph` MCP tool, `/repos/{repo}/graph` REST route (GET + POST), and `mrplex graph --render summary|yaml|mermaid|json` CLI. See §11.3 / `docs/archive/graph-plan.md`.
 - **Full-text search** over document body — SQLite FTS5 (porter+unicode61) or Postgres `websearch_to_tsquery`. Composes with filter via AND. Portable syntax subset across both engines: bare terms and quoted phrases.
-- **Semantic search via embeddings** — pluggable hook (`--embed-url` HTTP or `--embed-cmd` subprocess); mrplex never calls a provider itself. Chunker + backlog worker + brute-force cosine k-NN over `sqlite-vec`; results current-version only, deduped by content hash. Composes with filter/text/scope/sigil-exclusion. Project `$semantic_score` via `select` to see cosine similarity. No hook configured → `semantic_unavailable` (no zero-vector default — silent garbage is worse than a visible gap).
+- **Semantic search via embeddings** — pluggable hook (`--embedder`: subprocess command or `http(s)://` URL); mrplex never calls a provider itself. Chunker + backlog worker + brute-force cosine k-NN over `sqlite-vec`; results current-version only, deduped by content hash. Composes with filter/text/scope/sigil-exclusion. Project `$semantic_score` via `select` to see cosine similarity. No hook configured → `semantic_unavailable` (no zero-vector default — silent garbage is worse than a visible gap).
 - **Full-trust kernel — no in-engine auth.** mrplex authenticates nothing: any caller that can reach the engine can do anything. Authentication, users, and tokens live in a *shell* around it — the OS process boundary for local/stdio use, or a fronting proxy for networked deployments (never expose mrplex directly to an untrusted network). Identity is one opaque `author` string per write (default `"mrplex"`; convention is git's `Full Name <email>`). Read visibility can still be narrowed per call with a `ScopeClaim[]` — repo/path globs (gitignore-style, with negation) evaluated at call time.
 - **HTTP surfaces.** Protocol-true MCP server at `/mcp` (Streamable HTTP + optional STDIO), and a resource-oriented REST surface with `If-Match` / `If-None-Match`, content negotiation (`application/json` or `text/markdown`), `MOVE`, and sibling `/versions` / `/history` / `/diff` roots. Query responses carry ETags for `If-None-Match` → 304.
 - **`mrplex` CLI** — thin client over MCP. `--database` for local embedded mode; `--server` for remote mode against a running server. Every command works identically over both transports.
@@ -27,12 +27,31 @@ Two layers: a **full-trust kernel** (no in-engine auth — whoever reaches it ca
 
 ## Quickstart
 
-Install and link the `mrplex` command:
+Install mrplex globally (Node ≥ 20.11):
 
 ```bash
-npm install
-npm link          # puts `mrplex` on your PATH; alternatively, `npm install -g` after publish
+npm install -g mrplex
 ```
+
+Want semantic search too? Add the local embedder in the same step:
+
+```bash
+npm install -g mrplex @mrplex/embedder
+export MRPLEX_EMBEDDER=mrplex-embedder
+```
+
+Or install the embedder separately later:
+
+```bash
+npm install -g @mrplex/embedder
+export MRPLEX_EMBEDDER=mrplex-embedder
+```
+
+`@mrplex/embedder` installs a `mrplex-embedder` command on your PATH — pass that to
+`--embedder` (or set once via `MRPLEX_EMBEDDER` as above). No path to
+`node_modules` required.
+
+Prefer not to install globally? `npx mrplex …` and `npx @mrplex/embedder` work the same way.
 
 No bootstrap, no token for local use — the kernel is full-trust (whoever can run
 the binary or reach the port is trusted). Add authentication for shared or
@@ -55,6 +74,7 @@ with `-r / --repo <slug>`.
 mrplex config set-database ./mrplex.db
 mrplex config set-repo notes
 mrplex config set-author "Ada Lovelace <ada@example.com>"   # optional; identity on writes
+mrplex config set-embedder mrplex-embedder                  # optional; local semantic search
 mrplex config set-server http://127.0.0.1:8321             # optional — for remote mode
 mrplex config show                                         # summary
 ```
@@ -205,6 +225,9 @@ so full trust is never a forgotten-flag accident:
 # Full-trust local dev (no auth). --unsafe is deliberate and explicit.
 mrplex serve --unsafe --port 8321 &
 
+# With local embeddings (after: npm install -g @mrplex/embedder).
+mrplex serve --unsafe --embedder mrplex-embedder --port 8321 &
+
 # Same commands, now over the network — --server takes precedence over --database
 mrplex --server http://127.0.0.1:8321 docs get greetings/hi.md
 mrplex --server http://127.0.0.1:8321 query -r notes --filter 'status == "published"'
@@ -341,48 +364,81 @@ Troubleshooting: a 401 with a token that *looks* valid almost always means the
 token is opaque (missing `--audience`) or the issuer/audience don't match the
 server's pins exactly (Auth0 issuers include the trailing slash).
 
-> Prefer not to `npm link`? Use `npx mrplex …` from the repo, or add
-> `./node_modules/.bin` to your `PATH`. Every `mrplex …` command in
-> this README is equivalent to `npx mrplex …` or
-> `npm run --silent cli -- …`.
+> **Contributing from a git checkout?** Run `npm install && npm link` in the repo
+> (or `npm run cli -- …` / `npx mrplex …` with `./node_modules/.bin` on your PATH).
+> Every `mrplex …` command in this README is equivalent to `npx mrplex …`.
 
 ## Embeddings
 
-mrplex never calls an embedding provider itself — you wire one up. It doesn't install one by default either, but it does bundle a ready-to-use local provider ([`@mrplex/embedder`](packages/embedder), see [below](#local-embedder-no-service-no-gpu)) you can opt into, and rolling your own is just implementing one of two hook shapes:
+mrplex never calls an embedding provider itself — you wire one up with
+`--embedder`. A **command** (e.g. `mrplex-embedder`) runs as a long-lived
+subprocess; an **`http://` or `https://` URL** uses the HTTP hook instead.
 
-```bash
-# HTTP endpoint — server POSTs { chunks: [...] } and expects
-# { vectors: [[...]], model: "…", dim: N }.
-mrplex serve --unsafe --embed-url http://127.0.0.1:8399
-
-# Subprocess — one JSON line in / one JSON line out over stdin/stdout.
-mrplex serve --unsafe --embed-cmd "path/to/embedder --stdio"
-```
-
-(The `--policy` shell accepts the same `--embed-*` flags.)
-
-Either flag can also come from `MRPLEX_EMBED_URL` / `MRPLEX_EMBED_CMD` env or CLI config. `--embed-url` and `--embed-cmd` are mutually exclusive.
-
-### Local embedder (no service, no GPU)
-
-[`@mrplex/embedder`](packages/embedder) is a ready-to-use `--embed-cmd` provider: a resident Node subprocess running `bge-small-en-v1.5` (384-dim) on CPU via ONNX. It's a **separate package** so its `fastembed` dependency stays out of mrplex's core dependency graph — install it only if you want local embeddings:
+For local CPU embeddings, install [`@mrplex/embedder`](https://www.npmjs.com/package/@mrplex/embedder):
 
 ```bash
 npm install -g @mrplex/embedder
 
-mrplex serve --unsafe --embed-cmd "mrplex-embedder --stdio"
+# One-shot on the command line:
+mrplex serve --unsafe --embedder mrplex-embedder
+
+# Or set once for every command (serve, embed backfill, semantic query in local mode):
+export MRPLEX_EMBEDDER=mrplex-embedder
 ```
 
-For development from this repo, `cd packages/embedder && npm install` and use
-`node packages/embedder/embedder.mjs --stdio` instead of the global binary.
+Without a global install, `npx -y @mrplex/embedder` works as the `--embedder`
+value the same way.
 
-See [packages/embedder/README.md](packages/embedder/README.md) for model flags (`--model`, `--dim`) and a note on the `tar` advisory scope.
+Rolling your own provider implements the same contract — subprocess (default)
+or HTTP sidecar:
+
+```bash
+mrplex serve --unsafe --embedder http://127.0.0.1:8399
+mrplex serve --unsafe --embedder "node ./my-embedder.mjs"
+```
+
+(The `--policy` shell accepts `--embedder` too.)
+
+Resolution order: **flag → `MRPLEX_EMBEDDER` env → `mrplex config set-embedder` →
+unset**. Legacy `--embed-url` / `--embed-cmd` (and `MRPLEX_EMBED_URL` /
+`MRPLEX_EMBED_CMD`) still work but are deprecated.
+
+### Local embedder (no service, no GPU)
+
+[`@mrplex/embedder`](https://www.npmjs.com/package/@mrplex/embedder) is the
+official local provider: a resident Node subprocess running `bge-small-en-v1.5`
+(384-dim) on CPU via ONNX. It is a **separate npm package** so its `fastembed`
+dependency stays out of mrplex's core graph — install it only if you want local
+embeddings.
+
+```bash
+npm install -g @mrplex/embedder
+export MRPLEX_EMBEDDER=mrplex-embedder
+# or: mrplex config set-embedder mrplex-embedder
+
+mrplex serve --unsafe    # picks up MRPLEX_EMBEDDER / config automatically
+mrplex embed backfill -r notes
+mrplex query -r notes --semantic 'tiered SaaS pricing'
+```
+
+Model flags go on the embedder command itself:
+
+```bash
+export MRPLEX_EMBEDDER="mrplex-embedder --model fast-bge-base-en-v1.5"
+mrplex-embedder --list-models    # see all supported keys
+```
+
+See [packages/embedder/README.md](packages/embedder/README.md) for protocol
+details and a note on the `tar` advisory scope.
+
+**Monorepo development:** `cd packages/embedder && npm install`, then
+`--embedder "node packages/embedder/embedder.mjs"`.
 
 Backlog + backfill for retrofitting an existing corpus:
 
 ```bash
 # Re-chunk + re-embed a repo's current versions that are missing chunks.
-mrplex embed backfill --repo notes --embed-url http://127.0.0.1:8399
+mrplex embed backfill --repo notes    # uses MRPLEX_EMBEDDER when set
 
 # Inspect the queue — counts, models present, recent errors.
 mrplex embed status
@@ -397,6 +453,13 @@ node scripts/stub-embedder.mjs --http 8399
 Writes done while a hook is configured trigger the in-process worker automatically; a hookless server still enqueues each write so a later `embed backfill` doesn't have to walk history. Semantic queries with no hook return `semantic_unavailable` — there is no zero-vector fallback (design §5.3).
 
 ## Development
+
+From a git checkout (not needed if you installed from npm):
+
+```bash
+npm install
+npm link          # puts `mrplex` on your PATH for local hacking
+```
 
 ```bash
 npm test          # invariants, kernel suite, writes, read scopes, query, semantic, diff, chunker, worker, HTTP surfaces, CLI
@@ -429,4 +492,4 @@ The adapter passes any `postgres://…` URL through unchanged, so `sslmode`, `ap
 
 ## License
 
-TBD.
+MIT — see [LICENSE](LICENSE).

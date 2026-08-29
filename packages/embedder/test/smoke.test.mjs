@@ -68,7 +68,7 @@ describe("@mrplex/embedder smoke", () => {
     let proc;
 
     before(async () => {
-      ({ proc } = await spawnEmbedder(["--stdio"]));
+      ({ proc } = await spawnEmbedder([]));
     }, { timeout: 120_000 });
 
     after(() => {
@@ -108,4 +108,14 @@ describe("@mrplex/embedder smoke", () => {
       assert.match(body2.error, /chunks/);
     });
   });
+
+  it("--stdio is accepted as a backward-compatible no-op", async () => {
+    const { proc, ready } = await spawnEmbedder(["--stdio"]);
+    await ready;
+    writeLine(proc, { chunks: ["compat"] });
+    const body = JSON.parse(await readLine(proc));
+    assert.equal(body.dim, 384);
+    proc.stdin.end();
+    proc.kill();
+  }, { timeout: 120_000 });
 });

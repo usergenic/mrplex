@@ -20,9 +20,13 @@ import { parseDocument as parseYamlDocument } from "yaml";
 import type { KernelClient } from "../client/kernel-client.js";
 import { openLocalClient } from "../client/local.js";
 import { openRemoteClient } from "../client/remote-mcp.js";
-import { backfillRepo } from "../embed/backfill.js";
 import {
+  backfillRepo } from "../embed/backfill.js";
+import {
+  addEmbedCliOptions,
   createHookFromConfig,
+  embedFlagInputsFromCli,
+  type EmbedCliOpts,
   type EmbedFlagInputs,
   resolveEmbedConfig,
 } from "../embed/config.js";
@@ -294,8 +298,8 @@ function resolveRepoSlug(opts: GlobalOpts): string {
  * `server`) is set, otherwise the local in-process client. Enforces the
  * m3-plan decision that --database and --server are mutually exclusive.
  *
- * In local mode we also resolve an embed hook (from --embed-url/--embed-cmd
- * or env/config) — needed for CLI-local semantic queries and for backlog
+ * In local mode we also resolve an embed hook (from --embedder or legacy
+ * --embed-url/--embed-cmd, or env/config) — needed for CLI-local semantic
  * enqueue on writes done through the CLI.
  */
 async function openClient(
@@ -514,7 +518,7 @@ function buildProgram(): Command {
   // a server over a local database must spell out exactly one of --policy (run
   // the authenticating shell) or --unsafe (raw full-trust kernel). Neither →
   // refuse; both → refuse. Full trust is never the result of a forgotten flag.
-  program
+  const serveCmd = program
     .command("serve")
     .description("start HTTP surfaces (REST + MCP Streamable HTTP) — §7.3")
     .option("--policy <file>", "YAML policy file — run the authenticating shell (auth-shell plan)")
@@ -525,10 +529,9 @@ function buildProgram(): Command {
     .option("--oidc-jwks-uri <url>", "JWKS endpoint (default: <issuer>/.well-known/jwks.json)")
     .option("--port <n>", "TCP port (default 8321)", parsePositiveInt)
     .option("--host <h>", "bind host (default 127.0.0.1)")
-    .option("--mcp-stdio", "also expose MCP over STDIO for the launch token (--unsafe only)", false)
-    .option("--embed-url <url>", "HTTP embedding endpoint (§5.3)")
-    .option("--embed-cmd <cmd>", "subprocess embedding command (JSON-lines over stdio)")
-    .action(function (this: Command) {
+    .option("--mcp-stdio", "also expose MCP over STDIO for the launch token (--unsafe only)", false);
+  addEmbedCliOptions(serveCmd);
+  serveCmd.action(function (this: Command) {
       const gopts = this.optsWithGlobals<GlobalOpts>();
       const localOpts = this.opts<{
         policy?: string;
@@ -540,17 +543,12 @@ function buildProgram(): Command {
         port?: number;
         host?: string;
         mcpStdio: boolean;
-        embedUrl?: string;
-        embedCmd?: string;
-      }>();
+      } & EmbedCliOpts>();
       (async () => {
         try {
           assertServeGate(localOpts.policy, localOpts.unsafe);
           const database = resolveDatabase(gopts);
-          const embedCfg = resolveEmbedConfig({
-            embed_url: localOpts.embedUrl,
-            embed_cmd: localOpts.embedCmd,
-          });
+          const embedCfg = resolveEmbedConfig(embedFlagInputsFromCli(localOpts));
 
           // Authenticated shell mode.
           if (localOpts.policy !== undefined) {
@@ -628,7 +626,7 @@ function buildProgram(): Command {
   // Under the same policy|unsafe gate as serve: a server over a local database
   // spells out its trust posture. The credential arrives via --principal,
   // MRPLEX_SHELL_KEY / --key, or MRPLEX_SHELL_TOKEN / --token (an OAuth JWT).
-  program
+  const mcpStdioCmd = program
     .command("mcp-stdio")
     .description("run an MCP session over STDIO against a local database")
     .option("--policy <file>", "YAML policy file — resolve a guarded principal")
@@ -643,10 +641,9 @@ function buildProgram(): Command {
     .option("--oidc-issuer <url>", "OIDC issuer for --token verification")
     .option("--oidc-audience <aud>", "OIDC audience for --token verification")
     .option("--oidc-jwks-uri <url>", "JWKS endpoint (default: <issuer>/.well-known/jwks.json)")
-    .option("--audit <file>", "append a JSONL audit line per call (--policy only)")
-    .option("--embed-url <url>", "HTTP embedding endpoint (§5.3)")
-    .option("--embed-cmd <cmd>", "subprocess embedding command (JSON-lines over stdio)")
-    .action(function (this: Command) {
+    .option("--audit <file>", "append a JSONL audit line per call (--policy only)");
+  addEmbedCliOptions(mcpStdioCmd);
+  mcpStdioCmd.action(function (this: Command) {
       const gopts = this.optsWithGlobals<GlobalOpts>();
       const localOpts = this.opts<{
         policy?: string;
@@ -658,17 +655,12 @@ function buildProgram(): Command {
         oidcAudience?: string;
         oidcJwksUri?: string;
         audit?: string;
-        embedUrl?: string;
-        embedCmd?: string;
-      }>();
+      } & EmbedCliOpts>();
       (async () => {
         try {
           assertServeGate(localOpts.policy, localOpts.unsafe);
           const database = resolveDatabase(gopts);
-          const embedCfg = resolveEmbedConfig({
-            embed_url: localOpts.embedUrl,
-            embed_cmd: localOpts.embedCmd,
-          });
+          const embedCfg = resolveEmbedConfig(embedFlagInputsFromCli(localOpts));
           const hook = createHookFromConfig(embedCfg);
 
           if (localOpts.policy === undefined) {
@@ -892,6 +884,17 @@ function buildProgram(): Command {
       process.stderr.write("config: author set\n");
     });
   cfg
+    .command("set-embedder <spec>")
+    .description("write the default --embedder to the CLI config (command or http(s):// URL)")
+    .action((spec: string) => {
+      const prev = loadConfig();
+      const c: CliConfig = { ...prev, embedder: spec };
+      delete c.embed_url;
+      delete c.embed_cmd;
+      saveConfig(c);
+      process.stderr.write("config: embedder set\n");
+    });
+  cfg
     .command("show")
     .description("print the current CLI config")
     .action(function (this: Command) {
@@ -901,7 +904,7 @@ function buildProgram(): Command {
         process.stdout.write(`${JSON.stringify(c, null, 2)}\n`);
       } else {
         process.stdout.write(
-          `database: ${c.database ?? "(unset)"}\nserver:   ${c.server ?? "(unset)"}\nrepo:     ${c.repo ?? "(unset)"}\nauthor:   ${c.author ?? "(unset)"}\ntoken:    ${c.token ? "(set)" : "(unset)"}\n`,
+          `database: ${c.database ?? "(unset)"}\nserver:   ${c.server ?? "(unset)"}\nrepo:     ${c.repo ?? "(unset)"}\nauthor:   ${c.author ?? "(unset)"}\nembedder: ${c.embedder ?? "(unset)"}\ntoken:    ${c.token ? "(set)" : "(unset)"}\n`,
         );
       }
     });
@@ -1565,24 +1568,20 @@ function buildProgram(): Command {
   // — same as bootstrap.
   const embed = program.command("embed").description("embedding worker + backlog");
 
-  embed
+  const embedBackfillCmd = embed
     .command("backfill")
-    .description("re-chunk + re-embed current versions missing chunks (§5.3)")
-    .option("--embed-url <url>", "HTTP embedding endpoint")
-    .option("--embed-cmd <cmd>", "subprocess embedding command (JSON-lines over stdio)")
-    .action(function (this: Command) {
-      const localOpts = this.opts<{ embedUrl?: string; embedCmd?: string }>();
+    .description("re-chunk + re-embed current versions missing chunks (§5.3)");
+  addEmbedCliOptions(embedBackfillCmd);
+  embedBackfillCmd.action(function (this: Command) {
+      const localOpts = this.opts<EmbedCliOpts>();
       const gopts = this.optsWithGlobals<GlobalOpts>();
       (async () => {
         try {
           const repo = resolveRepoSlug(gopts);
-          const embedCfg = resolveEmbedConfig({
-            embed_url: localOpts.embedUrl,
-            embed_cmd: localOpts.embedCmd,
-          });
+          const embedCfg = resolveEmbedConfig(embedFlagInputsFromCli(localOpts));
           if (embedCfg.kind === "none") {
             process.stderr.write(
-              "embed backfill: no hook configured — set --embed-url or --embed-cmd\n",
+              "embed backfill: no hook configured — set --embedder (or MRPLEX_EMBEDDER)\n",
             );
             process.exit(1);
           }
@@ -1659,7 +1658,7 @@ function buildProgram(): Command {
     });
 
   // -------- sync (sync/history plan §4) --------
-  program
+  const syncCmd = program
     .command("sync <root>")
     .description("two-way sync between a local vault and a mrplex repo (§4)")
     .addHelpText(
@@ -1667,9 +1666,9 @@ function buildProgram(): Command {
       "\nNote: on a repo created before migration 0002, run `mrplex hash backfill` first.\n" +
         "Until every version has a stored $content_hash, a clean local copy that lacks\n" +
         "sync intrinsics can be parked as a conflict instead of adopted (§2.6).\n\n" +
-        "Note: --embed-url/--embed-cmd only apply in local (--database) mode. When\n" +
+        "Note: --embedder only applies in local (--database) mode. When\n" +
         "syncing against a --server, embeddings are the server's responsibility and\n" +
-        "these flags are ignored.",
+        "this flag is ignored.",
     )
     .option("--once", "run startup reconciliation once, then exit (no watcher)", false)
     .option("--interval <ms>", "feed poll interval in ms (daemon; default 5000)", parsePositiveInt)
@@ -1690,10 +1689,9 @@ function buildProgram(): Command {
       (value: string, prev: string[] | undefined) => [...(prev ?? []), value],
     )
     .option("--dry-run", "report the actions a reconciliation would take, changing nothing", false)
-    .option("-v, --verbose", "log each action to stderr", false)
-    .option("--embed-url <url>", "HTTP embedding endpoint (§5.3)")
-    .option("--embed-cmd <cmd>", "subprocess embedding command (JSON-lines over stdio)")
-    .action(function (this: Command, root: string) {
+    .option("-v, --verbose", "log each action to stderr", false);
+  addEmbedCliOptions(syncCmd);
+  syncCmd.action(function (this: Command, root: string) {
       const localOpts = this.opts<{
         once: boolean;
         interval?: number;
@@ -1703,13 +1701,8 @@ function buildProgram(): Command {
         exclude?: string[];
         dryRun: boolean;
         verbose: boolean;
-        embedUrl?: string;
-        embedCmd?: string;
-      }>();
-      const embedFlags: EmbedFlagInputs = {
-        embed_url: localOpts.embedUrl,
-        embed_cmd: localOpts.embedCmd,
-      };
+      } & EmbedCliOpts>();
+      const embedFlags: EmbedFlagInputs = embedFlagInputsFromCli(localOpts);
       const globals = this.optsWithGlobals<GlobalOpts>();
       let repo: string;
       try {

@@ -1,7 +1,7 @@
 # @mrplex/embedder
 
 A ready-to-use local embedding provider for [mrplex](https://github.com/usergenic/mrplex)'s
-`--embed-cmd` hook. It runs `bge-small-en-v1.5` (384-dim) on CPU via ONNX — no GPU, no
+`--embedder` hook. It runs `bge-small-en-v1.5` (384-dim) on CPU via ONNX — no GPU, no
 separate service. mrplex spawns it once and keeps it resident, so the model loads a single
 time and each batch is one JSON line in / one JSON line out.
 
@@ -30,34 +30,34 @@ cd packages/embedder && npm install
 
 ## Use with mrplex
 
-After a global install, point mrplex at the `mrplex-embedder` binary:
+After a global install:
 
 ```bash
 # Serve with the hook — every write auto-embeds.
-mrplex serve --unsafe --embed-cmd "mrplex-embedder --stdio"
+mrplex serve --unsafe --embedder mrplex-embedder
 
 # One-off backfill of an existing repo.
-mrplex embed backfill -r notes --embed-cmd "mrplex-embedder --stdio"
+mrplex embed backfill -r notes --embedder mrplex-embedder
 
-# Or make it ambient.
-export MRPLEX_EMBED_CMD="mrplex-embedder --stdio"
+# Or make it ambient for every mrplex command:
+export MRPLEX_EMBEDDER=mrplex-embedder
+# mrplex config set-embedder mrplex-embedder   # same thing, persisted
 ```
 
 **Monorepo / local checkout** (no global install):
 
 ```bash
-mrplex serve --unsafe \
-  --embed-cmd "node packages/embedder/embedder.mjs --stdio"
+mrplex serve --unsafe --embedder "node packages/embedder/embedder.mjs"
 ```
 
 ### Different models
 
 ```bash
 # Stronger, slower (768-dim).
-export MRPLEX_EMBED_CMD="mrplex-embedder --stdio --model fast-bge-base-en-v1.5"
+export MRPLEX_EMBEDDER="mrplex-embedder --model fast-bge-base-en-v1.5"
 
 # Matryoshka truncation (re-embed after changing --dim).
-export MRPLEX_EMBED_CMD="mrplex-embedder --stdio --dim 256"
+export MRPLEX_EMBEDDER="mrplex-embedder --dim 256"
 ```
 
 List supported model keys:
@@ -68,13 +68,14 @@ mrplex-embedder --list-models
 
 ## Flags
 
-- `--stdio` — required transport (one JSON line per batch over stdin/stdout).
 - `--model KEY` — any `fastembed` model key. Default `fast-bge-small-en-v1.5`.
   Others include `fast-all-MiniLM-L6-v2`, `fast-bge-base-en-v1.5`,
   `fast-multilingual-e5-large`. Run `--list-models` for the full set.
 - `--dim N` — truncate + re-normalize each vector to `N` dims (for Matryoshka
   models). The truncation is encoded into the reported model string
   (`<key>@<N>`) so mrplex treats a dim change as a model change and re-embeds.
+- `--stdio` — optional no-op; stdio is the default transport (one JSON line
+  per batch over stdin/stdout).
 - `--list-models` — print supported `--model` keys and exit.
 - `--help`, `--version` — usage and version.
 

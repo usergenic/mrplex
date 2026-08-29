@@ -21,6 +21,12 @@ export type CliConfig = {
   token?: string;
   repo?: string;
   author?: string;
+  /** Default --embedder (command or http(s):// URL). */
+  embedder?: string;
+  /** @deprecated Use `embedder`. */
+  embed_url?: string;
+  /** @deprecated Use `embedder`. */
+  embed_cmd?: string;
 };
 
 export function configPath(): string {

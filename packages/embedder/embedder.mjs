@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Local embedding provider for mrplex's `--embed-cmd` hook.
+ * Local embedding provider for mrplex's `--embedder` hook.
  *
  * Speaks the subprocess contract (design §5.3): one JSON line in on stdin
  * `{ chunks: string[] }`, one JSON line out on stdout
@@ -8,8 +8,8 @@
  * ONCE and reuses it for every batch (src/embed/cmd-hook.ts), so the model
  * loads a single time and stays resident — no per-call cold start.
  *
- *   mrplex serve --unsafe --embed-cmd "mrplex-embedder --stdio"
- *   mrplex embed backfill -r notes --embed-cmd "mrplex-embedder --stdio"
+ *   mrplex serve --unsafe --embedder mrplex-embedder
+ *   mrplex embed backfill -r notes --embedder mrplex-embedder
  *
  * Model: bge-small-en-v1.5 (384-dim) by default — strong retrieval quality for
  * its size, and small vectors keep mrplex's brute-force cosine scan fast. Runs
@@ -35,13 +35,13 @@ const has = (name) => argv.includes(name);
 
 function printHelp() {
   console.error(`mrplex-embedder ${VERSION}
-Local CPU embedding provider for mrplex's --embed-cmd hook.
+Local CPU embedding provider for mrplex's --embedder hook.
 
 Usage:
-  mrplex-embedder --stdio [--model KEY] [--dim N]
+  mrplex-embedder [--model KEY] [--dim N]
 
 Options:
-  --stdio          required transport (one JSON line per batch over stdin/stdout)
+  --stdio          optional; stdio is the default (one JSON line per batch over stdin/stdout)
   --model KEY      fastembed model key (default: fast-bge-small-en-v1.5)
   --dim N          truncate + re-normalize to N dims (Matryoshka models only)
   --list-models    print supported --model keys and exit
@@ -87,11 +87,6 @@ if (has("--list-models")) {
     console.log(key);
   }
   process.exit(0);
-}
-
-if (!has("--stdio")) {
-  printHelp();
-  process.exit(2);
 }
 
 // fastembed keys its models by an enum whose values are the string keys above.
