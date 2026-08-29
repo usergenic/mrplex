@@ -1292,9 +1292,15 @@ function buildProgram(): Command {
     });
 
   // -------- query --------
-  program
+  const queryCmd = program
     .command("query")
     .description("search documents — CEL filter + FTS text + semantic (design §5)")
+    .addHelpText(
+      "after",
+      "\nNote: --embedder only applies in local (--database) mode. When querying\n" +
+        "a --server, embeddings are the server's responsibility and this flag is\n" +
+        "ignored (use MRPLEX_EMBEDDER / serve --embedder on the host instead).",
+    )
     .option(
       "-r, --repo <slug-or-glob>",
       "repo slug or glob; repeat the flag to query multiple (default: all in scope)",
@@ -1315,8 +1321,9 @@ function buildProgram(): Command {
       (value: string, prev: string[] | undefined) => [...(prev ?? []), value],
     )
     .option("--include-hidden", "surface .-prefixed paths", false)
-    .option("--include-system", "surface :-prefixed (deleted, etc.) paths", false)
-    .action(function (this: Command) {
+    .option("--include-system", "surface :-prefixed (deleted, etc.) paths", false);
+  addEmbedCliOptions(queryCmd);
+  queryCmd.action(function (this: Command) {
       const localOpts = this.opts<{
         repo?: string[];
         filter?: string;
@@ -1327,7 +1334,8 @@ function buildProgram(): Command {
         select?: string[];
         includeHidden: boolean;
         includeSystem: boolean;
-      }>();
+      } & EmbedCliOpts>();
+      const embedFlags = embedFlagInputsFromCli(localOpts);
       withClient(this, async (client, opts) => {
         const result = await client.query({
           repo: localOpts.repo,
@@ -1340,7 +1348,7 @@ function buildProgram(): Command {
           include_system: localOpts.includeSystem,
         });
         emit(result, opts, renderQueryTable(result));
-      }).catch(reportError);
+      }, embedFlags).catch(reportError);
     });
 
   // -------- graph --------

@@ -243,14 +243,16 @@ mrplex never calls an embedding provider itself — wire one with `--embedder` (
 
 ```bash
 npm install -g @mrplex/embedder
-export MRPLEX_EMBEDDER=mrplex-embedder
+export MRPLEX_EMBEDDER=mrplex-embedder   # or: mrplex config set-embedder mrplex-embedder
 
 mrplex serve --unsafe --embedder mrplex-embedder
 mrplex embed backfill -r starship
-mrplex query -r starship --semantic 'distress beacon star map'
+mrplex query -r starship --semantic 'distress beacon star map'   # uses env/config
+# or per-invocation in local (--database) mode:
+mrplex query -r starship --embedder mrplex-embedder --semantic 'distress beacon star map'
 ```
 
-Resolution: **flag → `MRPLEX_EMBEDDER` → `mrplex config set-embedder` → unset**. See [packages/embedder/README.md](packages/embedder/README.md) for protocol details.
+Resolution: **flag → `MRPLEX_EMBEDDER` → `mrplex config set-embedder` → unset**. In local mode, `query --embedder` overrides for that call; with `--server`, configure the embedder on the host. See [packages/embedder/README.md](packages/embedder/README.md) for protocol details.
 
 ## Development
 

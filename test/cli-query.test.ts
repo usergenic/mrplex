@@ -14,6 +14,7 @@ import type { Storage } from "../src/storage/types.js";
 
 const REPO_ROOT = join(fileURLToPath(new URL(".", import.meta.url)), "..");
 const CLI = join(REPO_ROOT, "src", "cli", "main.ts");
+const STUB = join(REPO_ROOT, "scripts", "stub-embedder.mjs");
 
 let workDir: string;
 let dbUrl: string;
@@ -21,11 +22,12 @@ let storage: Storage;
 let notesRepoId: number;
 
 function run(...args: string[]): { stdout: string; stderr: string; status: number } {
+  const { MRPLEX_EMBEDDER: _ignored, ...parentEnv } = process.env as Record<string, string>;
   const res = spawnSync("node", ["--import", "tsx", CLI, "--database", dbUrl, ...args], {
     cwd: REPO_ROOT,
     encoding: "utf8",
     env: {
-      ...(process.env as Record<string, string>),
+      ...parentEnv,
       XDG_CONFIG_HOME: workDir,
     },
   });
@@ -216,5 +218,31 @@ describe("cli query", () => {
     const out = run("query", "--repo", "notes", "--filter", "this is [ not valid CEL");
     expect(out.status).toBe(1);
     expect(out.stderr).toContain("filter_invalid");
+  });
+
+  it("semantic without an embed hook → semantic_unavailable", async () => {
+    const out = run("query", "--repo", "notes", "--semantic", "welcome");
+    expect(out.status).toBe(1);
+    expect(out.stderr).toContain("semantic_unavailable");
+  });
+
+  it("--embedder enables semantic search in local mode", async () => {
+    const embedCmd = `node ${STUB} --stdio`;
+    const backfill = run("--json", "-r", "notes", "embed", "backfill", "--embed-cmd", embedCmd);
+    expect(backfill.status).toBe(0);
+
+    const out = run(
+      "--json",
+      "query",
+      "--repo",
+      "notes",
+      "--semantic",
+      "welcome",
+      "--embed-cmd",
+      embedCmd,
+    );
+    expect(out.status).toBe(0);
+    const results = JSON.parse(out.stdout) as { $path: string }[];
+    expect(results.map((r) => r.$path)).toContain("welcome.md");
   });
 });
