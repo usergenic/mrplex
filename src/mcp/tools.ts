@@ -44,6 +44,10 @@ export type ToolResult = {
   text: string;
 };
 
+/** Shared exact-path input note for docs tools (canonical-path-normalization). */
+const EXACT_PATH_DOC =
+  "Canonical repository-relative path (e.g. `projects/example.md`). Exact-path operations also accept one leading `/` as a repository-root reference alias; responses always return the slashless canonical path.";
+
 /** Wrap an array result as `{ items }` so it fits `structuredContent`. */
 function wrapList<T>(items: T[]): Record<string, unknown> {
   return { items };
@@ -663,12 +667,14 @@ export const TOOL_REGISTRY: ToolEntry[] = [
   {
     name: "docs_get",
     description:
-      "Read the current version of a document at (repo, path) — the way to recover a full document after `query`. Returned `frontmatter_raw` has `$version: <version_id>` then `$content_hash: <sha256>` appended so a subsequent `docs_put` can reuse `$version` as `prev_version_id` (unless `raw: true`). A missing path raises doc_not_found (unlike `query`, which omits unmatched paths). For several paths at once, use `docs_get_many`.",
+      "Read the current version of a document at (repo, path) — the way to recover a full document after `query`. " +
+      EXACT_PATH_DOC +
+      " Returned `frontmatter_raw` has `$version: <version_id>` then `$content_hash: <sha256>` appended so a subsequent `docs_put` can reuse `$version` as `prev_version_id` (unless `raw: true`). A missing path raises doc_not_found (unlike `query`, which omits unmatched paths). For several paths at once, use `docs_get_many`.",
     inputSchema: {
       type: "object",
       properties: {
         repo: { type: "string" },
-        path: { type: "string" },
+        path: { type: "string", description: EXACT_PATH_DOC },
         raw: {
           type: "boolean",
           description: "Suppress server-injected `$*` system properties in frontmatter_raw.",
@@ -697,7 +703,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
         paths: {
           type: "array",
           items: { type: "string" },
-          description: "Non-empty list of document paths to fetch.",
+          description: `Non-empty list of document paths to fetch. ${EXACT_PATH_DOC}`,
         },
         raw: {
           type: "boolean",
@@ -797,7 +803,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       type: "object",
       properties: {
         repo: { type: "string" },
-        path: { type: "string" },
+        path: { type: "string", description: EXACT_PATH_DOC },
         limit: { type: "integer", minimum: 1 },
         before: { type: "string", description: "ISO-8601 UTC" },
       },
@@ -815,12 +821,12 @@ export const TOOL_REGISTRY: ToolEntry[] = [
   {
     name: "docs_diff",
     description:
-      "Unified diff between two versions of the document at (repo, path). Both versions must belong to that document — otherwise version_not_in_document.",
+      `Unified diff between two versions of the document at (repo, path). ${EXACT_PATH_DOC} Both versions must belong to that document — otherwise version_not_in_document.`,
     inputSchema: {
       type: "object",
       properties: {
         repo: { type: "string" },
-        path: { type: "string" },
+        path: { type: "string", description: EXACT_PATH_DOC },
         from: { type: "string", description: "source version id" },
         to: { type: "string", description: "target version id" },
       },
@@ -841,12 +847,12 @@ export const TOOL_REGISTRY: ToolEntry[] = [
   {
     name: "docs_create",
     description:
-      "Create a new document at (repo, path). Fails with create_conflict if the path is occupied. Provide exactly one of `frontmatter` (JSON map) or `frontmatter_raw` (verbatim YAML).",
+      `Create a new document at (repo, path). ${EXACT_PATH_DOC} Fails with create_conflict if the path is occupied. Provide exactly one of \`frontmatter\` (JSON map) or \`frontmatter_raw\` (verbatim YAML).`,
     inputSchema: {
       type: "object",
       properties: {
         repo: { type: "string" },
-        path: { type: "string" },
+        path: { type: "string", description: EXACT_PATH_DOC },
         body: { type: "string" },
         frontmatter: { type: "object", additionalProperties: true },
         frontmatter_raw: { type: "string" },
@@ -880,7 +886,10 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       type: "object",
       properties: {
         repo: { type: "string" },
-        path: { type: "string", description: "Destination path (may differ from prev's path)." },
+        path: {
+          type: "string",
+          description: `Destination path (may differ from prev's path). ${EXACT_PATH_DOC}`,
+        },
         prev_version_id: {
           type: "string",
           description:

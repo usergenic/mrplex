@@ -75,12 +75,57 @@ function startsWithAnySigil(segment: string, sigils: readonly string[]): string 
 }
 
 // -----------------------------------------------------------------------------
+// Exact document path normalization (canonical-path-normalization plan).
+// -----------------------------------------------------------------------------
+
+/** True when `path` is a glob/pattern operand (not an exact document path). */
+export function isPathGlobPattern(path: string): boolean {
+  return path.includes("*") || path.includes("?");
+}
+
+/**
+ * Normalize an exact document path for API lookup and writes. Accepts a
+ * canonical slashless path unchanged, or exactly one leading `/` as a
+ * repository-root reference alias (Markdown-style). Returns the slashless
+ * canonical form after applying `validatePath`. Failure → `path_invalid`.
+ *
+ * Idempotent: `normalizeExactDocumentPath(normalizeExactDocumentPath(p))`
+ * equals `normalizeExactDocumentPath(p)`.
+ *
+ * Do not use for glob operands, CEL `$path` literals, or stored link text —
+ * those keep their own semantics.
+ */
+export function normalizeExactDocumentPath(
+  input: string,
+  config: EffectivePathConfig,
+): string {
+  if (input.includes("\\")) {
+    throw pathInvalid(input, "", "path contains backslash");
+  }
+
+  let path = input;
+  if (path.startsWith(PATH_SEPARATOR)) {
+    if (path === PATH_SEPARATOR) {
+      throw pathInvalid(path, "", "path is empty");
+    }
+    if (path.length > 1 && path[1] === PATH_SEPARATOR) {
+      throw pathInvalid(path, "", "path has multiple leading '/'");
+    }
+    path = path.slice(1);
+  }
+
+  validatePath(path, config);
+  return path;
+}
+
+// -----------------------------------------------------------------------------
 // Path validation (§3.5.3).
 // -----------------------------------------------------------------------------
 
 /**
- * Validate every segment of a user-written path. Applied at `docs.create` and
- * `docs.put` (design §3.5.3). Failure → `path_invalid`.
+ * Validate every segment of a canonical (slashless) user-written path.
+ * Applied at `docs.create` and `docs.put` (design §3.5.3) after exact-path
+ * alias normalization. Failure → `path_invalid`.
  *
  * The kernel bypasses these checks for its own deletion moves (§4.1 rule 4);
  * that bypass lives in the write surface, not here.

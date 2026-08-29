@@ -93,6 +93,12 @@ describe("roots (§4.2)", () => {
       code: "repo_not_found",
     });
   });
+
+  it("accepts a literal root with one leading slash (exact-path alias)", async () => {
+    await create("alias-root.md");
+    await create("other.md");
+    expect(await paths({ roots: "/alias-root.md", degrees: 0 })).toEqual(["alias-root.md"]);
+  });
 });
 
 describe("direction lens (§2.1, decision 4)", () => {

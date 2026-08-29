@@ -23,6 +23,7 @@ Two layers: a **full-trust kernel** (no in-engine auth — whoever reaches it ca
 - **Two v1 storage adapters — SQLite and Postgres+pgvector.** `--database sqlite:./mrplex.db` (bare path defaults to sqlite) or `--database postgres://user:pw@host:5432/db`. Both pass the same kernel test suite.
 - **Configurable path policy** — hardcoded defaults → server config → per-repo override. `disallowed_chars`, `system_sigils`, `hidden_sigils`, all with sensible defaults (Obsidian's cross-platform-safe rule).
 - **Case-insensitive paths and slugs** — identity is Unicode-normalized (NFC) and case-insensitive (`Alice.md` and `alice.md` are the same document; `docs.get NOTES/alice.md` finds it), while storage preserves the exact case you write.
+- **Canonical document paths** — API responses and query `$path` values are always slashless repository-relative paths (`projects/example.md`). Exact-path operations (`docs.get`, `docs.put`, …) also accept one leading `/` as a Markdown-style repository-root alias (`/projects/example.md`); a leading slash never creates a separate document identity.
 
 ## Quickstart
 

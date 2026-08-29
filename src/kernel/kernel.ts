@@ -66,7 +66,12 @@ import {
   validateRepoOverride,
 } from "./path-config.js";
 import { type QuerySpec, DEFAULT_QUERY_LIMIT, runQuery } from "./query/query.js";
-import { validatePath, validateSlug } from "./validation.js";
+import {
+  isPathGlobPattern,
+  normalizeExactDocumentPath,
+  validatePath,
+  validateSlug,
+} from "./validation.js";
 import { decodeVersionId, encodeVersionId } from "./version-id.js";
 import type {
   DocGetManyError,
@@ -302,7 +307,11 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
     if (!claimsGrantRead(claims, repoSlug, path)) throw forbidden();
   }
 
-  function dedupeGetManyPaths(paths: unknown): string[] {
+  function normalizeDocPath(repo: RepoRow, path: string): string {
+    return normalizeExactDocumentPath(path, repoEffectiveConfig(repo));
+  }
+
+  function dedupeGetManyPaths(paths: unknown, repo: RepoRow): string[] {
     if (!Array.isArray(paths) || paths.length === 0) {
       throw new KernelError("filter_invalid", {
         reason: "paths must be a non-empty array of strings",
@@ -316,9 +325,11 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
           reason: "paths must be a non-empty array of strings",
         });
       }
-      if (!seen.has(p)) {
-        seen.add(p);
-        unique.push(p);
+      const canonical = normalizeDocPath(repo, p);
+      const key = normalizeKey(canonical);
+      if (!seen.has(key)) {
+        seen.add(key);
+        unique.push(canonical);
       }
     }
     if (unique.length > GET_MANY_MAX_PATHS) {
@@ -462,15 +473,16 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
     docs: {
       async get(ctx, repoSlug, path) {
         const repo = await resolveRepo(ctx, repoSlug);
-        assertReadable(claimsFor(ctx), repo.slug, path);
-        const row = await storage.version_current(repo.id, path);
-        if (!row) throw docNotFound(repoSlug, path);
+        const canonical = normalizeDocPath(repo, path);
+        assertReadable(claimsFor(ctx), repo.slug, canonical);
+        const row = await storage.version_current(repo.id, canonical);
+        if (!row) throw docNotFound(repoSlug, canonical);
         return toVersionWire(row, repoSlug);
       },
 
       async get_many(ctx, repoSlug, paths) {
         const repo = await resolveRepo(ctx, repoSlug);
-        const uniquePaths = dedupeGetManyPaths(paths);
+        const uniquePaths = dedupeGetManyPaths(paths, repo);
         const rows = await storage.versions_current_by_paths(repo.id, uniquePaths);
         const byNorm = new Map(rows.map((r) => [normalizeKey(r.path), r]));
         const claims = claimsFor(ctx);
@@ -503,19 +515,22 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
 
       async history(ctx, repoSlug, path, opts) {
         const repo = await resolveRepo(ctx, repoSlug);
-        assertReadable(claimsFor(ctx), repo.slug, path);
-        const current = await storage.version_current(repo.id, path);
-        if (!current) throw docNotFound(repoSlug, path);
+        const canonical = normalizeDocPath(repo, path);
+        assertReadable(claimsFor(ctx), repo.slug, canonical);
+        const current = await storage.version_current(repo.id, canonical);
+        if (!current) throw docNotFound(repoSlug, canonical);
         const rows = await storage.version_history(current.document_id, opts);
         return rows.map((r) => toVersionWire(r, repoSlug));
       },
 
       async diff(ctx, repoSlug, path, fromVersionId, toVersionId) {
+        const repo = await resolveRepo(ctx, repoSlug);
+        const canonical = normalizeDocPath(repo, path);
         const claims = claimsFor(ctx);
         return runDiff(
           {
             repo: repoSlug,
-            path,
+            path: canonical,
             from_version_id: fromVersionId,
             to_version_id: toVersionId,
           },
@@ -529,16 +544,16 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
 
       async create(ctx, repoSlug, path, input) {
         const repo = await resolveRepo(ctx, repoSlug);
-        validatePath(path, repoEffectiveConfig(repo));
+        const canonical = normalizeDocPath(repo, path);
         const author = resolveAuthor(ctx);
         const canon = canonicalizeFrontmatter(input);
 
         const { version, insertedId } = await storage.tx(async () => {
-          const existing = await storage.version_current(repo.id, path);
+          const existing = await storage.version_current(repo.id, canonical);
           if (existing) {
             throw new KernelError("create_conflict", {
               repo: repoSlug,
-              path,
+              path: canonical,
               current_version_id: encodeVersionId(existing.id),
             });
           }
@@ -547,7 +562,7 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
             document_id: doc.id,
             repo_id: repo.id,
             prev_id: null,
-            path,
+            path: canonical,
             frontmatter_raw: canon.frontmatter_raw,
             frontmatter: canon.frontmatter,
             body: input.body,
@@ -562,11 +577,11 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
             linkConfig,
             repo.id,
             doc.id,
-            path,
+            canonical,
             input.body,
             canon.frontmatter,
           );
-          await bindDanglingToPath(storage, repo.id, path, doc.id);
+          await bindDanglingToPath(storage, repo.id, canonical, doc.id);
           return {
             version: toVersionWire(inserted, repoSlug),
             insertedId: inserted.id,
@@ -583,8 +598,7 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
         const prev = await storage.version_by_id(prevId);
         if (!prev || prev.repo_id !== repo.id) throw versionNotFound(prevVersionId);
 
-        const putCfg = repoEffectiveConfig(repo);
-        validatePath(destPath, putCfg);
+        const canonicalDest = normalizeDocPath(repo, destPath);
         const author = resolveAuthor(ctx);
         const canon = canonicalizeOrCarry(input, prev);
         const body = input.body ?? prev.body;
@@ -604,12 +618,12 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
             });
           }
 
-          if (destPath !== prev.path) {
-            const occupant = await storage.version_current(repo.id, destPath);
+          if (canonicalDest !== prev.path) {
+            const occupant = await storage.version_current(repo.id, canonicalDest);
             if (occupant && occupant.document_id !== prev.document_id) {
               throw new KernelError("path_taken", {
                 repo: repoSlug,
-                path: destPath,
+                path: canonicalDest,
                 current_version_id: encodeVersionId(occupant.id),
               });
             }
@@ -619,7 +633,7 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
             document_id: prev.document_id,
             repo_id: repo.id,
             prev_id: prev.id,
-            path: destPath,
+            path: canonicalDest,
             frontmatter_raw: canon.frontmatter_raw,
             frontmatter: canon.frontmatter,
             body,
@@ -636,12 +650,12 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
             linkConfig,
             repo.id,
             prev.document_id,
-            destPath,
+            canonicalDest,
             body,
             canon.frontmatter,
           );
-          if (destPath !== prev.path) {
-            await bindDanglingToPath(storage, repo.id, destPath, prev.document_id);
+          if (canonicalDest !== prev.path) {
+            await bindDanglingToPath(storage, repo.id, canonicalDest, prev.document_id);
           }
           return {
             version: toVersionWire(inserted, repoSlug),
@@ -811,7 +825,12 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
     },
 
     async graph(ctx: CallContext, spec: GraphSpec): Promise<GraphResult> {
-      const deps: GraphDeps = { storage, serverPathConfig };
+      const repo = await storage.repos_by_slug(spec.repo);
+      const pathConfig =
+        repo === null
+          ? serverPathConfig
+          : effectivePathConfig(serverPathConfig, parseRepoOverride(repo.path_config));
+      const deps: GraphDeps = { storage, serverPathConfig, pathConfig };
       return runGraph(claimsFor(ctx), spec, deps);
     },
 
@@ -879,10 +898,18 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
 
       async list(ctx, input) {
         const repo = await resolveRepo(ctx, input.repo);
+        const cfg = repoEffectiveConfig(repo);
         const claims = claimsFor(ctx);
         // Compile the path glob to an anchored regex source (the same dialect
         // scope + graph use). Omitted glob = every document in the repo.
-        const pathRegexes = input.path === undefined ? [] : [`^${globToRegexSource(input.path)}$`];
+        // Literal paths accept one leading `/`; glob operands keep theirs.
+        const pathGlob =
+          input.path === undefined
+            ? undefined
+            : isPathGlobPattern(input.path)
+              ? input.path
+              : normalizeExactDocumentPath(input.path, cfg);
+        const pathRegexes = pathGlob === undefined ? [] : [`^${globToRegexSource(pathGlob)}$`];
         // Reject an unparseable bound rather than coercing to 0 — for `until`
         // that would silently mean `id <= 0` (empty result), inverting intent.
         const decodeBound = (kind: "since" | "until", value: string): number => {

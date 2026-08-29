@@ -616,6 +616,77 @@ export function runKernelSuite(factory: AdapterFactory): void {
     });
 
     // -----------------------------------------------------------------
+    // Canonical path normalization — leading-slash alias on exact-path APIs.
+    // -----------------------------------------------------------------
+    describe("canonical path normalization", () => {
+      it("get via alias returns the same version and canonical stored path", async () => {
+        const actor = await aliceActor();
+        await kernel.docs.create(actor, "notes", "alias-target.md", {
+          frontmatter_raw: "",
+          body: "x\n",
+        });
+        const direct = await kernel.docs.get(actor, "notes", "alias-target.md");
+        const aliased = await kernel.docs.get(actor, "notes", "/alias-target.md");
+        expect(aliased.version_id).toBe(direct.version_id);
+        expect(aliased.path).toBe("alias-target.md");
+      });
+
+      it("create via alias conflicts with the canonical spelling", async () => {
+        const actor = await aliceActor();
+        await kernel.docs.create(actor, "notes", "alias-conflict.md", {
+          frontmatter_raw: "",
+          body: "a\n",
+        });
+        await expect(
+          kernel.docs.create(actor, "notes", "/alias-conflict.md", {
+            frontmatter_raw: "",
+            body: "b\n",
+          }),
+        ).rejects.toMatchObject({ code: "create_conflict" });
+      });
+
+      it("put and move treat alias and canonical destinations as identical", async () => {
+        const actor = await aliceActor();
+        const v = await kernel.docs.create(actor, "notes", "move-src.md", {
+          frontmatter_raw: "",
+          body: "src\n",
+        });
+        await kernel.docs.create(actor, "notes", "move-dst.md", {
+          frontmatter_raw: "",
+          body: "dst\n",
+        });
+        await expect(
+          kernel.docs.put(actor, "notes", v.version_id, "/move-dst.md", { body: "nope\n" }),
+        ).rejects.toMatchObject({ code: "path_taken" });
+      });
+
+      it("get_many collapses alias spellings to one fetch (first-seen canonical)", async () => {
+        const actor = await aliceActor();
+        await kernel.docs.create(actor, "notes", "batch-alias.md", {
+          frontmatter_raw: "",
+          body: "x\n",
+        });
+        const r = await kernel.docs.get_many(actor, "notes", [
+          "/batch-alias.md",
+          "batch-alias.md",
+        ]);
+        expect(r.items).toHaveLength(1);
+        expect(r.items[0]?.path).toBe("batch-alias.md");
+        expect(r.errors).toEqual([]);
+      });
+
+      it("case folding composes with slash normalization", async () => {
+        const actor = await aliceActor();
+        await kernel.docs.create(actor, "notes", "SlashCase.md", {
+          frontmatter_raw: "",
+          body: "x\n",
+        });
+        const v = await kernel.docs.get(actor, "notes", "/slashcase.md");
+        expect(v.path).toBe("SlashCase.md");
+      });
+    });
+
+    // -----------------------------------------------------------------
     // Case & Unicode folding — case-insensitive, NFC-normalized identity
     // with case-preserving storage (design §3.5.1; case-folding-plan.md).
     // -----------------------------------------------------------------
