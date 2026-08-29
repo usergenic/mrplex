@@ -21,7 +21,11 @@ import type { KernelClient } from "../client/kernel-client.js";
 import { openLocalClient } from "../client/local.js";
 import { openRemoteClient } from "../client/remote-mcp.js";
 import { backfillRepo } from "../embed/backfill.js";
-import { createHookFromConfig, resolveEmbedConfig } from "../embed/config.js";
+import {
+  createHookFromConfig,
+  type EmbedFlagInputs,
+  resolveEmbedConfig,
+} from "../embed/config.js";
 import { createWorker } from "../embed/worker.js";
 import { globToRegexSource } from "../kernel/auth/glob.js";
 import { type CallContext, type ScopeClaim, parseScopeClaims } from "../kernel/context.js";
@@ -294,7 +298,10 @@ function resolveRepoSlug(opts: GlobalOpts): string {
  * or env/config) — needed for CLI-local rank queries and for backlog
  * enqueue on writes done through the CLI.
  */
-async function openClient(opts: GlobalOpts): Promise<KernelClient> {
+async function openClient(
+  opts: GlobalOpts,
+  embedFlags: EmbedFlagInputs = {},
+): Promise<KernelClient> {
   const server = resolveServer(opts);
   const hasExplicitDatabase =
     opts.database !== undefined || process.env.MRPLEX_DATABASE !== undefined;
@@ -313,7 +320,7 @@ async function openClient(opts: GlobalOpts): Promise<KernelClient> {
       token: resolveTokenString(opts.token) ?? undefined,
     });
   }
-  const embedCfg = resolveEmbedConfig({});
+  const embedCfg = resolveEmbedConfig(embedFlags);
   const embed = createHookFromConfig(embedCfg);
   return openLocalClient({ database: resolveDatabase(opts), context, embed });
 }
@@ -328,9 +335,10 @@ function resolveTokenString(cliFlag: string | undefined): string | null {
 async function withClient<T>(
   cmd: Command,
   fn: (client: KernelClient, opts: GlobalOpts) => Promise<T>,
+  embedFlags: EmbedFlagInputs = {},
 ): Promise<T> {
   const opts = cmd.optsWithGlobals<GlobalOpts>();
-  const client = await openClient(opts);
+  const client = await openClient(opts, embedFlags);
   try {
     return await fn(client, opts);
   } finally {
@@ -1658,7 +1666,10 @@ function buildProgram(): Command {
       "after",
       "\nNote: on a repo created before migration 0002, run `mrplex hash backfill` first.\n" +
         "Until every version has a stored $content_hash, a clean local copy that lacks\n" +
-        "sync intrinsics can be parked as a conflict instead of adopted (§2.6).",
+        "sync intrinsics can be parked as a conflict instead of adopted (§2.6).\n\n" +
+        "Note: --embed-url/--embed-cmd only apply in local (--database) mode. When\n" +
+        "syncing against a --server, embeddings are the server's responsibility and\n" +
+        "these flags are ignored.",
     )
     .option("--once", "run startup reconciliation once, then exit (no watcher)", false)
     .option("--interval <ms>", "feed poll interval in ms (daemon; default 5000)", parsePositiveInt)
@@ -1680,6 +1691,8 @@ function buildProgram(): Command {
     )
     .option("--dry-run", "report the actions a reconciliation would take, changing nothing", false)
     .option("-v, --verbose", "log each action to stderr", false)
+    .option("--embed-url <url>", "HTTP embedding endpoint (§5.3)")
+    .option("--embed-cmd <cmd>", "subprocess embedding command (JSON-lines over stdio)")
     .action(function (this: Command, root: string) {
       const localOpts = this.opts<{
         once: boolean;
@@ -1690,7 +1703,13 @@ function buildProgram(): Command {
         exclude?: string[];
         dryRun: boolean;
         verbose: boolean;
+        embedUrl?: string;
+        embedCmd?: string;
       }>();
+      const embedFlags: EmbedFlagInputs = {
+        embed_url: localOpts.embedUrl,
+        embed_cmd: localOpts.embedCmd,
+      };
       const globals = this.optsWithGlobals<GlobalOpts>();
       let repo: string;
       try {
@@ -1723,14 +1742,14 @@ function buildProgram(): Command {
             `sync ${repo} @ ${root}: through=${report.through_version} ` +
               `actions=${changed} feed=${report.feed_applied}${localOpts.dryRun ? " (dry-run)" : ""}`,
           );
-        }).catch(reportError);
+        }, embedFlags).catch(reportError);
         return;
       }
 
       // Daemon: run until interrupted (Ctrl-C). The client stays open; SIGINT/
       // SIGTERM stop the daemon and close the transport cleanly.
       (async () => {
-        const client = await openClient(globals);
+        const client = await openClient(globals, embedFlags);
         const daemon = startDaemon(client, {
           root,
           repo,
