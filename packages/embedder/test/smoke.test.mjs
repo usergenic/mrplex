@@ -1,9 +1,11 @@
 /**
  * Smoke tests for the real embedder subprocess contract.
- * Requires `npm install` in packages/embedder (pulls fastembed + model on first run).
+ * Requires `npm install` in packages/embedder (pulls fastembed; first stdio
+ * run may download the ONNX model).
  */
 
 import { spawn } from "node:child_process";
+import { createRequire } from "node:module";
 import { once } from "node:events";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,6 +14,26 @@ import { describe, it, before, after } from "node:test";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const EMBEDDER = join(ROOT, "embedder.mjs");
+const require = createRequire(import.meta.url);
+
+function hasFastembed() {
+  try {
+    require.resolve("fastembed");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const FASTEMBED = hasFastembed();
+const integration = FASTEMBED ? describe : describe.skip;
+
+if (!FASTEMBED) {
+  console.error(
+    "embedder smoke: skipping integration tests — fastembed not installed.\n" +
+      "  run:  cd packages/embedder && npm install",
+  );
+}
 
 /** Spawn embedder with args; wait until stderr signals readiness. */
 async function spawnEmbedder(args) {
@@ -50,21 +72,23 @@ describe("@mrplex/embedder smoke", () => {
     assert.equal((await once(ver, "exit"))[0], 0);
   });
 
-  it("--list-models prints known keys", async () => {
-    const proc = spawn(process.execPath, [EMBEDDER, "--list-models"], {
-      stdio: ["ignore", "pipe", "pipe"],
+  integration("--list-models prints known keys", () => {
+    it("prints fast-bge-small-en-v1.5", async () => {
+      const proc = spawn(process.execPath, [EMBEDDER, "--list-models"], {
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let out = "";
+      proc.stdout.setEncoding("utf8");
+      proc.stdout.on("data", (chunk) => {
+        out += chunk;
+      });
+      const [code] = await once(proc, "exit");
+      assert.equal(code, 0);
+      assert.match(out, /fast-bge-small-en-v1\.5/);
     });
-    let out = "";
-    proc.stdout.setEncoding("utf8");
-    proc.stdout.on("data", (chunk) => {
-      out += chunk;
-    });
-    const [code] = await once(proc, "exit");
-    assert.equal(code, 0);
-    assert.match(out, /fast-bge-small-en-v1\.5/);
   });
 
-  describe("stdio hook", () => {
+  integration("stdio hook", () => {
     let proc;
 
     before(async () => {
@@ -109,13 +133,15 @@ describe("@mrplex/embedder smoke", () => {
     });
   });
 
-  it("--stdio is accepted as a backward-compatible no-op", async () => {
-    const { proc, ready } = await spawnEmbedder(["--stdio"]);
-    await ready;
-    writeLine(proc, { chunks: ["compat"] });
-    const body = JSON.parse(await readLine(proc));
-    assert.equal(body.dim, 384);
-    proc.stdin.end();
-    proc.kill();
-  }, { timeout: 120_000 });
+  integration("--stdio backward compatibility", () => {
+    it("accepts --stdio as a no-op", async () => {
+      const { proc, ready } = await spawnEmbedder(["--stdio"]);
+      await ready;
+      writeLine(proc, { chunks: ["compat"] });
+      const body = JSON.parse(await readLine(proc));
+      assert.equal(body.dim, 384);
+      proc.stdin.end();
+      proc.kill();
+    }, { timeout: 120_000 });
+  });
 });

@@ -33,6 +33,7 @@
     "README.md"
   ],
   "scripts": {
+    "pretest": "node -e \"try{require.resolve('fastembed')}catch{console.error('pretest: run npm install first');process.exit(1)}\"",
     "start": "node embedder.mjs",
     "test": "node --test test/*.test.mjs"
   },
