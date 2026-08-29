@@ -6,6 +6,7 @@
  */
 
 import type { EmbedHook } from "../embed/hook.js";
+import { type Worker, createWorker } from "../embed/worker.js";
 import type { CallContext } from "../kernel/context.js";
 import type { Kernel } from "../kernel/kernel.js";
 import { createKernel } from "../kernel/kernel.js";
@@ -49,7 +50,9 @@ export async function openLocalClient(config: LocalClientConfig): Promise<Kernel
         }
       : undefined,
   });
-  return buildClient(kernel, config.context ?? {}, storage, hook);
+  const worker = hook ? createWorker({ storage, hook }) : null;
+  worker?.start();
+  return buildClient(kernel, config.context ?? {}, storage, hook, worker);
 }
 
 function buildClient(
@@ -57,6 +60,7 @@ function buildClient(
   ctx: CallContext,
   storage: Storage,
   hook: EmbedHook | null,
+  worker: Worker | null,
 ): KernelClient {
   let closed = false;
 
@@ -104,6 +108,9 @@ function buildClient(
     close: async () => {
       if (closed) return;
       closed = true;
+      if (worker) {
+        await worker.stop().catch(() => {});
+      }
       if (hook) {
         try {
           await hook.close();
