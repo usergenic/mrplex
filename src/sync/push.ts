@@ -19,19 +19,18 @@
  */
 
 import type { KernelClient } from "../client/kernel-client.js";
-import { pathIsInSystemNamespace, withVersionSuffix } from "../kernel/deletion.js";
+import { pathIsInSystemNamespace } from "../kernel/deletion.js";
 import { KernelError } from "../kernel/errors.js";
 import { HARDCODED_DEFAULTS } from "../kernel/path-config.js";
 import type { Version } from "../kernel/wire.js";
-import { extractSystemProperties, split } from "../markdown/frontmatter.js";
 import {
-  isDirty,
-  isIgnored,
-  readFileIntrinsics,
-  renderIgnoredSibling,
-  renderMaterialized,
-  stampProvenance,
-} from "./intrinsics.js";
+  ackLocalWrite,
+  parkIgnoredSibling,
+  putAndAck,
+  stripToUserContent,
+  type UserContent,
+} from "./converge.js";
+import { isDirty, isIgnored, readFileIntrinsics, renderMaterialized } from "./intrinsics.js";
 import type { FileStore } from "./reconcile.js";
 
 /** Last-known remote state per path (§4.2 tier 3). */
@@ -54,8 +53,6 @@ export type PushDeps = {
   map: RemoteMap;
   log?: (msg: string) => void;
 };
-
-type UserContent = { frontmatter_raw: string; body: string };
 
 type StalePrevData = {
   current_version_id?: string | null;
@@ -247,10 +244,7 @@ async function recoverStalePut(
       ) {
         throw rebaseErr;
       }
-      await store.write(
-        withVersionSuffix(path, destCurrent.version_id),
-        renderIgnoredSibling(destCurrent),
-      );
+      await parkIgnoredSibling(store, path, destCurrent);
       log(`conflict\t${path}`);
       return "conflict";
     }
@@ -281,7 +275,7 @@ async function recoverStalePut(
     // Still live at another path with a newer version — local rename vs
     // remote edit. Park the remote current; keep local bytes.
     const current = await client.docs.get_version(repo, currentId);
-    await store.write(withVersionSuffix(path, current.version_id), renderIgnoredSibling(current));
+    await parkIgnoredSibling(store, path, current);
     log(`conflict\t${path}`);
     return "conflict";
   }
@@ -323,35 +317,11 @@ async function commitPut(
 ): Promise<PushResult> {
   const { client, store, repo, map } = deps;
   const log = deps.log ?? (() => {});
-  const v = await client.docs.put(repo, prevVersionId, path, user);
-  await ackLocalWrite(store, path, v, user);
+  const v = await putAndAck(client, store, repo, path, prevVersionId, user);
   dropMapEntriesForVersion(map, prevVersionId, path);
   map.set(path, { version_id: v.version_id, content_hash: v.content_hash });
   log(`${logLabel}\t${path}`);
   return "updated";
-}
-
-/**
- * After a successful kernel write, restamp the local file. If the editor saved
- * again during the round-trip, keep those bytes and only update provenance —
- * never write the snapshot we just pushed over newer typing.
- */
-async function ackLocalWrite(
-  store: FileStore,
-  path: string,
-  v: Version,
-  pushed: UserContent,
-): Promise<void> {
-  const now = await store.read(path);
-  if (now === null) return;
-  const current = stripToUserContent(now);
-  if (current.body === pushed.body && current.frontmatter_raw === pushed.frontmatter_raw) {
-    await store.write(path, renderMaterialized(v), { preserveMtime: true });
-    return;
-  }
-  await store.write(path, stampProvenance(now, v.version_id, v.content_hash), {
-    preserveMtime: true,
-  });
 }
 
 /** The occupied-path rule (§4.4): hash match → adopt; differ → conflict park. */
@@ -370,7 +340,7 @@ async function occupiedPath(
     map.set(path, { version_id: current.version_id, content_hash: current.content_hash });
     return "clean";
   }
-  await store.write(withVersionSuffix(path, current.version_id), renderIgnoredSibling(current));
+  await parkIgnoredSibling(store, path, current);
   log(`conflict\t${path}`);
   return "conflict";
 }
@@ -404,10 +374,4 @@ function dropMapEntriesForVersion(map: RemoteMap, versionId: string, keepPath: s
 
 function isDeletedPath(path: string): boolean {
   return pathIsInSystemNamespace(path, HARDCODED_DEFAULTS.system_sigils);
-}
-
-function stripToUserContent(text: string): UserContent {
-  const lf = text.replace(/\r\n/g, "\n");
-  const { frontmatter_raw, body } = split(lf);
-  return { frontmatter_raw: extractSystemProperties(frontmatter_raw).raw, body };
 }

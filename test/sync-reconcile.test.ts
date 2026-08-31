@@ -15,10 +15,15 @@ import { type FileStore, reconcileOnce } from "../src/sync/reconcile.js";
 let client: KernelClient;
 
 /** In-memory FileStore: docPath → text. */
-function memStore(initial?: Record<string, string>): FileStore & { files: Map<string, string> } {
+function memStore(initial?: Record<string, string>): FileStore & {
+  files: Map<string, string>;
+  mtimes: Map<string, number>;
+} {
   const files = new Map<string, string>(Object.entries(initial ?? {}));
+  const mtimes = new Map<string, number>();
   return {
     files,
+    mtimes,
     async list() {
       return [...files.keys()];
     },
@@ -30,6 +35,11 @@ function memStore(initial?: Record<string, string>): FileStore & { files: Map<st
     },
     async remove(p) {
       files.delete(p);
+      mtimes.delete(p);
+    },
+    async mtime(p) {
+      if (!files.has(p)) return null;
+      return mtimes.get(p) ?? 0;
     },
   };
 }
@@ -128,37 +138,35 @@ describe("reconcile — §4.9 rows", () => {
     expect(store.files.get("a.md")).toContain("v2");
   });
 
-  it("row 5: local edit AND remote advanced → conflict (park sibling, keep local)", async () => {
+  it("row 5: local edit AND remote advanced → rebase (local becomes new head)", async () => {
     const v1 = await client.docs.create("notes", "a.md", { body: "base\n", frontmatter_raw: "" });
     const injected = renderInjected(await client.docs.get("notes", "a.md"));
     const localEdited = injected.replace("base", "my local edit");
     const store = memStore({ "a.md": localEdited });
-    // Remote advances to v2.
-    const v2 = await client.docs.put("notes", v1.version_id, "a.md", {
+    await client.docs.put("notes", v1.version_id, "a.md", {
       body: "their remote edit\n",
       frontmatter_raw: "",
     });
     const report = await reconcile(store);
-    expect(verdictFor(report, "a.md")).toBe("conflict");
-    // Local bytes preserved.
-    expect(store.files.get("a.md")).toBe(localEdited);
-    // Remote current parked as an ignored sibling.
-    const sibling = store.files.get(`a-${v2.version_id}.md`) ?? "";
-    expect(sibling).toContain("their remote edit");
-    expect(sibling).toContain("$sync: ignore");
+    expect(verdictFor(report, "a.md")).toBe("rebase");
+    expect(store.files.get("a.md")).toContain("my local edit");
+    expect([...store.files.keys()].some((k) => /-v\d+\.md$/.test(k))).toBe(false);
+    const remote = await client.docs.get("notes", "a.md");
+    expect(remote.body).toBe("my local edit\n");
   });
 
-  it("row 6: occupied path, no local provenance, bytes differ → conflict", async () => {
-    const v = await client.docs.create("notes", "a.md", {
+  it("row 6: occupied path, no local provenance, bytes differ → rebase", async () => {
+    await client.docs.create("notes", "a.md", {
       body: "remote body\n",
       frontmatter_raw: "",
     });
-    // Local file at same path, different bytes, NO provenance.
     const store = memStore({ "a.md": "totally different local\n" });
     const report = await reconcile(store);
-    expect(verdictFor(report, "a.md")).toBe("conflict");
-    expect(store.files.get("a.md")).toBe("totally different local\n");
-    expect(store.files.get(`a-${v.version_id}.md`)).toContain("remote body");
+    expect(verdictFor(report, "a.md")).toBe("rebase");
+    expect(store.files.get("a.md")).toContain("totally different local");
+    expect([...store.files.keys()].some((k) => /-v\d+\.md$/.test(k))).toBe(false);
+    const remote = await client.docs.get("notes", "a.md");
+    expect(remote.body).toBe("totally different local\n");
   });
 
   it("remote-deleted, local clean → delete-local", async () => {

@@ -8,19 +8,24 @@
  * absent file is a no-op; the dirty check prevents a replay from clobbering an
  * edit made in a crash window. So a crash between apply and cursor-advance
  * simply replays the batch harmlessly.
+ *
+ * better-sync.plan: hot files defer inbound effects into an in-memory map
+ * (cursor still advances); dirty+stale local files rebase onto remote current
+ * before parking a sibling.
  */
 
 import type { KernelClient } from "../client/kernel-client.js";
-import { withVersionSuffix } from "../kernel/deletion.js";
-import { decodeVersionId } from "../kernel/version-id.js";
 import type { VersionRef } from "../kernel/wire.js";
+import { materializeAt } from "./converge.js";
 import {
-  isDirty,
-  isIgnored,
-  readFileIntrinsics,
-  renderIgnoredSibling,
-  renderMaterialized,
-} from "./intrinsics.js";
+  type DeferredMap,
+  decideInbound,
+  effectInbound,
+  enqueueDeferred,
+  pathIsHot,
+  versionAtOrAhead,
+} from "./hot-path.js";
+import { isDirty, isIgnored, readFileIntrinsics } from "./intrinsics.js";
 import type { ScopeFilter } from "./paths.js";
 import type { RemoteMap } from "./push.js";
 import type { FileStore } from "./reconcile.js";
@@ -35,6 +40,15 @@ export type ApplyFeedOptions = {
    * witnessed unlink knows the file's prev_version_id.
    */
   map?: RemoteMap;
+  /**
+   * Minimum mtime age before inbound touch (better-sync `--settle`). When a
+   * deferred map is also supplied, hot paths enqueue instead of writing.
+   */
+  settleMs?: number;
+  /** In-memory deferred holds (daemon only). Absent → never defer (e.g. `--once`). */
+  deferred?: DeferredMap;
+  /** Injectable clock for tests. */
+  nowMs?: () => number;
 };
 
 export type ApplyFeedResult = {
@@ -42,6 +56,8 @@ export type ApplyFeedResult = {
   cursor: string;
   /** Number of refs whose filesystem effect was applied. */
   applied: number;
+  /** Number of refs held in the deferred map (hot path). */
+  deferred: number;
 };
 
 /**
@@ -58,10 +74,13 @@ export async function applyFeed(
   const log = opts.log ?? (() => {});
   let cursor = opts.since;
   let applied = 0;
+  let deferredCount = 0;
   for (;;) {
     const page = await client.history.since({ after_version: cursor, repo: opts.repo });
     for (const ref of page.refs) {
-      if (await applyRef(client, store, scope, opts.repo, ref, log, opts.map)) applied++;
+      const outcome = await applyRef(client, store, scope, opts, ref, log);
+      if (outcome === "applied") applied++;
+      else if (outcome === "deferred") deferredCount++;
     }
     // No forward progress → caught up (or a hot gap). Stop draining.
     if (page.next_since === cursor || page.refs.length === 0) {
@@ -70,91 +89,112 @@ export async function applyFeed(
     }
     cursor = page.next_since;
   }
-  return { cursor, applied };
+  return { cursor, applied, deferred: deferredCount };
 }
 
-/** Apply one feed ref to the local store. Returns true if it changed a file. */
+type ApplyOutcome = "applied" | "deferred" | "noop";
+
+/** Apply one feed ref to the local store. */
 async function applyRef(
   client: KernelClient,
   store: FileStore,
   scope: ScopeFilter,
-  repo: string,
+  opts: ApplyFeedOptions,
   ref: VersionRef,
   log: (msg: string) => void,
-  map?: RemoteMap,
-): Promise<boolean> {
+): Promise<ApplyOutcome> {
+  const settleMs = opts.settleMs ?? 0;
+  const nowMs = opts.nowMs?.() ?? Date.now();
+  const canDefer = opts.deferred !== undefined;
+
   if (ref.op === "delete") {
-    // Remove the local file at prev_path IF clean; dirty ⇒ keep (resurrection
-    // happens on its next local-change cycle). §4.3 delete.
     const target = ref.prev_path;
-    if (target === null || !scope.matches(target)) return false;
-    map?.delete(target);
+    if (target === null || !scope.matches(target)) return "noop";
+    opts.map?.delete(target);
     const text = await store.read(target);
-    if (text === null) return false;
+    if (text === null) return "noop";
     const intr = readFileIntrinsics(text);
-    if (isIgnored(intr) || isDirty(intr)) return false; // preserve local work
+    if (isIgnored(intr) || isDirty(intr)) return "noop"; // preserve local work
+    if (canDefer && (await pathIsHot(store, target, settleMs, nowMs))) {
+      enqueueDeferred(opts.deferred!, target, ref, nowMs);
+      return "deferred";
+    }
     await store.remove(target);
     log(`feed delete\t${target}`);
-    return true;
+    return "applied";
   }
 
   if (ref.op === "move") {
     const from = ref.prev_path;
     if (from !== null && scope.matches(from)) {
-      map?.delete(from);
+      opts.map?.delete(from);
       const text = await store.read(from);
       if (text !== null) {
         const intr = readFileIntrinsics(text);
-        if (!isIgnored(intr) && !isDirty(intr)) await store.remove(from);
+        if (!isIgnored(intr) && !isDirty(intr)) {
+          if (canDefer && (await pathIsHot(store, from, settleMs, nowMs))) {
+            // Hold the whole move (including dest) until source is cold.
+            enqueueDeferred(opts.deferred!, ref.path, ref, nowMs);
+            return "deferred";
+          }
+          await store.remove(from);
+        }
       }
     }
     // Fall through to materialize at the destination path.
   }
 
-  // create / update / move-destination: materialize at ref.path unless the
-  // local file already holds these bytes, is at-or-ahead of this ref, is
-  // dirty against a *newer* remote, or is $sync: ignore.
-  if (!scope.matches(ref.path)) return false;
+  if (!scope.matches(ref.path)) return "noop";
   const existing = await store.read(ref.path);
   if (existing !== null) {
     const intr = readFileIntrinsics(existing);
-    if (isIgnored(intr)) return false;
-    if (intr.computed_hash === ref.content_hash) {
-      // Bytes already present (our own push echoing back, or a vault copy).
-      map?.set(ref.path, { version_id: ref.version_id, content_hash: ref.content_hash });
-      // Repair provenance only if the embedded version lags.
-      if (intr.version === ref.version_id) return false;
-      if (versionAtOrAhead(intr.version, ref.version_id)) return false;
-      const v = await client.docs.get_version(repo, ref.version_id);
-      await store.write(ref.path, renderMaterialized(v), { preserveMtime: true });
-      return true;
-    }
-    // Local is at or ahead of this ref (echo of our push, or a replay of an
-    // older version). Never clobber and never park a sibling of something we
-    // already have — including when the user has typed more since (dirty).
-    if (versionAtOrAhead(intr.version, ref.version_id)) return false;
-    if (isDirty(intr)) {
-      // A local edit collides with a *newer* incoming version → conflict, not
-      // overwrite. Park the remote as an ignored sibling; keep local bytes.
-      const v = await client.docs.get_version(repo, ref.version_id);
-      await store.write(withVersionSuffix(ref.path, ref.version_id), renderIgnoredSibling(v));
-      log(`feed conflict\t${ref.path}`);
-      return true;
-    }
-  }
-  const v = await client.docs.get_version(repo, ref.version_id);
-  await store.write(ref.path, renderMaterialized(v));
-  map?.set(ref.path, { version_id: ref.version_id, content_hash: ref.content_hash });
-  log(`feed ${ref.op}\t${ref.path}`);
-  return true;
-}
+    if (isIgnored(intr)) return "noop";
 
-/** True when the local embedded version is this ref or a later one. */
-function versionAtOrAhead(localVersion: string | undefined, refVersion: string): boolean {
-  if (!localVersion) return false;
-  if (localVersion === refVersion) return true;
-  const local = decodeVersionId(localVersion);
-  const ref = decodeVersionId(refVersion);
-  if (local === null || ref === null) return false;
-  return local > ref;
+    // Fast path: bytes already match — provenance repair or defer when hot.
+    if (intr.computed_hash === ref.content_hash) {
+      opts.map?.set(ref.path, { version_id: ref.version_id, content_hash: ref.content_hash });
+      if (intr.version === ref.version_id) return "noop";
+      if (versionAtOrAhead(intr.version, ref.version_id)) return "noop";
+      const hot = await pathIsHot(store, ref.path, settleMs, nowMs);
+      if (hot && canDefer) {
+        enqueueDeferred(opts.deferred!, ref.path, ref, nowMs);
+        return "deferred";
+      }
+      const v = await client.docs.get_version(opts.repo, ref.version_id);
+      await materializeAt(store, ref.path, v, { preserveMtime: true });
+      log(`feed adopt\t${ref.path}`);
+      return "applied";
+    }
+
+    if (versionAtOrAhead(intr.version, ref.version_id)) return "noop";
+
+    // Divergent local vs newer remote → decideInbound (rebase / defer / park).
+    const hot = await pathIsHot(store, ref.path, settleMs, nowMs);
+    const v = await client.docs.get_version(opts.repo, ref.version_id);
+    const decision = decideInbound({
+      localText: existing,
+      remote: v,
+      hot,
+      canDefer,
+    });
+    const result = await effectInbound(client, store, opts.repo, ref.path, decision, {
+      deferred: opts.deferred,
+      ref,
+      map: opts.map,
+      nowMs,
+    });
+    if (result === "deferred") return "deferred";
+    if (result === "noop") return "noop";
+    if (result === "parked") log(`feed conflict\t${ref.path}`);
+    else if (decision.action === "rebase") log(`feed rebase\t${ref.path}`);
+    else log(`feed ${ref.op}\t${ref.path}`);
+    return "applied";
+  }
+
+  // Absent locally → materialize (unless somehow hot — can't be; no mtime).
+  const v = await client.docs.get_version(opts.repo, ref.version_id);
+  await materializeAt(store, ref.path, v);
+  opts.map?.set(ref.path, { version_id: ref.version_id, content_hash: ref.content_hash });
+  log(`feed ${ref.op}\t${ref.path}`);
+  return "applied";
 }

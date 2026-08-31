@@ -72,6 +72,10 @@ async function run(steps: Step[]) {
     async remove(p) {
       files.delete(p);
     },
+    async mtime(p) {
+      if (!files.has(p)) return null;
+      return 0;
+    },
   };
 
   const wrapped: KernelClient = {
@@ -344,7 +348,7 @@ describe("sync timelines", () => {
     expect(await v.remote("note.md")).toBe("idea\n");
   });
 
-  it("two-writer: feed of newer remote vs dirty local parks sibling, keeps local", async () => {
+  it("two-writer: feed of newer remote vs dirty local rebases; local wins, no sibling", async () => {
     const v = await run([
       ["write", "a.md", "base\n"],
       ["push"],
@@ -353,6 +357,7 @@ describe("sync timelines", () => {
       ["feed"],
     ]);
     expect(v.bodies["a.md"]).toBe("my local edit\n");
-    expect(v.ignored.length).toBe(1);
+    expect(v.ignored.length).toBe(0);
+    expect(await v.remote("a.md")).toBe("my local edit\n");
   });
 });
