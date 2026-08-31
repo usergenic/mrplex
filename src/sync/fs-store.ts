@@ -42,6 +42,14 @@ export function createFsStore(root: string): FileStore {
     async remove(docPath: string): Promise<void> {
       await rm(toLocalPath(root, docPath), { force: true });
     },
+    async mtime(docPath: string): Promise<number | null> {
+      try {
+        return (await stat(toLocalPath(root, docPath))).mtimeMs;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+        throw err;
+      }
+    },
   };
 }
 

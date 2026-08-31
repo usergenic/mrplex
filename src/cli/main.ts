@@ -1684,7 +1684,7 @@ function buildProgram(): Command {
     .option("--debounce <ms>", "burst debounce in ms (daemon; default 5000)", parsePositiveInt)
     .option(
       "--settle <ms>",
-      "skip files younger than this many ms (partial saves)",
+      "minimum mtime age in ms before sync touches a path (default 0)",
       parsePositiveInt,
     )
     .option(

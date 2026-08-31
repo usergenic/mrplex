@@ -14,16 +14,20 @@
  */
 
 import type { KernelClient } from "../client/kernel-client.js";
-import { withVersionSuffix } from "../kernel/deletion.js";
 import { KernelError } from "../kernel/errors.js";
 import type { IndexItem } from "../kernel/wire.js";
-import { extractSystemProperties, split } from "../markdown/frontmatter.js";
+import {
+  materializeAt,
+  parkIgnoredSibling,
+  putAndAck,
+  stripToUserContent,
+} from "./converge.js";
+import { decideInbound, effectInbound } from "./hot-path.js";
 import {
   type FileIntrinsics,
   isDirty,
   isIgnored,
   readFileIntrinsics,
-  renderIgnoredSibling,
   renderMaterialized,
 } from "./intrinsics.js";
 import type { ScopeFilter } from "./paths.js";
@@ -43,6 +47,12 @@ export type FileStore = {
   write(docPath: string, text: string, opts?: { preserveMtime?: boolean }): Promise<void>;
   /** Remove the file at a doc path (no-op if already absent). */
   remove(docPath: string): Promise<void>;
+  /**
+   * File mtime in epoch milliseconds, or null if absent. Used by the settle /
+   * hot-path gate (better-sync.plan); provenance-preserving writes must not
+   * advance this value.
+   */
+  mtime(docPath: string): Promise<number | null>;
 };
 
 /** One reconciliation action, for reporting + dry-run (§4.1 `--dry-run`). */
@@ -53,6 +63,7 @@ export type SyncAction = {
     | "adopt" // metadata repair: inject remote provenance into a clean local copy
     | "materialize" // write remote current locally (new or fast-forward)
     | "push" // local edit → docs.put / docs.create
+    | "rebase" // dirty local put onto advanced remote current (better-sync)
     | "conflict" // park remote as ignored sibling; local bytes preserved
     | "delete-local" // remote-deleted, local clean → remove
     | "resurrect" // remote-deleted, local dirty → push as create
@@ -181,10 +192,12 @@ async function resolveLocalPath(
       return { path, verdict: "adopt", detail: "content matches remote; provenance repaired" };
     }
     if (!intr.version) {
-      // No embedded version and bytes differ from remote → occupied-path
-      // conflict (row 6). Never stamp divergent local bytes with remote id.
-      if (!dryRun) await parkConflict(client, store, opts.repo, path, remote.version_id);
-      return { path, verdict: "conflict", detail: "occupied path, no local provenance" };
+      // No embedded version and bytes differ → rebase onto remote, else park
+      // (better-sync WS2; formerly unconditional §4.9 row 6 park).
+      if (dryRun) {
+        return { path, verdict: "rebase", detail: "occupied path, no local provenance" };
+      }
+      return convergeOccupied(client, store, opts.repo, path);
     }
     if (intr.version === remote.version_id) {
       // Embedded version is the remote current.
@@ -199,9 +212,11 @@ async function resolveLocalPath(
       if (!dryRun) await materializeVersion(client, store, opts.repo, path, remote.version_id);
       return { path, verdict: "materialize", detail: "fast-forward to remote current" };
     }
-    // Local edited AND remote advanced → conflict (row 5).
-    if (!dryRun) await parkConflict(client, store, opts.repo, path, remote.version_id);
-    return { path, verdict: "conflict", detail: "local edit vs advanced remote" };
+    // Local edited AND remote advanced → rebase, else park (better-sync WS2).
+    if (dryRun) {
+      return { path, verdict: "rebase", detail: "local edit vs advanced remote" };
+    }
+    return convergeOccupied(client, store, opts.repo, path);
   }
 
   // No remote doc at this path.
@@ -253,14 +268,6 @@ async function readUserContent(
   return stripToUserContent(text);
 }
 
-/** Split a file into stored-shape fields, dropping all `$*` intrinsic lines. */
-function stripToUserContent(text: string): { frontmatter_raw: string; body: string } {
-  const lf = text.replace(/\r\n/g, "\n");
-  // Reuse the same split/strip path the hash uses so bytes are canonical.
-  const { frontmatter_raw, body } = split(lf);
-  return { frontmatter_raw: extractSystemProperties(frontmatter_raw).raw, body };
-}
-
 async function materializeVersion(
   client: KernelClient,
   store: FileStore,
@@ -269,7 +276,7 @@ async function materializeVersion(
   versionId: string,
 ): Promise<void> {
   const v = await client.docs.get_version(repo, versionId);
-  await store.write(path, renderMaterialized(v));
+  await materializeAt(store, path, v);
 }
 
 /** Repair a clean local file's embedded provenance to the given version. */
@@ -280,11 +287,8 @@ async function materializeInPlace(
   path: string,
   versionId: string,
 ): Promise<void> {
-  // The content already equals the version; re-render from the authoritative
-  // remote version so intrinsics are exact. Keep mtime so a metadata-only
-  // stamp cannot win an Obsidian/iCloud race against unsynced typing.
   const v = await client.docs.get_version(repo, versionId);
-  await store.write(path, renderMaterialized(v), { preserveMtime: true });
+  await materializeAt(store, path, v, { preserveMtime: true });
 }
 
 async function pushEdit(
@@ -294,9 +298,8 @@ async function pushEdit(
   path: string,
   prevVersionId: string,
 ): Promise<void> {
-  const { frontmatter_raw, body } = await readUserContent(store, path);
-  const v = await client.docs.put(repo, prevVersionId, path, { frontmatter_raw, body });
-  await store.write(path, renderMaterialized(v), { preserveMtime: true });
+  const user = await readUserContent(store, path);
+  await putAndAck(client, store, repo, path, prevVersionId, user);
 }
 
 async function pushMove(
@@ -306,10 +309,9 @@ async function pushMove(
   path: string,
   prevVersionId: string,
 ): Promise<void> {
-  const { frontmatter_raw, body } = await readUserContent(store, path);
+  const user = await readUserContent(store, path);
   // A put whose path differs from prev's path is a move preserving identity.
-  const v = await client.docs.put(repo, prevVersionId, path, { frontmatter_raw, body });
-  await store.write(path, renderMaterialized(v), { preserveMtime: true });
+  await putAndAck(client, store, repo, path, prevVersionId, user);
 }
 
 async function pushCreate(
@@ -318,16 +320,14 @@ async function pushCreate(
   repo: string,
   path: string,
 ): Promise<void> {
-  const { frontmatter_raw, body } = await readUserContent(store, path);
+  const user = await readUserContent(store, path);
   try {
-    const v = await client.docs.create(repo, path, { frontmatter_raw, body });
+    const v = await client.docs.create(repo, path, user);
     await store.write(path, renderMaterialized(v), { preserveMtime: true });
   } catch (err) {
     if (err instanceof KernelError && err.code === "create_conflict") {
-      // A doc appeared at this path since the index scan; treat the occupied
-      // path as a conflict rather than clobbering it.
-      const current = (err.data as { current_version_id?: string }).current_version_id;
-      if (current) await parkConflict(client, store, repo, path, current);
+      // A doc appeared at this path since the index scan; rebase or park.
+      await convergeOccupied(client, store, repo, path);
       return;
     }
     throw err;
@@ -335,21 +335,37 @@ async function pushCreate(
 }
 
 /**
- * Park a conflict (§4.8): keep the local file's bytes and path untouched;
- * materialize the remote current beside it as `<name>-<version_id>.md` with
- * `$sync: ignore`. Collision-safe (version ids are unique), so replay never
- * sprays duplicates.
+ * Rebase local bytes onto the live remote current at `path`, else park a
+ * sibling (better-sync WS2). Used for §4.9 rows 5–6 and create races.
  */
-async function parkConflict(
+async function convergeOccupied(
   client: KernelClient,
   store: FileStore,
   repo: string,
   path: string,
-  remoteVersionId: string,
-): Promise<void> {
-  const v = await client.docs.get_version(repo, remoteVersionId);
-  const siblingPath = withVersionSuffix(path, remoteVersionId);
-  await store.write(siblingPath, renderIgnoredSibling(v));
+): Promise<SyncAction> {
+  const text = (await store.read(path)) ?? "";
+  const remote = await client.docs.get(repo, path);
+  const decision = decideInbound({
+    localText: text,
+    remote,
+    hot: false,
+    canDefer: false,
+  });
+  const result = await effectInbound(client, store, repo, path, decision);
+  if (result === "parked" || decision.action === "noop") {
+    // noop here would mean ignored; occupied diverge shouldn't noop.
+    if (result === "parked") {
+      return { path, verdict: "conflict", detail: "rebase failed; parked remote sibling" };
+    }
+  }
+  if (decision.action === "rebase" || result === "applied") {
+    return { path, verdict: "rebase", detail: "local bytes put onto remote current" };
+  }
+  if (decision.action === "adopt") {
+    return { path, verdict: "adopt", detail: "content matches remote; provenance repaired" };
+  }
+  return { path, verdict: "conflict", detail: "could not converge occupied path" };
 }
 
 /** Conflict park keyed off the doc's *current* remote version (move race). */
@@ -360,11 +376,7 @@ async function parkConflictForCurrent(
   path: string,
   embeddedVersionId: string,
 ): Promise<void> {
-  // Resolve the document's current version from the embedded (now-superseded)
-  // one, then park it. get_version gives us the doc; docs.get by its path finds
-  // the live current.
   const superseded = await client.docs.get_version(repo, embeddedVersionId);
   const current = await client.docs.get(repo, superseded.path);
-  const siblingPath = withVersionSuffix(path, current.version_id);
-  await store.write(siblingPath, renderIgnoredSibling(current));
+  await parkIgnoredSibling(store, path, current);
 }

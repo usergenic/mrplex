@@ -14,10 +14,15 @@ import type { FileStore } from "../src/sync/reconcile.js";
 
 let client: KernelClient;
 
-function memStore(initial?: Record<string, string>): FileStore & { files: Map<string, string> } {
+function memStore(initial?: Record<string, string>): FileStore & {
+  files: Map<string, string>;
+  mtimes: Map<string, number>;
+} {
   const files = new Map<string, string>(Object.entries(initial ?? {}));
+  const mtimes = new Map<string, number>();
   return {
     files,
+    mtimes,
     async list() {
       return [...files.keys()];
     },
@@ -29,6 +34,11 @@ function memStore(initial?: Record<string, string>): FileStore & { files: Map<st
     },
     async remove(p) {
       files.delete(p);
+      mtimes.delete(p);
+    },
+    async mtime(p) {
+      if (!files.has(p)) return null;
+      return mtimes.get(p) ?? 0;
     },
   };
 }

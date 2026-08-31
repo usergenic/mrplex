@@ -15,10 +15,15 @@ import type { FileStore } from "../src/sync/reconcile.js";
 
 let client: KernelClient;
 
-function memStore(initial?: Record<string, string>): FileStore & { files: Map<string, string> } {
+function memStore(initial?: Record<string, string>): FileStore & {
+  files: Map<string, string>;
+  mtimes: Map<string, number>;
+} {
   const files = new Map<string, string>(Object.entries(initial ?? {}));
+  const mtimes = new Map<string, number>();
   return {
     files,
+    mtimes,
     async list() {
       return [...files.keys()];
     },
@@ -30,6 +35,11 @@ function memStore(initial?: Record<string, string>): FileStore & { files: Map<st
     },
     async remove(p) {
       files.delete(p);
+      mtimes.delete(p);
+    },
+    async mtime(p) {
+      if (!files.has(p)) return null;
+      return mtimes.get(p) ?? 0; // default cold
     },
   };
 }
@@ -100,22 +110,23 @@ describe("applyFeed — move", () => {
     expect(store.files.get("new.md")).toContain("x");
   });
 
-  it("parks a conflict when the move destination holds divergent dirty bytes", async () => {
+  it("rebases a dirty destination onto the moved remote instead of parking", async () => {
     const v1 = await client.docs.create("notes", "old.md", { body: "x\n", frontmatter_raw: "" });
     const store = memStore({
       "old.md": materialized(await client.docs.get_version("notes", v1.version_id)),
       // A dirty file already occupies the destination (no provenance).
       "new.md": "my local dest work\n",
     });
-    const v2 = await client.docs.put("notes", v1.version_id, "new.md", {
+    await client.docs.put("notes", v1.version_id, "new.md", {
       body: "moved body\n",
       frontmatter_raw: "",
     });
     await applyFeed(client, store, scope, { repo: "notes", since: v1.version_id });
-    // Local destination bytes preserved; remote parked as an ignored sibling.
-    expect(store.files.get("new.md")).toBe("my local dest work\n");
-    expect(store.files.get(`new-${v2.version_id}.md`)).toContain("moved body");
-    expect(store.files.get(`new-${v2.version_id}.md`)).toContain("$sync: ignore");
+    // Local destination bytes become the new head; no ignored sibling.
+    expect(store.files.get("new.md")).toContain("my local dest work");
+    expect([...store.files.keys()].some((k) => /-v\d+\.md$/.test(k))).toBe(false);
+    const remote = await client.docs.get("notes", "new.md");
+    expect(remote.body).toBe("my local dest work\n");
   });
 });
 
@@ -142,21 +153,22 @@ describe("applyFeed — delete", () => {
 });
 
 describe("applyFeed — conflict + ignore", () => {
-  it("parks an incoming version beside a dirty local file", async () => {
+  it("rebases a dirty local file onto a newer incoming version (no sibling)", async () => {
     const v1 = await client.docs.create("notes", "a.md", { body: "base\n", frontmatter_raw: "" });
     const dirty = materialized(await client.docs.get_version("notes", v1.version_id)).replace(
       "base",
       "my local edit",
     );
     const store = memStore({ "a.md": dirty });
-    const v2 = await client.docs.put("notes", v1.version_id, "a.md", {
+    await client.docs.put("notes", v1.version_id, "a.md", {
       body: "remote edit\n",
       frontmatter_raw: "",
     });
     await applyFeed(client, store, scope, { repo: "notes", since: v1.version_id });
-    expect(store.files.get("a.md")).toBe(dirty);
-    expect(store.files.get(`a-${v2.version_id}.md`)).toContain("remote edit");
-    expect(store.files.get(`a-${v2.version_id}.md`)).toContain("$sync: ignore");
+    expect(store.files.get("a.md")).toContain("my local edit");
+    expect([...store.files.keys()].some((k) => /-v\d+\.md$/.test(k))).toBe(false);
+    const remote = await client.docs.get("notes", "a.md");
+    expect(remote.body).toBe("my local edit\n");
   });
 
   it("does not park or clobber when local is dirty on the same $version (push echo)", async () => {
@@ -229,5 +241,59 @@ describe("applyFeed — idempotent replay (§4.3)", () => {
     expect(replay.applied).toBe(0);
     expect(store.files).toEqual(snapshot);
     expect(replay.cursor).toBe(first.cursor);
+  });
+});
+
+describe("applyFeed — settle / defer (better-sync)", () => {
+  it("defers inbound rebase on a hot file and still advances the cursor", async () => {
+    const v1 = await client.docs.create("notes", "a.md", { body: "base\n", frontmatter_raw: "" });
+    const dirty = materialized(await client.docs.get_version("notes", v1.version_id)).replace(
+      "base",
+      "my local edit",
+    );
+    const store = memStore({ "a.md": dirty });
+    store.mtimes.set("a.md", 10_000);
+    const v2 = await client.docs.put("notes", v1.version_id, "a.md", {
+      body: "remote edit\n",
+      frontmatter_raw: "",
+    });
+    const deferred = new Map();
+    const result = await applyFeed(client, store, scope, {
+      repo: "notes",
+      since: v1.version_id,
+      settleMs: 5_000,
+      deferred,
+      nowMs: () => 12_000,
+    });
+    expect(store.files.get("a.md")).toBe(dirty);
+    expect([...store.files.keys()].some((k) => /-v\d+\.md$/.test(k))).toBe(false);
+    expect(deferred.has("a.md")).toBe(true);
+    expect(deferred.get("a.md")?.ref.version_id).toBe(v2.version_id);
+    expect(result.deferred).toBeGreaterThan(0);
+    expect(result.cursor).not.toBe(v1.version_id);
+  });
+
+  it("does not defer when settleMs is 0 even if mtime is fresh", async () => {
+    const v1 = await client.docs.create("notes", "a.md", { body: "base\n", frontmatter_raw: "" });
+    const dirty = materialized(await client.docs.get_version("notes", v1.version_id)).replace(
+      "base",
+      "my local edit",
+    );
+    const store = memStore({ "a.md": dirty });
+    store.mtimes.set("a.md", Date.now());
+    await client.docs.put("notes", v1.version_id, "a.md", {
+      body: "remote edit\n",
+      frontmatter_raw: "",
+    });
+    const deferred = new Map();
+    await applyFeed(client, store, scope, {
+      repo: "notes",
+      since: v1.version_id,
+      settleMs: 0,
+      deferred,
+    });
+    expect(deferred.size).toBe(0);
+    expect(store.files.get("a.md")).toContain("my local edit");
+    expect(await client.docs.get("notes", "a.md")).toMatchObject({ body: "my local edit\n" });
   });
 });

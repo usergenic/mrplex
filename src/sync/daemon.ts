@@ -9,6 +9,10 @@
  *     first so unlink+add of a rename is a move, not a delete (§4.7); each
  *     path is still stated, not trusted by event type (§4.6).
  *
+ * better-sync.plan: `--settle` is an mtime-age gate on both directions; inbound
+ * conflicts on hot files are held in an in-memory deferred map and retried on
+ * later polls (cursor still advances).
+ *
  * chokidar is confined to this module (§4.4). Echo suppression falls out of
  * self-description (§4.5): our own pushes come back on the feed but the local
  * file already embeds that version+hash, and our own writes trip the watcher
@@ -21,6 +25,11 @@ import type { KernelClient } from "../client/kernel-client.js";
 import { type SyncCursor, readCursor, sourceFields, writeCursor } from "./cursor.js";
 import { applyFeed } from "./feed.js";
 import { createFsStore } from "./fs-store.js";
+import {
+  type DeferredMap,
+  pathIsHot,
+  retryDeferredEntry,
+} from "./hot-path.js";
 import { isIgnored, readFileIntrinsics } from "./intrinsics.js";
 import { SYNC_DIR, type ScopeFilter, makeScopeFilter, toDocPath } from "./paths.js";
 import { type RemoteMap, pushBurst, pushPath } from "./push.js";
@@ -55,8 +64,10 @@ export function startDaemon(client: KernelClient, opts: DaemonOptions): Daemon {
   const store = createFsStore(opts.root);
   const scope = makeScopeFilter({ include: opts.include, exclude: opts.exclude });
   const map: RemoteMap = new Map();
+  const deferred: DeferredMap = new Map();
   const intervalMs = opts.intervalMs ?? 5000;
   const debounceMs = opts.debounceMs ?? 5000;
+  const settleMs = opts.settleMs ?? 0;
 
   let stopped = false;
   let watcher: FSWatcher | undefined;
@@ -99,12 +110,36 @@ export function startDaemon(client: KernelClient, opts: DaemonOptions): Daemon {
     }
   }
 
+  /** Retry in-memory deferred inbound holds before draining new feed pages. */
+  async function retryDeferred(): Promise<void> {
+    if (deferred.size === 0) return;
+    for (const [path, entry] of [...deferred.entries()]) {
+      if (!scope.matches(path) && entry.ref.op !== "delete") {
+        deferred.delete(path);
+        continue;
+      }
+      try {
+        const { done } = await retryDeferredEntry(client, store, opts.repo, path, entry, {
+          settleMs,
+          map,
+          deferred,
+        });
+        if (done) deferred.delete(path);
+      } catch (err) {
+        log(`defer retry error\t${path}\t${(err as Error).message}`);
+      }
+    }
+  }
+
   async function pollFeedOnce(): Promise<void> {
+    await retryDeferred();
     const { cursor: next } = await applyFeed(client, store, scope, {
       repo: opts.repo,
       since: cursor,
       log,
       map,
+      settleMs,
+      deferred,
     });
     if (next !== cursor) {
       cursor = next;
@@ -112,9 +147,7 @@ export function startDaemon(client: KernelClient, opts: DaemonOptions): Daemon {
     }
   }
 
-  function schedulePush(docPath: string): void {
-    if (!scope.matches(docPath)) return;
-    pending.add(docPath);
+  function armBurstTimer(): void {
     if (burstTimer) clearTimeout(burstTimer);
     burstTimer = setTimeout(() => {
       burstTimer = undefined;
@@ -122,9 +155,26 @@ export function startDaemon(client: KernelClient, opts: DaemonOptions): Daemon {
       pending.clear();
       void serialize(async () => {
         if (stopped) return;
-        await pushBurst(batch, { client, store, repo: opts.repo, map, log });
+        const ready: string[] = [];
+        for (const path of batch) {
+          if (settleMs > 0 && (await pathIsHot(store, path, settleMs))) {
+            pending.add(path);
+            continue;
+          }
+          ready.push(path);
+        }
+        if (pending.size > 0) armBurstTimer();
+        if (ready.length > 0) {
+          await pushBurst(ready, { client, store, repo: opts.repo, map, log });
+        }
       });
     }, debounceMs);
+  }
+
+  function schedulePush(docPath: string): void {
+    if (!scope.matches(docPath)) return;
+    pending.add(docPath);
+    armBurstTimer();
   }
 
   const ready = (async () => {
@@ -160,8 +210,13 @@ export function startDaemon(client: KernelClient, opts: DaemonOptions): Daemon {
       ignoreInitial: true,
       // Prune the sync state dir; the scope filter still guards everything else.
       ignored: (p: string) => p.includes(`/${SYNC_DIR}/`) || p.endsWith(`/${SYNC_DIR}`),
-      ...(opts.settleMs
-        ? { awaitWriteFinish: { stabilityThreshold: opts.settleMs, pollInterval: 100 } }
+      ...(settleMs > 0
+        ? {
+            awaitWriteFinish: {
+              stabilityThreshold: Math.min(settleMs, 2000),
+              pollInterval: 100,
+            },
+          }
         : {}),
     });
     const onEvent = (abs: string): void => {
