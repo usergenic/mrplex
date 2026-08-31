@@ -1,6 +1,6 @@
 {
   "name": "mrplex",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Markdown Repos, plexed. Turn Markdown folders into queryable, versioned, graph-aware knowledge stores.",
   "type": "module",
   "license": "MIT",
