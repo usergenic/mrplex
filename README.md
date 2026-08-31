@@ -2,7 +2,11 @@
 
 *Markdown Repos, plexed.*
 
-**Turn ordinary Markdown folders into queryable, versioned, graph-aware knowledge stores — without giving up files.** Your notes stay plain `.md` on disk; agents and humans share the same repository, every write is versioned, and links survive renames.
+mrplex is not a better notes app. It is a small kernel that leaves your files as files and makes the folder a multi-agent substrate.
+
+You keep working with ordinary `.md` with YAML frontmatter. mrplex adds versions, optimistic concurrency, CEL filters, full-text search, optional embeddings, and a link graph bound to document identity so renames do not smash backlinks. CLI, MCP, and REST are the same model with different sockets.
+
+If you wanted an Obsidian clone, this is the wrong repo.  If you're an Obsidian user, now your agents can utilize and manage your vault through mrplex's MCP interface.
 
 ## Install
 
@@ -12,38 +16,34 @@ Node ≥ 20.11:
 npm install -g mrplex
 ```
 
-Prefer not to install globally? `npx mrplex …` works the same way.
+`npx mrplex …` works. From a git checkout: `npm install && npm link`.
 
-Point every command at a database and default repo once (the tour below uses `starship`):
+Point every command at a database and a default repo:
 
 ```bash
 export MRPLEX_DATABASE=./demo.db
 export MRPLEX_REPO=starship
 ```
 
-Or persist settings in `~/.config/mrplex/config.json`:
+Or persist it:
 
 ```bash
 mrplex config set-database ./demo.db
 mrplex config set-repo starship
 ```
 
-Each setting resolves **flag → env → config file → default**, so one-off overrides never require editing anything.
+Resolution is always **flag → env → config file → default**.
 
-> **From a git checkout?** Run `npm install && npm link` (or `npm run cli -- …`). Every `mrplex …` command below is equivalent to `npx mrplex …`.
+Local mode is full-trust. Whoever can run the binary owns the database. That is intentional.
 
-## A five-minute tour
+## Five minutes on the USS Meridian
 
-This walkthrough uses the **USS Meridian** — a sample starship knowledge base in [`fixtures/starship/`](fixtures/starship/): crew files, mission records, officer logs, and equipment status, all ordinary Markdown with YAML frontmatter.
-
-### 1. Sync the sample corpus
-
-Clone the repo (for the fixture files), install, and sync the folder into a fresh mrplex repo:
+The fixture in `fixtures/starship/` is a starship knowledge base: crew, missions, logs, equipment. Ordinary Markdown. The product is the questions you can ask without opening every file.
 
 ```bash
 git clone https://github.com/usergenic/mrplex
 cd mrplex
-npm install && npm link    # skip if you installed globally above
+npm install && npm link
 
 export MRPLEX_DATABASE=./demo.db
 export MRPLEX_REPO=starship
@@ -52,93 +52,59 @@ mrplex repos create starship
 mrplex sync fixtures/starship --once -r starship
 ```
 
-`sync` is the normal way to load a Markdown folder: it pushes local files into the repo, materializes version metadata, and keeps a cursor for two-way updates. Frontmatter values written as repo-root paths (`/crew/foo.md`) and embedded wikilinks/inline links are indexed automatically — no link-config setup step.
+`sync` loads a folder, versions it, and keeps a cursor for two-way updates. Wikilinks, inline links, and frontmatter values written as repo-root paths (`/crew/foo.md`) are indexed automatically.
 
-No bootstrap, no token — local mode is full-trust (whoever can run the binary owns the database).
-
-### 2. Query it like data
-
-Frontmatter is queryable with [CEL](https://github.com/google/cel-spec) filters:
+### Ask the folder like data
 
 ```bash
-# What's broken or offline right now?
+# What's broken?
 mrplex query --filter 'status == "damaged" || status == "offline"'
 
-# Who reports directly to the captain?
-mrplex query --filter '$has_static("crew/kestrel-vance.md", "reports_to")'
-```
+# Who reports to the captain?
+mrplex query --filter '$has("crew/kestrel-vance.md", "reports_to")'
 
-```text
-PATH                              STATUS
-equipment/plasma-manifold-3.md    damaged
-equipment/shuttle-corvid.md       offline
-…
-
-PATH                    TITLE
-crew/aria-okonkwo.md    Commander Aria Okonkwo
-crew/dax-thorne.md      Lieutenant Commander Dax Thorne
-crew/quill-vasquez.md   Doctor Quill Vasquez
-```
-
-Compose with full-text search — filter, text, and semantic (when configured) all AND together:
-
-```bash
-mrplex query --text 'manifold coolant'
+# Filter AND full-text
 mrplex query --filter 'type == "mission"' --text 'Halloway'
 ```
 
-### 3. Follow the links as a graph
+`query` returns lean hits. Default projection is paths, not bodies. Hydrate what you need. That is how an agent stays cheap.
 
-Markdown links, wikilinks, and frontmatter repo-root paths (`/crew/foo.md`) build a derived index bound to document *identity*, so backlinks survive renames. Query membership in CEL:
+Filter, text, and semantic compose with AND. Semantic rank is a shortlist, not an oracle. Inspect the top hits; do not treat cosine as authority.
 
-```bash
-# Every mission indexed by the mission log MOC
-mrplex query --filter '$in_static("moc/missions.md")'
+### Follow the graph
 
-# What touches the damaged plasma manifold? (maintainer field, body links, logs…)
-mrplex query --filter '$has_static("equipment/plasma-manifold-3.md")'
-```
-
-Explore *how* documents connect — neighborhood expansion from a root set:
+Links live on document identity, not on the string you typed. Move a file and the graph still knows who pointed at it. The written text may go stale; the relation does not.
 
 ```bash
+# Everything a map-of-content claims
+mrplex query --filter '$in("moc/missions.md")'
+
+# What touches the damaged manifold?
+mrplex query --filter '$has("equipment/plasma-manifold-3.md")'
+
+# Neighborhood, not a file listing
 mrplex graph --roots missions/the-hollow-signal.md --degrees 2 --direction both --render summary
-```
-
-The missing officer, his mission, the encounter, and the logs that mention him appear as a connected neighborhood — the kind of thread a flat file listing can't give you.
-
-Mermaid for slides or docs:
-
-```bash
 mrplex graph --roots crew/kestrel-vance.md --degrees 2 --direction out --render mermaid
 ```
 
-### 4. Change something safely
+### Write without clobbering
 
-Every write inserts a new version; nothing is overwritten. Rename a document and the link graph follows its identity:
+Every write inserts a version. `prev_version_id` is optimistic concurrency. Stale prev loses; the current version comes back. Delete is a move to `:deleted/…`. Restore is a normal put.
 
 ```bash
-# See current version id, then move the manifold note
 V=$(mrplex --json docs get equipment/plasma-manifold-3.md | jq -r .version_id)
 mrplex docs mv equipment/manifold-3.md --prev "$V"
 
-# Backlinks still resolve — the graph never broke; link text may need repair
-mrplex query --filter '$has_static("equipment/manifold-3.md")'
+mrplex query --filter '$has("equipment/manifold-3.md")'
 mrplex links stale
-```
 
-History and unified diff between any two versions:
-
-```bash
 mrplex docs history equipment/manifold-3.md
 mrplex docs diff equipment/manifold-3.md --from v1 --to v2
 ```
 
-Deletion moves a document to a system-namespace path (`:deleted/…`); restore is a normal `docs put` back to user territory.
+## Connect an agent
 
-### 5. Connect an agent
-
-CLI, MCP, and REST are surfaces over the same model. Point Cursor (or any MCP client) at your local database:
+CLI, MCP, and REST are surfaces over one kernel. Local stdio is the right first attachment:
 
 ```json
 {
@@ -152,58 +118,13 @@ CLI, MCP, and REST are surfaces over the same model. Point Cursor (or any MCP cl
 }
 ```
 
-An agent can now ask relational questions — *"What's broken on the ship, who maintains it, and which missions were affected?"* — and recover structured answers through `query` and `graph` instead of reading every file into context.
+`--unsafe` means full-trust kernel: no auth in-process. That is correct for a database only you can touch. It is not a networked default.
 
-Serve HTTP for remote clients or Streamable HTTP MCP:
+The questions that justify the extra process are relational: *what is broken, who maintains it, which missions were hit?* Query and graph first. `docs get` / `docs_get_many` only for the hits you will actually use.
 
-```bash
-mrplex serve --unsafe --port 8321 &
-mrplex --server http://127.0.0.1:8321 query --filter 'status == "missing"'
-```
+## Networked use: policy first
 
-For shared or networked deployments, run the authenticating shell instead — see [Authentication](#authentication) below. Never expose the raw kernel (`serve --unsafe`) directly to an untrusted network.
-
-## How it works
-
-| Concept | What it means |
-|--------|----------------|
-| **Document** | One Markdown file with YAML frontmatter, addressed by repo-relative path |
-| **Version** | Every write appends; `prev_version_id` optimistic concurrency rejects stale writes |
-| **Query** | CEL filters over frontmatter + `$path` / `$body` / `$updated_at` intrinsics; composes with FTS and semantic search |
-| **Link graph** | Derived index over inline links, wikilinks, and frontmatter repo-root paths; `$in`, `$has`, `$backlinks`, `$links` in CEL |
-| **Graph** | BFS neighborhood expansion over the link index — *how* things connect, not just *which* match |
-| **Surfaces** | `mrplex` CLI (local or `--server`), MCP at `/mcp` or `mcp-stdio`, REST at `/repos/{repo}/…` |
-
-Two layers: a **full-trust kernel** (no in-engine auth) and an optional **access-and-identity shell** (API keys, OIDC, per-path write policy, audit log). See [docs/archive/security.md](docs/archive/security.md) for trust boundaries and deployment shapes.
-
-## Features
-
-<details>
-<summary>Full feature list</summary>
-
-- **Versioned Markdown store** — every write inserts; `docs.put` handles in-place update and move; any past state is addressable
-- **Byte-exact frontmatter** — `frontmatter_raw` (verbatim YAML) or `frontmatter` (JSON); exactly one; round-trips are byte-exact via raw
-- **Optimistic concurrency** — stale `prev_version_id` → `stale_prev` with current version returned
-- **Deletion as move** — `:deleted/…` paths; idempotent delete; restore via `docs.put`
-- **Unified diff** — `docs.diff`, REST `/diff`, MCP `docs_diff`, CLI `mrplex docs diff`; `patch(1)`-applicable output
-- **CEL filter queries** — frontmatter fields + `$`-intrinsics; `list()` polymorphism for scalar-or-list fields
-- **Link graph** — inline, wikilink, and frontmatter path extraction (no per-field config); backlinks survive renames; set algebra (`$in("moc/**") && !$in("moc/draft.md")`); `$in_static` for link-only membership; `links stale` / `repair` / `backfill`
-- **Graph exploration** — BFS with direction lens, visibility filter, graph-only `$degrees` intrinsic; CLI `--render summary|yaml|mermaid|json`
-- **Full-text search** — SQLite FTS5 or Postgres `websearch_to_tsquery`; composes with filter via AND
-- **Semantic search** — pluggable `--embedder` hook; chunker + backlog worker; `$semantic_score` in `select`; no hook → `semantic_unavailable`
-- **HTTP surfaces** — MCP (Streamable HTTP + STDIO), REST with `If-Match` / content negotiation / `MOVE`
-- **CLI** — thin MCP client; `--database` local or `--server` remote; identical commands over both
-- **Storage** — SQLite (default) or Postgres+pgvector; same kernel test suite on both
-- **Path policy** — configurable sigils and disallowed chars; NFC + case-insensitive identity, case-preserved storage
-- **Canonical paths** — API responses use slashless repo-relative paths; leading `/` accepted as root alias on input only
-
-Prior design docs in [docs/archive/](docs/archive/) may be out of date where later work supersedes them.
-
-</details>
-
-## Authentication
-
-For anything beyond single-user local use, run the **authenticating shell** — `serve --policy`. It reads declarative YAML (roles, principals, grants, key hashes, OIDC bindings), authenticates each request, and dispatches against a per-principal *guarded* kernel: read visibility narrowed, writes enforced per-path, author derived from the credential, every call audited.
+`serve` requires an explicit trust posture. For anything that binds a port other people can reach, use the authenticating shell.
 
 ```yaml
 # policy.yaml
@@ -223,7 +144,7 @@ principals:
     author: Brendan Baldwin <brendan@example.com>
     roles: [operator]
     keys:
-      - sha256:...        # `mrplex key mint brendan --policy policy.yaml`
+      - sha256:...        # mrplex key mint brendan --policy policy.yaml
   ann:
     roles: [editor]
     oidc: { email: ann@example.com }
@@ -235,24 +156,57 @@ mrplex serve --policy policy.yaml --audit audit.jsonl --port 8321 &
 curl -H "Authorization: Bearer $KEY" http://127.0.0.1:8321/repos
 ```
 
-Three deployment shapes — **embedded** (`serve --policy`), **launcher** (`mcp-stdio --policy`), and **fronting proxy** (`proxy --policy --upstream`). Edit the policy and `kill -HUP` to reload grants without restart. OIDC device-flow login via `mrplex login`. Full details in [docs/archive/security.md](docs/archive/security.md).
+Three shapes: **embedded** (`serve --policy`), **launcher** (`mcp-stdio --policy`), **fronting proxy** (`proxy --policy --upstream`). Edit the policy and `kill -HUP` to reload. OIDC device flow via `mrplex login`. Details in [docs/archive/security.md](docs/archive/security.md).
+
+Local HTTP against a private database:
+
+```bash
+mrplex serve --unsafe --port 8321 &
+mrplex --server http://127.0.0.1:8321 query --filter 'status == "missing"'
+```
+
+Never expose `serve --unsafe` to an untrusted network. The flag is loud on purpose. Do not copy the MCP snippet above onto a shared host and call it done.
+
+## How it works
+
+| Piece          | Job                                                                                      |
+| -------------- | ---------------------------------------------------------------------------------------- |
+| **Document**   | One Markdown file with YAML frontmatter, addressed by repo-relative path                 |
+| **Version**    | Every write appends. `prev_version_id` rejects stale writers                             |
+| **Query**      | CEL over frontmatter + `$path` / `$body` / `$updated_at`; AND with FTS and semantic      |
+| **Link graph** | Derived from inline links, wikilinks, and frontmatter repo-root paths. Bound to identity |
+| **Graph**      | BFS neighborhood. *How* things connect, not only *which* match                           |
+| **Surfaces**   | CLI (`--database` or `--server`), MCP (`/mcp` or `mcp-stdio`), REST                      |
+
+Two layers: a **full-trust kernel** and an optional **access-and-identity shell** (keys, OIDC, per-path grants, audit). The kernel does not pretend to be a user system.
+
+What ships today:
+
+- Versioned Markdown store; byte-exact `frontmatter_raw` or structured `frontmatter`
+- Optimistic concurrency; delete-as-move; unified diff
+- CEL + `list()` for scalar-or-list fields; `$in` / `$has` / `$backlinks` / `$links` (membership is a filter, not a separate CLI flag)
+- FTS5 or Postgres `websearch_to_tsquery`
+- Pluggable embedder; no hook → `semantic_unavailable` instead of silent junk vectors
+- SQLite default or Postgres+pgvector; same kernel suite on both
+- NFC + case-insensitive identity, case-preserved storage
+
 
 ## Embeddings
 
-mrplex never calls an embedding provider itself — wire one with `--embedder` (subprocess command or HTTP URL). For local CPU embeddings:
+mrplex never calls an embedding vendor. Wire a hook.
 
 ```bash
 npm install -g @mrplex/embedder
-export MRPLEX_EMBEDDER=mrplex-embedder   # or: mrplex config set-embedder mrplex-embedder
+export MRPLEX_EMBEDDER=mrplex-embedder
 
 mrplex serve --unsafe --embedder mrplex-embedder
 mrplex embed backfill -r starship
-mrplex query -r starship --semantic 'distress beacon star map'   # uses env/config
-# or per-invocation in local (--database) mode:
-mrplex query -r starship --embedder mrplex-embedder --semantic 'distress beacon star map'
+mrplex query -r starship --semantic 'distress beacon star map'
 ```
 
-Resolution: **flag → `MRPLEX_EMBEDDER` → `mrplex config set-embedder` → unset**. In local mode, `query --embedder` overrides for that call; with `--server`, configure the embedder on the host. See [packages/embedder/README.md](packages/embedder/README.md) for protocol details.
+Resolution: **flag → `MRPLEX_EMBEDDER` → config → unset**. With `--server`, configure the embedder on the host. Protocol: [packages/embedder/README.md](packages/embedder/README.md).
+
+Use semantic search to generate candidates. Then filter, hydrate, and read. Rank without inspection is how agents launder a guess into a citation.
 
 ## Development
 
@@ -263,17 +217,11 @@ npm test
 npm run typecheck
 npm run lint
 npm run build
-```
 
-Seed the full dev fixture set (notes + starship):
-
-```bash
 npm run seed -- --database ./mrplex.db
 ```
 
-CI runs typecheck + lint + tests on Ubuntu & macOS × Node 20 & 22, plus Postgres+pgvector parity. If tests fail with a `NODE_MODULE_VERSION` error from `better-sqlite3`, run `npm rebuild better-sqlite3`.
-
-### Postgres locally
+CI: typecheck + lint + tests on Ubuntu and macOS × Node 20 and 22, plus Postgres+pgvector parity. If `better-sqlite3` throws `NODE_MODULE_VERSION`, run `npm rebuild better-sqlite3`.
 
 ```bash
 npm run pg:up
@@ -284,3 +232,4 @@ mrplex serve --unsafe
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
