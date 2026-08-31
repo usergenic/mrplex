@@ -150,27 +150,18 @@ async function applyRef(
     const intr = readFileIntrinsics(existing);
     if (isIgnored(intr)) return "noop";
 
-    // Fast path: bytes already match — may still need provenance repair.
+    // Fast path: bytes already match — provenance repair or defer when hot.
     if (intr.computed_hash === ref.content_hash) {
       opts.map?.set(ref.path, { version_id: ref.version_id, content_hash: ref.content_hash });
       if (intr.version === ref.version_id) return "noop";
       if (versionAtOrAhead(intr.version, ref.version_id)) return "noop";
       const hot = await pathIsHot(store, ref.path, settleMs, nowMs);
+      if (hot && canDefer) {
+        enqueueDeferred(opts.deferred!, ref.path, ref, nowMs);
+        return "deferred";
+      }
       const v = await client.docs.get_version(opts.repo, ref.version_id);
-      const decision = decideInbound({
-        localText: existing,
-        remote: v,
-        hot,
-        canDefer,
-      });
-      const result = await effectInbound(client, store, opts.repo, ref.path, decision, {
-        deferred: opts.deferred,
-        ref,
-        map: opts.map,
-        nowMs,
-      });
-      if (result === "deferred") return "deferred";
-      if (result === "noop") return "noop";
+      await materializeAt(store, ref.path, v, { preserveMtime: true });
       log(`feed adopt\t${ref.path}`);
       return "applied";
     }

@@ -243,7 +243,7 @@ async function resolveLocalPath(
 
   if (!intr.version) {
     // No provenance, path absent remotely → a genuine local creation (row 7).
-    if (!dryRun) await pushCreate(client, store, opts.repo, path);
+    if (!dryRun) return await pushCreate(client, store, opts.repo, path);
     return { path, verdict: "push", detail: "local creation" };
   }
 
@@ -254,7 +254,16 @@ async function resolveLocalPath(
     if (!dryRun) await store.remove(path);
     return { path, verdict: "delete-local", detail: "remote-deleted, local clean" };
   }
-  if (!dryRun) await pushCreate(client, store, opts.repo, path);
+  if (!dryRun) {
+    return await pushCreate(
+      client,
+      store,
+      opts.repo,
+      path,
+      "resurrect",
+      "remote-deleted, local dirty",
+    );
+  }
   return { path, verdict: "resurrect", detail: "remote-deleted, local dirty" };
 }
 
@@ -319,16 +328,18 @@ async function pushCreate(
   store: FileStore,
   repo: string,
   path: string,
-): Promise<void> {
+  successVerdict: SyncAction["verdict"] = "push",
+  successDetail = "local creation",
+): Promise<SyncAction> {
   const user = await readUserContent(store, path);
   try {
     const v = await client.docs.create(repo, path, user);
     await store.write(path, renderMaterialized(v), { preserveMtime: true });
+    return { path, verdict: successVerdict, detail: successDetail };
   } catch (err) {
     if (err instanceof KernelError && err.code === "create_conflict") {
       // A doc appeared at this path since the index scan; rebase or park.
-      await convergeOccupied(client, store, repo, path);
-      return;
+      return await convergeOccupied(client, store, repo, path);
     }
     throw err;
   }
@@ -353,11 +364,14 @@ async function convergeOccupied(
     canDefer: false,
   });
   const result = await effectInbound(client, store, repo, path, decision);
-  if (result === "parked" || decision.action === "noop") {
-    // noop here would mean ignored; occupied diverge shouldn't noop.
-    if (result === "parked") {
-      return { path, verdict: "conflict", detail: "rebase failed; parked remote sibling" };
+  if (result === "noop" || decision.action === "noop") {
+    if (isIgnored(readFileIntrinsics(text))) {
+      return { path, verdict: "ignored" };
     }
+    return { path, verdict: "clean", detail: "already converged" };
+  }
+  if (result === "parked") {
+    return { path, verdict: "conflict", detail: "rebase failed; parked remote sibling" };
   }
   if (decision.action === "rebase" || result === "applied") {
     return { path, verdict: "rebase", detail: "local bytes put onto remote current" };

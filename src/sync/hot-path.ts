@@ -209,8 +209,8 @@ export async function effectInbound(
           let park: Version = current;
           try {
             park = await client.docs.get(repo, path);
-          } catch {
-            // Keep get_version result.
+          } catch (err) {
+            if (!(err instanceof KernelError && err.code === "doc_not_found")) throw err;
           }
           await parkIgnoredSibling(store, path, park);
           return "parked";
@@ -282,8 +282,11 @@ export async function retryDeferredEntry(
     if (!(err instanceof KernelError && err.code === "doc_not_found")) throw err;
     try {
       remote = await client.docs.get_version(repo, entry.ref.version_id);
-    } catch {
-      return { done: true, result: "noop" };
+    } catch (err) {
+      if (err instanceof KernelError && err.code === "doc_not_found") {
+        return { done: true, result: "noop" };
+      }
+      throw err;
     }
   }
 
