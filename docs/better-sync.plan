@@ -1,0 +1,334 @@
+# Better Sync Plan — defer hot files, rebase before park, in-memory conflict hold
+
+Status: **design**. Extends [sync-and-history-plan.md](archive/sync-and-history-plan.md)
+(§4.3–4.9). Targets the UX failure mode where a conflict sibling
+(`<name>-<version_id>.md`) lands beside a note the user is actively editing, and the
+related case where local bytes are ahead of stale embedded provenance but inbound sync
+parks a sibling instead of rebasing in place.
+
+This plan does **not** introduce three-way markdown merge or a persistent conflict
+database. It tightens the existing hash-gate + optimistic-concurrency model so
+siblings are a last resort, not the default reaction to a hot or rebaseable file.
+
+## 0. Problem
+
+Today, inbound sync (feed + startup reconcile) applies this rule without nuance:
+
+> local dirty **and** incoming remote ≠ embedded `$version` → park remote as ignored sibling
+
+See `applyRef` in `src/sync/feed.ts` and row 5 of the §4.9 table in
+`src/sync/reconcile.ts`. Outbound push is already smarter: `recoverStalePut` in
+`src/sync/push.ts` tries to put local bytes on top of remote current before parking.
+
+Gaps:
+
+1. **Feed has no edit-awareness.** Push is debounced; feed polls every `--interval`
+   and may park a sibling while the user is still typing.
+2. **`--settle` is misdocumented.** CLI help claims mtime-age filtering; the daemon
+   wires it only to chokidar `awaitWriteFinish` on the watcher (push direction).
+3. **Rebase logic is push-only.** The highest-leverage fix for “disk is ahead, `$version`
+   is stale, remote also advanced” never runs on inbound paths.
+4. **Conflicts are immediate and filesystem-visible.** There is no in-memory hold to
+   retry once the file settles or a rebase becomes possible.
+
+## 1. Principles (unchanged)
+
+These north stars from the sync plan still govern every change here:
+
+- **Never clobber local bytes** on the canonical path without proof it is safe.
+- **Hash equality licenses adopt** — inject provenance in place, no server write.
+- **Optimistic put with `prev_version_id`** is the preferred convergence path when
+  bytes diverge but the editor’s work should win as the new head.
+- **Conflict siblings remain the last resort** — remote parked beside local with
+  `$sync: ignore`, deterministic name, idempotent replay.
+- **No new persistent client state** beyond the existing `.mrplex/sync.json` cursor.
+  Deferred conflicts live in daemon memory only; restart replays from the feed.
+
+## 2. Scope
+
+**In:**
+
+1. **Feed deferral** — skip inbound materialize/conflict/park on paths whose mtime is
+   too recent (or otherwise “hot”).
+2. **Rebase-before-park** — shared inbound logic mirroring `recoverStalePut` /
+   `occupiedPath`: hash-equal adopt, else try `docs.put`, park sibling only on failure.
+3. **`--settle` semantics** — restore documented mtime-age meaning; apply symmetrically
+   to inbound touch decisions and outbound push scheduling.
+4. **In-memory deferred conflicts** — hold would-be sibling writes in daemon memory;
+   retry on later polls when the file is settled; no log line, no disk artifact.
+
+**Out (deliberately):**
+
+- Three-way or block-level markdown merge (`docs.merge_preview`, etc.).
+- Persistent conflict queue / sidecar manifest.
+- Obsidian open-buffer integration (no API available).
+- Changes to kernel concurrency (`stale_prev`, `create_conflict` codes stay as-is).
+
+## 3. Architecture
+
+### 3.1 New module: `src/sync/hot-path.ts`
+
+Centralize “may we touch this path right now?” and “how do we converge inbound?”
+
+```ts
+/** True when path mtime is within settleMs of now (0 = no gate). */
+export function isPathHot(store: FileStore, path: string, settleMs: number): Promise<boolean>;
+
+/** Inbound convergence: adopt | rebase-put | defer | park-sibling. */
+export type InboundVerdict =
+  | { action: "noop" }
+  | { action: "adopt"; version: Version }
+  | { action: "rebase"; prevVersionId: string; user: UserContent }
+  | { action: "defer"; ref: VersionRef }      // hold in memory
+  | { action: "park"; version: Version };     // write ignored sibling
+
+export function resolveInbound(
+  client, store, repo, path, localText, ref, opts: { settleMs: number; hot: boolean },
+): Promise<InboundVerdict>;
+```
+
+`resolveInbound` encapsulates the decision order in §4.2. Callers (`feed.ts`,
+`reconcile.ts`) replace ad-hoc dirty/version checks with this function.
+
+### 3.2 Daemon state: in-memory deferred conflicts
+
+Add to `startDaemon` in `src/sync/daemon.ts`:
+
+```ts
+/** Paths we would have conflict-parked but are holding until settled or rebase succeeds. */
+const deferred = new Map<string, { ref: VersionRef; since: number }>();
+```
+
+Properties:
+
+- **Key:** canonical doc path (repo-relative POSIX).
+- **Value:** the `VersionRef` we deferred (plus `since` timestamp for optional TTL).
+- **Not logged** — no `deferred-conflict` stderr line; optional `--verbose` may mention
+  retries, but default output stays unchanged.
+- **Not persisted** — daemon restart drops the map; the next `history.since` drain
+  re-encounters the ref (idempotent — no duplicate siblings if one was already written).
+- **Processed before each feed page** — `retryDeferred(deferred)` runs at the start of
+  `pollFeedOnce` (inside the existing serialize chain).
+
+When a deferred entry succeeds (adopt/rebase/noop), delete the map entry. When rebase
+fails and the path is no longer hot, fall through to park and delete the entry.
+
+Optional safety cap: drop deferred entries older than e.g. 30 minutes and park immediately
+(prevents infinite deferral during an all-day editing session). Tunable constant, not CLI
+for v1.
+
+### 3.3 `--settle` restored semantics
+
+| Direction | Today | After |
+|-----------|-------|-------|
+| Push (watcher) | `awaitWriteFinish.stabilityThreshold = settleMs` | Mtime age ≥ `settleMs` before `pushPath`; keep `awaitWriteFinish` with `min(settleMs, 2000)` when `settleMs > 0` so rapid saves still coalesce |
+| Feed / reconcile | ignored | Skip materialize + conflict park when `isPathHot`; enqueue defer instead |
+| Provenance ack | `preserveMtime: true` | unchanged — ack writes never participate in the hot gate |
+
+Default remains `0` (no gate) for backward compatibility.
+
+Update CLI help in `src/cli/main.ts` to match behavior:
+
+```
+--settle <ms>   minimum mtime age before sync reads or writes a path (default 0)
+```
+
+## 4. Workstreams
+
+### WS1 — Feed deferral (mtime hot gate)
+
+**Goal:** inbound sync does not materialize or park siblings on files the editor likely
+still has open.
+
+**Behavior:**
+
+Before any inbound filesystem effect at `path` (materialize, fast-forward, conflict
+park, delete of clean file):
+
+1. If `settleMs === 0`, proceed (current behavior modulo WS2).
+2. If `isPathHot(path)`, do **not** write. For conflict-shaped situations, insert
+   `{ path → ref }` into `deferred` (WS4). For benign noops (hash-equal adopt), still
+   defer the provenance stamp — stamping during an active edit can confuse Obsidian Sync
+   even with `preserveMtime`; retry when cold.
+3. Feed cursor **still advances** for deferred refs — the ref is reflected in memory, not
+   on disk. Rationale: stalling the global cursor blocks the entire vault for one hot
+   file. The deferred map is the per-path hold.
+
+**Exception:** witnessed **clean delete** on a cold file stays immediate. Hot + dirty
+delete already no-ops (existing §4.3).
+
+**Files:** `src/sync/feed.ts`, `src/sync/hot-path.ts`, `src/sync/daemon.ts` (pass
+`settleMs`, `deferred` into `applyFeed` options).
+
+**Acceptance:**
+
+- Feed poll while mtime is fresh → no sibling, entry in `deferred`.
+- After mtime ages past `settleMs` → retry applies adopt/rebase/park per WS2.
+- Cursor advances even when all refs in a page defer.
+- `--settle 0` → no deferrals from mtime.
+
+### WS2 — Rebase-before-park (feed + reconcile)
+
+**Goal:** extend outbound `recoverStalePut` / `occupiedPath` logic to inbound paths so
+“local ahead + stale `$version` + remote advanced” converges in place when the kernel
+accepts the put.
+
+**Decision order** (for `resolveInbound` when local file exists and incoming remote
+current ≠ embedded `$version`, or reconcile equivalent):
+
+| Step | Condition | Action |
+|------|-----------|--------|
+| 1 | `computed_hash === remote.content_hash` | **Adopt** — `renderMaterialized` in place, `preserveMtime: true` |
+| 2 | `versionAtOrAhead(local, remote)` | **Noop** — local already names this or a later version |
+| 3 | `!isDirty(local)` | **Materialize** — fast-forward (existing row 3 / feed materialize) |
+| 4 | hot (WS1) | **Defer** — memory hold |
+| 5 | dirty + divergent | **Rebase** — strip user content, `docs.put(repo, remote.version_id, path, user)` |
+| 6 | rebase → success | **Ack** — `ackLocalWrite` / `renderMaterialized` with `preserveMtime` |
+| 7 | rebase → `stale_prev` / `path_taken` / hash mismatch after race | **Park** — ignored sibling (§4.8) |
+
+Rebase (step 5) is the new branch. It matches `recoverStalePut`’s “same-path continuation”
+comment: the editor is on stale provenance but has newer bytes; put those bytes on top of
+remote current instead of parking a sibling that Obsidian then syncs into the vault.
+
+**Reconcile changes** (`src/sync/reconcile.ts`):
+
+- Row 5 (stale + dirty): call `resolveInbound` instead of unconditional `parkConflict`.
+- Row 6 (occupied, no provenance): already partially handled; route through shared helper.
+- `parkConflict` / `parkConflictForCurrent` become the terminal action of `resolveInbound`.
+
+**Feed changes** (`src/sync/feed.ts`):
+
+- Replace the block at lines 132–143 (dirty → immediate park) with `resolveInbound`.
+- Hash-equal branch (lines 122–130) folds into step 1.
+
+**Shared push helpers:**
+
+- Extract `occupiedPath`, `commitPut`, `ackLocalWrite`, `stripToUserContent` usage into
+  imports from `push.ts` or a thin `src/sync/converge.ts` to avoid circular deps
+  (feed/reconcile must not import the whole push burst machinery).
+
+**Acceptance:**
+
+- Stale `$version`, dirty local, local bytes = remote current → adopt, no sibling.
+- Stale `$version`, dirty local, local bytes differ, put succeeds → in-place head, no sibling.
+- True divergence (put fails) → sibling, same as today.
+- Existing `test/sync-feed.test.ts`, `test/sync-reconcile.test.ts`, `test/sync-push.test.ts`
+  scenarios still pass; new cases cover rebase path.
+
+### WS3 — Fix `--settle` semantics
+
+**Goal:** CLI flag matches implementation; one knob for “don’t touch files still being
+written.”
+
+**Implementation:**
+
+1. Implement `isPathHot` in `src/sync/hot-path.ts` using `fs.stat` mtime vs
+   `Date.now() - settleMs`.
+2. Push path: in `schedulePush` / before `pushBurst`, re-queue paths that fail the hot
+   check (reset debounce timer, do not call `pushPath` yet).
+3. Feed path: WS1.
+4. chokidar: when `settleMs > 0`, set
+   `awaitWriteFinish: { stabilityThreshold: Math.min(settleMs, 2000), pollInterval: 100 }`
+   as a complementary write-stability guard (not a substitute for mtime age).
+5. Update CLI help and `docs/archive/sync-and-history-plan.md` cross-reference (one line
+   in this plan’s §7 changelog; full doc edit optional).
+
+**Acceptance:**
+
+- `--settle 3000` + file modified 1s ago → push and inbound touch both wait.
+- `--settle 0` → no mtime gate (stability threshold off unless we keep a separate default;
+  prefer fully off for 0).
+- `test/sync-fs-store.test.ts` preserveMtime cases unaffected.
+
+### WS4 — In-memory deferred conflicts
+
+**Goal:** when WS1 or WS2 would park but the path is hot, hold the ref in memory and
+retry silently until the file is cold or rebase succeeds.
+
+**Behavior:**
+
+1. **Enqueue:** `deferred.set(path, { ref, since: Date.now() })` when `resolveInbound`
+   returns `{ action: "defer" }`. No stderr output.
+2. **Retry:** at the start of each serialized `pollFeedOnce`:
+   - For each deferred entry (snapshot copy of map to avoid mutation during iteration):
+     - Re-read local file; re-fetch remote version for `ref.version_id` if needed.
+     - Call `resolveInbound` with `hot: isPathHot(...)`.
+     - On adopt/rebase/noop → remove entry.
+     - On park (cold + rebase failed) → write sibling, remove entry.
+     - On defer → keep entry.
+3. **Dedup:** if `deferred` already has `path`, replace `ref` only when incoming
+   `ref.version_id` is newer (decode integer ids).
+4. **Interaction with feed cursor:** deferred refs correspond to feed positions already
+   passed; retry uses `client.docs.get` / `get_version` at canonical path, not replay of
+   old refs. The held `VersionRef` is a hint for which remote version we need to converge
+   with.
+5. **Restart:** map empty; next feed poll may re-park if still divergent and cold — acceptable.
+
+**Not in scope:** logging deferred state, persisting queue, UI indicators.
+
+**Acceptance:**
+
+- Active edit + inbound remote change → no sibling during hot window; sibling only if still
+  divergent after cold + rebase failure.
+- `--verbose` may print retry outcomes; default silent.
+- `test/sync-daemon.test.ts`: simulate hot mtime → deferred; advance clock or touch mtime →
+  convergence.
+
+## 5. Scenario notes
+
+### A — Obsidian local → Obsidian Sync → server vault → mrplex sync
+
+- Sibling originates on server; Obsidian Sync propagates it locally.
+- WS2 reduces false siblings when server file is dirty with stale `$version` but content
+  is rebaseable onto remote current.
+- WS1/WS4 reduce siblings when Obsidian Sync delivers the edit while server mrplex poll runs.
+- Mtime on server may lag Obsidian Sync delivery — defer+retry still helps on the next poll.
+
+### B — Obsidian local + mrplex sync on same machine
+
+- WS1/WS4 directly address “sibling appeared while I was editing.”
+- WS2 addresses stale provenance after interrupted ack (crash between put and restamp).
+- Recommend `--settle 2000` or `--settle 3000` in docs as a sensible Obsidian default once
+  implemented (not changed as CLI default in code).
+
+## 6. Test plan
+
+| Area | Tests |
+|------|-------|
+| `hot-path.ts` | unit: `isPathHot`, `resolveInbound` decision table |
+| Feed | hot file → defer; cold + rebase → in place; cold + fail → sibling |
+| Reconcile | row 5 rebase; row 5 park unchanged for true conflict |
+| Daemon | deferred map retry loop; cursor advances with deferrals |
+| Push + settle | push delayed until mtime age; `--settle 0` unchanged |
+| Regression | echo suppression, hash-equal adopt, `$sync: ignore`, move/delete |
+
+Use in-memory `FileStore` test doubles with controllable mtimes (extend test store or mock
+`stat` via injectable clock + mtime map).
+
+## 7. Implementation order
+
+1. **WS3 + WS1 foundation** — `hot-path.ts`, `isPathHot`, wire `settleMs` through feed opts.
+2. **WS4** — deferred map in daemon, feed defer enqueue, retry loop.
+3. **WS2** — `resolveInbound` rebase branch; refactor feed + reconcile to use it.
+4. **CLI/docs** — help text, optional README note on Obsidian `--settle`.
+
+Estimated touch surface: `src/sync/hot-path.ts` (new), `src/sync/converge.ts` (new, optional),
+`src/sync/feed.ts`, `src/sync/reconcile.ts`, `src/sync/push.ts` (extract shared ack/put),
+`src/sync/daemon.ts`, `src/cli/main.ts`, tests under `test/sync-*.test.ts`.
+
+## 8. Open questions
+
+1. **Cursor advance vs defer** — this plan advances the global cursor while holding per-path
+   deferred state. Alternative: stall cursor at first deferred ref (simpler replay, blocks
+   whole vault). Recommendation: advance + per-path hold unless integration tests show
+   missed convergence.
+2. **Defer TTL** — 30-minute cap before forced park: keep, drop, or make configurable?
+3. **`--once` reconcile** — apply hot gate on startup reconcile? Recommendation: yes for
+   conflict park; no for remote-only materialize of files absent locally (less surprising).
+4. **Rebase on feed delete** — if remote deleted and local is dirty+hot, existing keep-local
+   behavior stands; no defer needed.
+
+---
+
+*Changelog: initial draft — four workstreams (deferral, rebase-before-park, settle fix,
+in-memory deferred conflicts without logging).*
