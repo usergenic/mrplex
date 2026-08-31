@@ -82,19 +82,21 @@ describe("sync daemon", () => {
   it("pushes a new local file to the remote via the watcher", async () => {
     daemon = await start();
     writeFileSync(join(vault, "local.md"), "brand new\n");
+    // chokidar + debounce can lag under a loaded vitest worker; same headroom
+    // as the rename case below.
     const v = await waitFor(async () => {
       try {
         return await client.docs.get("notes", "local.md");
       } catch {
         return undefined;
       }
-    });
+    }, 20_000);
     expect(v.body).toBe("brand new\n");
     // The local file gets its provenance rewritten by the ack.
     const text = await waitFor(() => {
       const t = readFileSync(join(vault, "local.md"), "utf8");
       return t.includes("$version") ? t : undefined;
-    });
+    }, 20_000);
     expect(text).toMatch(/\$version: v\d+/);
   });
 
