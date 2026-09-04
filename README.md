@@ -1,6 +1,6 @@
-# mrplex
+![mrplex](https://i.imgur.com/C82h0Wg.jpeg)
 
-*Markdown Repos, plexed.*
+# a plex of [m]arkdown [r]epos → mrplex
 
 mrplex turns a folder of Markdown files into a queryable, versioned knowledge store — without taking your files hostage. Your notes stay ordinary `.md` on disk, readable and editable by any tool you already use. On top of that folder mrplex adds four things a plain directory can't give you:
 
