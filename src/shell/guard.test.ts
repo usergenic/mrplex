@@ -26,6 +26,7 @@ function ent(over: Partial<Entitlement> = {}): Entitlement {
     author: "Test <test@example.com>",
     read: [],
     write: [],
+    maintain: false,
     destructive: false,
     impersonate: false,
     ...over,
@@ -188,12 +189,12 @@ describe("write policy", () => {
 });
 
 // -----------------------------------------------------------------------------
-// Destructive gating
+// Destructive + maintain gating
 // -----------------------------------------------------------------------------
 
 describe("destructive gating", () => {
   it("forbids repo ops without the destructive bit", async () => {
-    const k = guardKernel(raw, ent({ write: [{ repo: "*", paths: ["**"] }] }));
+    const k = guardKernel(raw, ent({ write: [{ repo: "*", paths: ["**"] }], maintain: true }));
     await expectForbidden(k.repos.create(ROOT, "new-repo"));
     await expectForbidden(k.repos.rename(ROOT, "notes", "notes2"));
     await expectForbidden(k.repos.delete(ROOT, "notes"));
@@ -202,11 +203,13 @@ describe("destructive gating", () => {
   });
 
   it("allows repo ops with the destructive bit", async () => {
-    const k = guardKernel(raw, ent({ destructive: true }));
+    const k = guardKernel(raw, ent({ destructive: true, maintain: true }));
     const r = await k.repos.create(ROOT, "fresh");
     expect(r.repo).toBe("fresh");
   });
+});
 
+describe("maintain gating", () => {
   it("gates links.backfill and live repair, but allows dry-run repair as a read", async () => {
     await seed("notes", "a.md");
     const k = guardKernel(raw, ent({ read: [{ repo: "notes", paths: ["**"] }] }));
@@ -215,6 +218,20 @@ describe("destructive gating", () => {
     // dry-run is a read → allowed under a read-only entitlement.
     const plan = await k.links.repair(ROOT, "notes", { dry_run: true });
     expect(plan.dry_run).toBe(true);
+  });
+
+  it("allows backfill and live repair with maintain but without destructive", async () => {
+    await seed("notes", "a.md");
+    const k = guardKernel(
+      raw,
+      ent({ read: [{ repo: "notes", paths: ["**"] }], maintain: true }),
+    );
+    const report = await k.links.backfill(ROOT, "notes");
+    expect(report.documents).toBeGreaterThanOrEqual(1);
+    const repaired = await k.links.repair(ROOT, "notes", { dry_run: false });
+    expect(repaired.dry_run).toBe(false);
+    // Still cannot create a repo.
+    await expectForbidden(k.repos.create(ROOT, "other"));
   });
 });
 

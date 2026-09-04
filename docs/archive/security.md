@@ -45,7 +45,8 @@ Entitlement = {
   author:      string        // stamped on writes
   read:        ScopeClaim[]   // forwarded verbatim as ctx.scope
   write:       ScopeClaim[]   // enforced BY THE SHELL against write paths
-  destructive: boolean        // repos.create/rename/delete/set_*_config, links.backfill, live repair
+  maintain:    boolean        // links.backfill, live links.repair (expensive non-delete)
+  destructive: boolean        // repos.create/rename/delete/set_*_config (implies maintain)
   impersonate: boolean        // may supply a caller-chosen author
 }
 ```
@@ -66,8 +67,9 @@ reimplemented).
 Declarative YAML, diffable and commentable, loaded at startup and reloaded on
 `SIGHUP`. A **grant** `{ repo, read?, write? }` is the human-facing vocabulary —
 it pairs a repo pattern with path globs per direction; `compile()` splits it
-into the two claim lists. Roles are grant bundles plus the two booleans; a
-principal's entitlement is the union of its roles.
+into the two claim lists. Roles are grant bundles plus the op-level booleans; a
+principal's entitlement is the union of its roles. `destructive` implies
+`maintain` at compile time.
 
 ```yaml
 roles:
@@ -79,6 +81,10 @@ roles:
       - repo: notes
         read: "**"
         write: ["drafts/**", "inbox/**"]
+  maintainer:
+    grants:
+      - { repo: "*", read: "**", write: "**" }
+    maintain: true
   operator:
     grants:
       - { repo: "*", read: "**", write: "**" }

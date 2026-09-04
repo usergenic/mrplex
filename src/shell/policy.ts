@@ -37,7 +37,12 @@ export type Entitlement = {
   read: ScopeClaim[];
   /** Enforced BY THE SHELL against write-op target paths. */
   write: ScopeClaim[];
-  /** May run repos.create/rename/delete/set_path_config/set_link_config + link mutations. */
+  /**
+   * May run expensive non-deleting maintenance: `links.backfill`, live
+   * `links.repair`. Implied by `destructive` at compile time.
+   */
+  maintain: boolean;
+  /** May run structural admin: repos.create/rename/delete/set_*_config. */
   destructive: boolean;
   /** May supply a caller-chosen author instead of the derived one. */
   impersonate: boolean;
@@ -57,9 +62,12 @@ export type Grant = {
   write?: string | string[];
 };
 
-/** A role is a grant bundle plus the two op-level booleans. */
+/** A role is a grant bundle plus the op-level booleans. */
 export type Role = {
   grants: Grant[];
+  /** Expensive non-deleting maintenance (backfill / live repair). */
+  maintain?: boolean;
+  /** Structural admin (repo create/rename/delete, set_*_config). Implies maintain. */
   destructive?: boolean;
   impersonate?: boolean;
 };
@@ -137,6 +145,64 @@ export function loadPolicyFile(path: string): Policy {
   return parsePolicy(text);
 }
 
+// -----------------------------------------------------------------------------
+// Scaffold — starter policy text for `mrplex policy create`.
+// -----------------------------------------------------------------------------
+
+export type ScaffoldPolicyOptions = {
+  /** Maintainer principal id (MCP / day-to-day). `admin` is always also created. */
+  principal: string;
+  /** Author stamped on writes for both scaffold principals. */
+  author: string;
+};
+
+/**
+ * Render a minimal starter policy. Pure — no I/O. Always parses via
+ * `parsePolicy`. Two principals: `admin` (operator — create/delete repos) and
+ * the named maintainer (MCP day-to-day — no structural admin).
+ */
+export function scaffoldPolicyYaml(opts: ScaffoldPolicyOptions): string {
+  const principal = opts.principal.trim();
+  const author = opts.author.trim();
+  if (!principal) throw new PolicyError("scaffold principal id must be non-empty");
+  if (!author) throw new PolicyError("scaffold author must be non-empty");
+  // Keep the template free of quoting footguns: principal ids that aren't
+  // plain YAML barewords would need escaping in the rendered file.
+  if (!/^[A-Za-z][A-Za-z0-9_-]*$/.test(principal)) {
+    throw new PolicyError(
+      `scaffold principal id "${principal}" must start with a letter and contain only letters, digits, _ and -`,
+    );
+  }
+  if (principal === "admin") {
+    throw new PolicyError(
+      'scaffold principal id cannot be "admin" (reserved for the operator principal)',
+    );
+  }
+  // JSON string literals are valid YAML double-quoted scalars — handles spaces
+  // and angle brackets in "Name <email>" authors without a hand-rolled escape.
+  const authorYaml = JSON.stringify(author);
+
+  return `roles:
+  maintainer:
+    grants: [{ repo: "*", read: "**", write: "**" }]
+    maintain: true
+  operator:
+    grants: [{ repo: "*", read: "**", write: "**" }]
+    destructive: true
+
+# author: prefer "Full Name <email@domain>" (git-style) — stamped on writes
+principals:
+  admin:
+    author: ${authorYaml}
+    roles: [operator]
+    keys: []
+  ${principal}:
+    author: ${authorYaml}
+    roles: [maintainer]
+    keys: []
+`;
+}
+
 function validateGrant(g: unknown, where: string): Grant {
   if (!isObject(g)) throw new PolicyError(`${where} must be a mapping`);
   if (!isStrOrStrList(g.repo)) {
@@ -166,6 +232,9 @@ function validateRoles(raw: unknown): Record<string, Role> {
     }
     const grantsRaw = (value.grants ?? []) as unknown[];
     const grants = grantsRaw.map((g, i) => validateGrant(g, `${where}.grants[${i}]`));
+    if (value.maintain !== undefined && typeof value.maintain !== "boolean") {
+      throw new PolicyError(`${where}.maintain must be a boolean`);
+    }
     if (value.destructive !== undefined && typeof value.destructive !== "boolean") {
       throw new PolicyError(`${where}.destructive must be a boolean`);
     }
@@ -173,6 +242,7 @@ function validateRoles(raw: unknown): Record<string, Role> {
       throw new PolicyError(`${where}.impersonate must be a boolean`);
     }
     const role: Role = { grants };
+    if (value.maintain !== undefined) role.maintain = value.maintain;
     if (value.destructive !== undefined) role.destructive = value.destructive;
     if (value.impersonate !== undefined) role.impersonate = value.impersonate;
     roles[name] = role;
@@ -244,7 +314,9 @@ function validatePrincipals(raw: unknown, roles: Record<string, Role>): Record<s
  * Resolve a principal to its `Entitlement` — the union of its roles' grants and
  * op booleans. Pure: no I/O, no clock, no globals. A principal's read/write
  * claim lists are the concatenation of every role's grants (union semantics,
- * §8.2); `destructive`/`impersonate` are OR'd across roles.
+ * §8.2); `maintain`/`destructive`/`impersonate` are OR'd across roles.
+ * `destructive` always implies `maintain` (structural admin may also press
+ * the maintenance buttons).
  *
  * `author` is `principal.author` when set. For an OIDC principal with no static
  * author, the front derives `name <email>` from claims and passes it as
@@ -258,6 +330,7 @@ export function compile(policy: Policy, principalId: string, derivedAuthor?: str
   }
   const read: ScopeClaim[] = [];
   const write: ScopeClaim[] = [];
+  let maintain = false;
   let destructive = false;
   let impersonate = false;
   for (const roleName of principal.roles) {
@@ -266,6 +339,7 @@ export function compile(policy: Policy, principalId: string, derivedAuthor?: str
     // hand-built Policy object can't slip an unknown role past compile.
     if (!role)
       throw new PolicyError(`principal "${principalId}" references unknown role "${roleName}"`);
+    if (role.maintain) maintain = true;
     if (role.destructive) destructive = true;
     if (role.impersonate) impersonate = true;
     for (const grant of role.grants) {
@@ -273,11 +347,12 @@ export function compile(policy: Policy, principalId: string, derivedAuthor?: str
       if (grant.write !== undefined) write.push({ repo: grant.repo, paths: grant.write });
     }
   }
+  if (destructive) maintain = true;
   const author = principal.author ?? derivedAuthor;
   if (author === undefined) {
     throw new PolicyError(
       `principal "${principalId}" has no static author and none was derived (OIDC login supplies it)`,
     );
   }
-  return { author, read, write, destructive, impersonate };
+  return { author, read, write, maintain, destructive, impersonate };
 }

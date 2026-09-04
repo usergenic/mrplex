@@ -974,7 +974,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
   {
     name: "links_backfill",
     description:
-      "Rebuild the link index for a repo (after a link-config change, or to repair a missing index).",
+      "Rebuild the link index for a repo (after a link-config change, or to repair a missing index). Requires the maintain entitlement under a policy shell.",
     inputSchema: {
       type: "object",
       properties: { repo: { type: "string" } },
@@ -1010,7 +1010,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
   {
     name: "links_repair",
     description:
-      "Rewrite stale link text in place via optimistic `docs_put`. `dry_run: true` plans only (no writes). Per-document conflicts are skipped, not fatal.",
+      "Rewrite stale link text in place via optimistic `docs_put`. `dry_run: true` plans only (no writes; read entitlement). Live repair requires the maintain entitlement. Per-document conflicts are skipped, not fatal.",
     inputSchema: {
       type: "object",
       properties: { repo: { type: "string" }, dry_run: { type: "boolean" } },

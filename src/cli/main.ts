@@ -14,7 +14,7 @@
  * itself ignores it. serve deliberately bypasses the seam — it IS the server.
  */
 
-import { readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { Command, InvalidArgumentError, Option } from "commander";
 import { parseDocument as parseYamlDocument } from "yaml";
 import type { KernelClient } from "../client/kernel-client.js";
@@ -51,7 +51,14 @@ import {
   saveTokenSet,
 } from "../shell/login.js";
 import { type OidcVerifier, createOidcVerifier } from "../shell/oidc.js";
-import { type Entitlement, PolicyError, compile, loadPolicyFile } from "../shell/policy.js";
+import {
+  type Entitlement,
+  PolicyError,
+  compile,
+  loadPolicyFile,
+  parsePolicy,
+  scaffoldPolicyYaml,
+} from "../shell/policy.js";
 import { startProxyServer } from "../shell/proxy.js";
 import { startShellServer } from "../shell/serve.js";
 import { type StdioCredential, startShellStdio } from "../shell/stdio.js";
@@ -437,7 +444,7 @@ function renderEntitlement(principalId: string, e: Entitlement): string {
   return (
     `principal: ${principalId}\n` +
     `author:    ${e.author}\n` +
-    `destructive: ${e.destructive}   impersonate: ${e.impersonate}\n` +
+    `maintain: ${e.maintain}   destructive: ${e.destructive}   impersonate: ${e.impersonate}\n` +
     `read:\n${claims(e.read)}` +
     `write:\n${claims(e.write)}`
   );
@@ -911,9 +918,9 @@ function buildProgram(): Command {
     });
 
   // -------- key (policy tooling) --------
-  // `key mint` and `policy check` read/edit the policy file by definition, so
-  // they take --policy directly and never touch the serve gate (auth-shell §1
-  // "Policy tooling").
+  // `key mint`, `policy create`, and `policy check` read/edit the policy file
+  // by definition, so they take a file path directly and never touch the serve
+  // gate (auth-shell §1 "Policy tooling").
   const key = program.command("key").description("API-key tooling for the auth shell");
   key
     .command("mint <principal>")
@@ -941,6 +948,45 @@ function buildProgram(): Command {
 
   // -------- policy --------
   const policy = program.command("policy").description("policy-file tooling for the auth shell");
+  policy
+    .command("create [file]")
+    .description("write a starter policy.yaml (admin + maintainer)")
+    .option("--principal <id>", "maintainer principal id (MCP day-to-day)", "local")
+    .option("--force", "overwrite the file if it already exists", false)
+    .action(function (this: Command, file: string | undefined) {
+      const localOpts = this.opts<{ principal: string; force: boolean }>();
+      const gopts = this.optsWithGlobals<GlobalOpts>();
+      try {
+        const path = file ?? "policy.yaml";
+        if (existsSync(path) && !localOpts.force) {
+          const err = new Error(`policy: ${path} already exists (pass --force to overwrite)`);
+          (err as unknown as { code: string }).code = "cli_usage";
+          throw err;
+        }
+        const principal = localOpts.principal;
+        // Reuse the global --author / MRPLEX_AUTHOR (same meaning: write stamp).
+        const author = gopts.author ?? `${principal} <${principal}@localhost>`;
+        const text = scaffoldPolicyYaml({ principal, author });
+        // Refuse to write anything that wouldn't load — scaffold is pure, but
+        // this catches template/option bugs before the operator discovers them.
+        parsePolicy(text);
+        const tmp = `${path}.tmp.${process.pid}`;
+        writeFileSync(tmp, text);
+        renameSync(tmp, path);
+        process.stderr.write(
+          `wrote ${path}\n` +
+            `next: mrplex key mint ${principal} --policy ${path}   # MCP\n` +
+            `      mrplex key mint admin --policy ${path}          # repo create/delete\n` +
+            `      mrplex serve --policy ${path} --database <url>\n`,
+        );
+      } catch (err) {
+        if (err instanceof PolicyError) {
+          process.stderr.write(`policy: ${err.message}\n`);
+          process.exit(1);
+        }
+        reportError(err);
+      }
+    });
   policy
     .command("check [principal]")
     .description("validate a policy file; with a principal, print its effective entitlement")

@@ -7,7 +7,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { PolicyError, compile, parsePolicy } from "./policy.js";
+import { PolicyError, compile, parsePolicy, scaffoldPolicyYaml } from "./policy.js";
 
 const SAMPLE = `
 roles:
@@ -121,6 +121,16 @@ principals:
 `;
     expect(() => parsePolicy(t)).toThrow(/destructive must be a boolean/);
   });
+
+  it("rejects a non-boolean maintain", () => {
+    const t = `
+roles:
+  r: { grants: [], maintain: sometimes }
+principals:
+  a: { author: a, roles: [r] }
+`;
+    expect(() => parsePolicy(t)).toThrow(/maintain must be a boolean/);
+  });
 });
 
 describe("compile", () => {
@@ -132,14 +142,30 @@ describe("compile", () => {
     expect(e.read).toEqual([{ repo: "notes", paths: "**" }]);
     expect(e.write).toEqual([{ repo: "notes", paths: ["drafts/**", "inbox/**"] }]);
     expect(e.destructive).toBe(false);
+    expect(e.maintain).toBe(false);
     expect(e.impersonate).toBe(false);
   });
 
-  it("carries destructive from the operator role", () => {
+  it("carries destructive from the operator role and implies maintain", () => {
     const e = compile(policy, "brendan");
     expect(e.destructive).toBe(true);
+    expect(e.maintain).toBe(true);
     expect(e.read).toEqual([{ repo: "*", paths: "**" }]);
     expect(e.write).toEqual([{ repo: "*", paths: "**" }]);
+  });
+
+  it("carries maintain without destructive", () => {
+    const p = parsePolicy(`
+roles:
+  maintainer:
+    grants: [ { repo: "*", read: "**", write: "**" } ]
+    maintain: true
+principals:
+  m: { author: M, roles: [maintainer] }
+`);
+    const e = compile(p, "m");
+    expect(e.maintain).toBe(true);
+    expect(e.destructive).toBe(false);
   });
 
   it("unions grants across multiple roles", () => {
@@ -198,5 +224,42 @@ principals:
     oidc: { email: a@example.com }
 `);
     expect(() => compile(oidcPolicy, "a")).toThrow(/no static author/);
+  });
+});
+
+describe("scaffoldPolicyYaml", () => {
+  it("renders admin (operator) + maintainer principals", () => {
+    const text = scaffoldPolicyYaml({
+      principal: "brendan",
+      author: "Brendan Baldwin <brendan@example.com>",
+    });
+    const p = parsePolicy(text);
+    expect(Object.keys(p.roles).sort()).toEqual(["maintainer", "operator"]);
+    expect(Object.keys(p.principals).sort()).toEqual(["admin", "brendan"]);
+    expect(p.principals.admin?.roles).toEqual(["operator"]);
+    expect(p.principals.brendan?.roles).toEqual(["maintainer"]);
+    expect(p.principals.brendan?.author).toBe("Brendan Baldwin <brendan@example.com>");
+    expect(compile(p, "brendan")).toMatchObject({
+      maintain: true,
+      destructive: false,
+    });
+    expect(compile(p, "admin")).toMatchObject({
+      maintain: true,
+      destructive: true,
+    });
+  });
+
+  it("rejects an empty principal", () => {
+    expect(() => scaffoldPolicyYaml({ principal: "  ", author: "a" })).toThrow(PolicyError);
+  });
+
+  it("rejects a principal id that is not a YAML bareword", () => {
+    expect(() => scaffoldPolicyYaml({ principal: "bad id", author: "a" })).toThrow(
+      /start with a letter/,
+    );
+  });
+
+  it('rejects principal id "admin"', () => {
+    expect(() => scaffoldPolicyYaml({ principal: "admin", author: "a" })).toThrow(/reserved/);
   });
 });

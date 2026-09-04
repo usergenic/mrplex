@@ -9,7 +9,8 @@
  *     filtering — search ranking, pagination, graph traversal stay kernel-side),
  *   • enforces write policy against the TYPED call arguments using
  *     `entitlement.write` and the engine's own glob dialect,
- *   • gates destructive ops on `entitlement.destructive`,
+ *   • gates maintenance ops (backfill / live repair) on `entitlement.maintain`,
+ *   • gates structural admin ops on `entitlement.destructive`,
  *   • and forwards to the wrapped kernel.
  *
  * The kernel never learns any of this exists. The shell imports only the
@@ -95,6 +96,13 @@ export function guardKernel(kernel: Kernel, entitlement: Entitlement, audit?: Au
 
   function assertDestructive(op: string, repo?: string): void {
     if (!entitlement.destructive) {
+      emit({ op, repo, outcome: "forbidden" });
+      throw forbidden();
+    }
+  }
+
+  function assertMaintain(op: string, repo?: string): void {
+    if (!entitlement.maintain) {
       emit({ op, repo, outcome: "forbidden" });
       throw forbidden();
     }
@@ -203,7 +211,7 @@ export function guardKernel(kernel: Kernel, entitlement: Entitlement, audit?: Au
 
     links: {
       backfill: async (ctx, repo) => {
-        assertDestructive("links.backfill", repo);
+        assertMaintain("links.backfill", repo);
         return forward("links.backfill", { repo }, () =>
           kernel.links.backfill(writeCtx(ctx), repo),
         );
@@ -213,9 +221,9 @@ export function guardKernel(kernel: Kernel, entitlement: Entitlement, audit?: Au
         forward("links.stale", { repo }, () => kernel.links.stale(readCtx(), repo)),
       repair: async (ctx, repo, opts) => {
         const dryRun = opts?.dry_run ?? false;
-        // A live repair mutates docs → destructive. A dry run only plans → a
+        // A live repair mutates docs → maintain. A dry run only plans → a
         // read, bounded by read visibility (which docs the caller may see).
-        if (!dryRun) assertDestructive("links.repair", repo);
+        if (!dryRun) assertMaintain("links.repair", repo);
         const forwardCtx: CallContext = dryRun
           ? { scope: entitlement.read }
           : { author: authorFor(ctx), scope: entitlement.read };
