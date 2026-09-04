@@ -1787,6 +1787,16 @@ function buildProgram(): Command {
       parsePositiveInt,
     )
     .option(
+      "--rescan <ms>",
+      "periodic local rescan to recover dropped fs events (daemon; 0 disables; default max(interval*6, 30000))",
+      parsePositiveInt,
+    )
+    .option(
+      "--poll",
+      "poll the filesystem instead of native change notifications (more robust under load, higher idle cost)",
+      false,
+    )
+    .option(
       "--include <glob>",
       "include glob (default **/*.md); repeat to add more",
       (value: string, prev: string[] | undefined) => [...(prev ?? []), value],
@@ -1805,6 +1815,8 @@ function buildProgram(): Command {
         interval?: number;
         debounce?: number;
         settle?: number;
+        rescan?: number;
+        poll: boolean;
         include?: string[];
         exclude?: string[];
         dryRun: boolean;
@@ -1860,6 +1872,8 @@ function buildProgram(): Command {
           intervalMs: localOpts.interval,
           debounceMs: localOpts.debounce,
           settleMs: localOpts.settle,
+          rescanMs: localOpts.rescan,
+          usePolling: localOpts.poll,
           log: verboseLog,
         });
         const shutdown = async () => {

@@ -19,17 +19,15 @@
  * but the hash gate no-ops them.
  */
 
+import { rm, utimes, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { watch } from "chokidar";
 import type { FSWatcher } from "chokidar";
 import type { KernelClient } from "../client/kernel-client.js";
 import { type SyncCursor, readCursor, sourceFields, writeCursor } from "./cursor.js";
 import { applyFeed } from "./feed.js";
 import { createFsStore } from "./fs-store.js";
-import {
-  type DeferredMap,
-  pathIsHot,
-  retryDeferredEntry,
-} from "./hot-path.js";
+import { type DeferredMap, pathIsHot, retryDeferredEntry } from "./hot-path.js";
 import { isIgnored, readFileIntrinsics } from "./intrinsics.js";
 import { SYNC_DIR, type ScopeFilter, makeScopeFilter, toDocPath } from "./paths.js";
 import { type RemoteMap, pushBurst, pushPath } from "./push.js";
@@ -45,6 +43,25 @@ export type DaemonOptions = {
   intervalMs?: number;
   debounceMs?: number;
   settleMs?: number;
+  /**
+   * Poll the filesystem (stat-based) instead of subscribing to OS change
+   * notifications. Native backends (fsevents on macOS, and to a lesser extent
+   * inotify) can silently *drop* events under CPU load — an event that never
+   * arrives is never pushed. Polling cannot miss a change (it only observes it
+   * up to one interval late), so it is the deterministic choice for tests. The
+   * periodic rescan (`rescanMs`) is the production safety-net for the same loss.
+   */
+  usePolling?: boolean;
+  /** Poll interval when `usePolling` is set (ms). */
+  watchIntervalMs?: number;
+  /**
+   * Interval for a periodic local rescan that recovers watcher losses: a
+   * dropped native fs event means a locally-changed file sits dirty with no
+   * pending push until something else touches it. An idle-gated dirty walk
+   * catches those (clean files no-op via the hash gate). 0 disables it.
+   * Recovers creates/edits only; offline deletes/moves still need a full pass.
+   */
+  rescanMs?: number;
   log?: (msg: string) => void;
 };
 
@@ -68,11 +85,18 @@ export function startDaemon(client: KernelClient, opts: DaemonOptions): Daemon {
   const intervalMs = opts.intervalMs ?? 5000;
   const debounceMs = opts.debounceMs ?? 5000;
   const settleMs = opts.settleMs ?? 0;
+  // Default the safety rescan to a slow multiple of the feed poll — frequent
+  // enough to recover a dropped event within a reasonable window, rare enough
+  // to be negligible when idle (it only stats + hash-checks). 0 disables.
+  const rescanMs = opts.rescanMs ?? Math.max(intervalMs * 6, 30_000);
 
   let stopped = false;
   let watcher: FSWatcher | undefined;
   const pending = new Set<string>();
   let burstTimer: NodeJS.Timeout | undefined;
+  // Timestamp of the last local→remote push activity; the rescan skips when
+  // the watcher is clearly keeping up (recent burst) to stay idle-cheap.
+  let lastPushActivity = 0;
   let cursor = "";
   let existingCursor: SyncCursor | null = null;
   // Serialize all remote-touching work so a poll and a push never interleave a
@@ -165,6 +189,7 @@ export function startDaemon(client: KernelClient, opts: DaemonOptions): Daemon {
         }
         if (pending.size > 0) armBurstTimer();
         if (ready.length > 0) {
+          lastPushActivity = Date.now();
           await pushBurst(ready, { client, store, repo: opts.repo, map, log });
         }
       });
@@ -208,6 +233,7 @@ export function startDaemon(client: KernelClient, opts: DaemonOptions): Daemon {
     // 3. Start the watcher (local → remote).
     watcher = watch(opts.root, {
       ignoreInitial: true,
+      ...(opts.usePolling ? { usePolling: true, interval: opts.watchIntervalMs ?? 50 } : {}),
       // Prune the sync state dir; the scope filter still guards everything else.
       ignored: (p: string) => p.includes(`/${SYNC_DIR}/`) || p.endsWith(`/${SYNC_DIR}`),
       ...(settleMs > 0
@@ -224,13 +250,20 @@ export function startDaemon(client: KernelClient, opts: DaemonOptions): Daemon {
       if (docPath !== null) schedulePush(docPath);
     };
     watcher.on("add", onEvent).on("change", onEvent).on("unlink", onEvent);
-    // Wait for the initial scan to finish so events aren't missed right after
-    // ready resolves (chokidar only watches reliably once it emits `ready`).
     const w = watcher;
     await new Promise<void>((resolve) => w.once("ready", () => resolve()));
+    // chokidar's `ready` fires before the OS watch is guaranteed to be armed
+    // (notably fsevents on macOS): a file written in that gap is silently
+    // dropped and never pushed until the next full pass. Prove the stream is
+    // actually live by writing a sentinel and waiting until chokidar reports
+    // it — a definite signal rather than a fixed sleep. The sentinel is a
+    // root dotfile: the watcher sees it (its `ignored` only prunes SYNC_DIR)
+    // but scope excludes dot-segments, so it never schedules a push.
+    if (!stopped) await confirmWatcherArmed(w, opts.root);
 
-    // 4. Start the remote → local poll loop.
+    // 4. Start the remote → local poll loop and the local rescan safety-net.
     void pollLoop();
+    if (rescanMs > 0) void rescanLoop();
   })();
 
   async function pollLoop(): Promise<void> {
@@ -248,6 +281,33 @@ export function startDaemon(client: KernelClient, opts: DaemonOptions): Daemon {
     }
   }
 
+  /**
+   * Safety-net for dropped native fs events (§4.6 is stat-based per path, so a
+   * re-walk is authoritative). A native backend can silently lose an event
+   * under load, leaving a locally-changed file dirty with no scheduled push;
+   * the next witness might not come until the user touches it again. A periodic
+   * local dirty walk recovers those: clean files no-op via the hash gate, so an
+   * idle vault costs only a stat + hash per file. Skipped while the watcher is
+   * demonstrably keeping up (a burst within the last interval) and while a burst
+   * is pending, so it never contends with live event handling.
+   */
+  async function rescanLoop(): Promise<void> {
+    while (!stopped) {
+      await sleep(rescanMs);
+      if (stopped) break;
+      if (pending.size > 0 || burstTimer) continue;
+      if (Date.now() - lastPushActivity < rescanMs) continue;
+      await serialize(async () => {
+        if (stopped || pending.size > 0) return;
+        try {
+          await localDirtyWalk();
+        } catch (err) {
+          log(`rescan error\t${(err as Error).message}`);
+        }
+      });
+    }
+  }
+
   return {
     ready,
     async stop() {
@@ -259,6 +319,53 @@ export function startDaemon(client: KernelClient, opts: DaemonOptions): Daemon {
       await chain.catch(() => {});
     },
   };
+}
+
+/**
+ * Block until the watcher demonstrably delivers a filesystem event, so a caller
+ * can trust that subsequent writes will be observed. chokidar's `ready` only
+ * means the initial scan finished, not that the OS notifier is armed — on
+ * fsevents there is a window after `ready` where events are dropped, which under
+ * load silently loses the first local write. We close that window empirically:
+ * touch a sentinel and wait for chokidar to report it, re-touching periodically
+ * in case an early write raced the arming. Bounded so startup never hangs; if
+ * the notifier is genuinely that slow the poll loop's reconcile still catches up.
+ */
+async function confirmWatcherArmed(
+  watcher: FSWatcher,
+  root: string,
+  opts: { timeoutMs?: number; retouchMs?: number } = {},
+): Promise<void> {
+  const timeoutMs = opts.timeoutMs ?? 5000;
+  const retouchMs = opts.retouchMs ?? 100;
+  const sentinel = join(root, ".mrplex-arming-probe");
+  let seen = false;
+  const onAll = (_event: string, abs: string): void => {
+    if (abs === sentinel) seen = true;
+  };
+  watcher.on("all", onAll);
+
+  const touch = async (): Promise<void> => {
+    try {
+      const now = new Date();
+      await writeFile(sentinel, "arming\n", "utf8");
+      await utimes(sentinel, now, now);
+    } catch {
+      /* best-effort; a failed touch just means we retry or time out */
+    }
+  };
+
+  const deadline = Date.now() + timeoutMs;
+  try {
+    await touch();
+    while (!seen && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, retouchMs));
+      if (!seen) await touch();
+    }
+  } finally {
+    watcher.off("all", onAll);
+    await rm(sentinel, { force: true }).catch(() => {});
+  }
 }
 
 /** Seed the in-memory map from the local files' embedded provenance (§4.2). */

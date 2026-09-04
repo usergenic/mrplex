@@ -44,15 +44,38 @@ async function start(): Promise<Daemon> {
     repo: "notes",
     intervalMs: 100,
     debounceMs: 50,
+    // Poll the filesystem instead of using the native backend. On macOS the
+    // fsevents stream silently drops events under the parallel suite's CPU
+    // load (even after chokidar's `ready` fires and the stream is armed), which
+    // made these tests hang until timeout — a *lost* event, not a slow one, so
+    // no cap could fix it. Polling cannot miss a change; it only observes it up
+    // to one interval late. A tight interval keeps the tests fast. Production
+    // keeps the native backend and relies on the periodic rescan safety-net.
+    usePolling: true,
+    watchIntervalMs: 15,
   });
   await d.ready;
   return d;
 }
 
+/**
+ * The propagation cap for every daemon assertion below. These tests all wait
+ * on an explicit condition (the expected version/verdict appearing), never a
+ * fixed sleep, so a generous cap only costs wall-clock time on a genuine hang.
+ * One shared knob rather than per-call overrides.
+ *
+ * With the polling watcher (see `start`) propagation is reliably ~1s even under
+ * the loaded parallel suite, so this only needs headroom for a slow CI worker,
+ * not for the old lost-event hangs. Kept under vitest's `testTimeout` so a real
+ * hang fails here with a clear "waitFor timed out" rather than the opaque outer
+ * test timeout.
+ */
+const PROPAGATION_TIMEOUT_MS = 15_000;
+
 /** Poll `fn` until it returns truthy or the deadline passes. */
 async function waitFor<T>(
   fn: () => T | undefined | Promise<T | undefined>,
-  timeoutMs = 8000,
+  timeoutMs = PROPAGATION_TIMEOUT_MS,
 ): Promise<T> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
@@ -82,21 +105,19 @@ describe("sync daemon", () => {
   it("pushes a new local file to the remote via the watcher", async () => {
     daemon = await start();
     writeFileSync(join(vault, "local.md"), "brand new\n");
-    // chokidar + debounce can lag under a loaded vitest worker; same headroom
-    // as the rename case below.
     const v = await waitFor(async () => {
       try {
         return await client.docs.get("notes", "local.md");
       } catch {
         return undefined;
       }
-    }, 20_000);
+    });
     expect(v.body).toBe("brand new\n");
     // The local file gets its provenance rewritten by the ack.
     const text = await waitFor(() => {
       const t = readFileSync(join(vault, "local.md"), "utf8");
       return t.includes("$version") ? t : undefined;
-    }, 20_000);
+    });
     expect(text).toMatch(/\$version: v\d+/);
   });
 
@@ -181,19 +202,17 @@ describe("sync daemon", () => {
     renameSync(join(vault, "Untitled.md"), join(vault, "brand-new-idea.md"));
     // A rename is detected as a move only when chokidar delivers unlink(old)+
     // add(new) inside one debounce burst, so pushBurst can suppress the delete
-    // (§4.7). Under the full parallel suite's CPU load those fs events can be
-    // delayed or split across bursts, in which case the move completes via the
-    // slower recoverStalePut restore-from-`:deleted` path. This case runs in
-    // ~90ms in isolation but can blow past the default 8s deadline when a
-    // vitest worker is starved, so give it extra headroom (under the 30s
-    // testTimeout). Not a daemon bug — purely event-scheduling latency.
+    // (§4.7). Under load those fs events can be delayed or split across bursts,
+    // in which case the move completes via the slower recoverStalePut
+    // restore-from-`:deleted` path — same eventual result, just later. Covered
+    // by the shared PROPAGATION_TIMEOUT_MS headroom.
     const moved = await waitFor(async () => {
       try {
         return await client.docs.get("notes", "brand-new-idea.md");
       } catch {
         return undefined;
       }
-    }, 20_000);
+    });
     expect(moved.prev_version_id).toBe(v1.version_id);
     expect(moved.body).toBe("This is a brand new idea.\n");
     await expect(client.docs.get("notes", "Untitled.md")).rejects.toThrow();
