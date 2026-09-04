@@ -175,6 +175,8 @@ The CLI, the MCP server, and the REST API are three doors into the same store. F
 
 `--unsafe` runs the store with no authentication — every caller has full access. That's an acceptable choice for a private database file on your own machine, and the wrong choice for anything reachable over a network. The next section is what you use instead — when more than one principal is involved, or when you want to guard against a destructive agent mishap.
 
+For **remote** clients that only speak HTTPS MCP (ChatGPT custom connectors, Grok, and similar), run `mrplex serve --policy` on a public host and point the connector at `/mcp`. Connectors that cannot set an `Authorization` header can put the API key in the URL instead: `https://host/k/<token>/mcp`. A full walkthrough — including a [zo.computer](https://www.zo.computer) Services setup — is in [docs/remote-http-mcp.md](docs/remote-http-mcp.md).
+
 ## Access control
 
 When you need real principals — say, an agent that may read and write documents, plus a separate admin identity that can create and delete repos — mrplex generates a starter policy and signing keys for you, so there's no YAML to write by hand:

@@ -157,6 +157,9 @@ fronting proxy scrubs `/k/<token>` from its access logs (or don't log paths). A
 leaked path-token is a leaked key: rotate it with `key mint` and drop the old
 hash from the policy.
 
+Operator walkthrough (zo.computer + ChatGPT connectors):
+[../remote-http-mcp.md](../remote-http-mcp.md).
+
 ## Deployment shapes
 
 ### Embedded (primary) — `mrplex serve --policy policy.yaml`
