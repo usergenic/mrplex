@@ -989,7 +989,15 @@ export function runKernelSuite(factory: AdapterFactory): void {
         const actor = await aliceActor();
         try {
           await kernel.repos.set_link_config(actor, "notes", {
-            body: { inline: "nope" as unknown as boolean },
+            // A tier override replaces its syntaxes wholesale, so all keys are
+            // present; `inline` carries a non-boolean the validator must reject.
+            body: {
+              inline: "nope" as unknown as boolean,
+              reference: true,
+              autolink: true,
+              wikilink: true,
+              fullpath: true,
+            },
           });
           throw new Error("expected throw");
         } catch (err) {

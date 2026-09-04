@@ -1,6 +1,7 @@
 /**
- * HTTP embedding hook (--embed-url). POST { chunks: string[] } → the
- * contract response (design §5.3, m4-plan §5 decision 1).
+ * HTTP embedding hook — the http(s):// form of `--embedder`. POST
+ * { chunks: string[] } → the contract response (design §5.3, m4-plan §5
+ * decision 1).
  *
  * Uses Node ≥ 20's built-in fetch — no dep. Timeout defaults to 30s;
  * anything longer usually means the operator wants a subprocess hook.

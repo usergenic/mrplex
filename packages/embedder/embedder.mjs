@@ -16,7 +16,7 @@
  * on CPU via ONNX; no GPU or separate service required.
  */
 
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { createInterface } from "node:readline";
 import { dirname, join } from "node:path";
@@ -105,6 +105,15 @@ if (!model) {
   console.error(
     `embedder: unknown --model '${modelKey}'. known: ${Object.values(EmbeddingModel).join(", ")}`,
   );
+  process.exit(2);
+}
+
+// fastembed's own cache mkdir is not recursive — create the full path here so
+// a machine without ~/.cache/mrplex yet doesn't crash on first run.
+try {
+  mkdirSync(cacheDir, { recursive: true });
+} catch (err) {
+  console.error(`embedder: cannot create cache dir '${cacheDir}': ${err.message}`);
   process.exit(2);
 }
 

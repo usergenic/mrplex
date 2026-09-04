@@ -4,9 +4,10 @@
  *   embed(chunks: string[]) → { vectors: number[][], model: string, dim: int }
  *
  * mrplex does NOT call any provider itself: the operator wires a hook
- * that speaks this contract. m4-plan ships two shapes: HTTP endpoint
- * (--embed-url) and long-lived subprocess with JSON-lines over stdio
- * (--embed-cmd). In-process plugin is deferred (m4-plan §5 decision 1).
+ * that speaks this contract via `--embedder`. Two shapes ship: an HTTP
+ * endpoint (an `http(s)://` value) and a long-lived subprocess with
+ * JSON-lines over stdio (any other value). In-process plugin is deferred
+ * (m4-plan §5 decision 1).
  *
  * Contract-validation happens here so every shape gets the same
  * checks: batch alignment, per-vector dim, non-empty model. A single

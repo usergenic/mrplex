@@ -1,8 +1,8 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  parseEmbedderSpec,
-  resolveEmbedConfig,
-} from "./config.js";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { parseEmbedderSpec, resolveEmbedConfig } from "./config.js";
 
 describe("parseEmbedderSpec", () => {
   it("treats http(s):// as HTTP hooks", () => {
@@ -37,51 +37,67 @@ describe("parseEmbedderSpec", () => {
 });
 
 describe("resolveEmbedConfig", () => {
-  const env = process.env;
+  const savedEnv = process.env;
+  let configDir: string;
 
   beforeEach(() => {
-    vi.resetModules();
-    process.env = { ...env };
-    delete process.env.MRPLEX_EMBEDDER;
-    delete process.env.MRPLEX_EMBED_URL;
-    delete process.env.MRPLEX_EMBED_CMD;
+    configDir = mkdtempSync(join(tmpdir(), "mrplex-embed-config-"));
+    // Hermetic setup, two ways. (1) Point the CLI config loader at an empty dir
+    // so the host machine's ~/.config/mrplex/config.json — which may set
+    // `embedder` — can't leak in; loadConfig() reads configPath() fresh on each
+    // call and configPath() honors XDG_CONFIG_HOME. (2) Drop any inherited
+    // MRPLEX_EMBEDDER (rebuilt per test rather than deleted).
+    const { MRPLEX_EMBEDDER: _drop, ...rest } = savedEnv;
+    process.env = { ...rest, XDG_CONFIG_HOME: configDir };
   });
 
   afterEach(() => {
-    process.env = env;
+    process.env = savedEnv;
+    rmSync(configDir, { recursive: true, force: true });
   });
 
-  it("errors when --embedder is combined with a legacy flag", () => {
-    expect(() =>
-      resolveEmbedConfig({
-        embedder: "mrplex-embedder",
-        embed_url: "http://127.0.0.1:1",
-      }),
-    ).toThrow(/mutually exclusive/);
+  /** Write a CLI config.json into the isolated XDG dir. */
+  function writeConfig(cfg: Record<string, unknown>): void {
+    const dir = join(configDir, "mrplex");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "config.json"), JSON.stringify(cfg));
+  }
+
+  it("returns { kind: none } when nothing is configured", () => {
+    expect(resolveEmbedConfig({})).toEqual({ kind: "none" });
   });
 
-  it("errors when multiple source kinds are configured", () => {
-    expect(() =>
-      resolveEmbedConfig({
-        embed_url: "http://127.0.0.1:8399",
-        embed_cmd: "mrplex-embedder",
-      }),
-    ).toThrow(/mutually exclusive/);
-  });
-
-  it("still resolves legacy url and cmd inputs", () => {
-    expect(resolveEmbedConfig({ embed_url: "http://127.0.0.1:8399" })).toEqual({
-      kind: "http",
-      url: "http://127.0.0.1:8399",
-    });
-    expect(resolveEmbedConfig({ embed_cmd: "mrplex-embedder" })).toEqual({
+  it("resolves an explicit --embedder command input", () => {
+    expect(resolveEmbedConfig({ embedder: "mrplex-embedder" })).toEqual({
       kind: "cmd",
       command: "mrplex-embedder",
+    });
+  });
+
+  it("resolves an explicit --embedder http(s):// input", () => {
+    expect(resolveEmbedConfig({ embedder: "http://127.0.0.1:8399" })).toEqual({
+      kind: "http",
+      url: "http://127.0.0.1:8399",
     });
   });
 
   it("reads MRPLEX_EMBEDDER from the environment", () => {
     process.env.MRPLEX_EMBEDDER = "mrplex-embedder";
     expect(resolveEmbedConfig({})).toEqual({ kind: "cmd", command: "mrplex-embedder" });
+  });
+
+  it("falls back to the CLI config file's embedder", () => {
+    writeConfig({ embedder: "http://embed.example.com" });
+    expect(resolveEmbedConfig({})).toEqual({ kind: "http", url: "http://embed.example.com" });
+  });
+
+  it("precedence: input beats env beats config file", () => {
+    writeConfig({ embedder: "from-config" });
+    process.env.MRPLEX_EMBEDDER = "from-env";
+    expect(resolveEmbedConfig({})).toEqual({ kind: "cmd", command: "from-env" });
+    expect(resolveEmbedConfig({ embedder: "from-input" })).toEqual({
+      kind: "cmd",
+      command: "from-input",
+    });
   });
 });

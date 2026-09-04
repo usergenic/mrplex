@@ -1,5 +1,5 @@
 /**
- * CLI embed backfill repo-resolution regression (embed-cmd fix).
+ * CLI embed backfill repo-resolution regression.
  *
  * `embed backfill` used to redeclare `-r, --repo` as a subcommand
  * requiredOption on top of the root program's global -r, which in
@@ -62,7 +62,7 @@ describe("cli embed backfill repo resolution", () => {
       "notes",
       "embed",
       "backfill",
-      "--embed-cmd",
+      "--embedder",
       `node ${STUB} --stdio`,
     ]);
     // The regression: parse used to fail before ever reaching the action.
@@ -73,7 +73,7 @@ describe("cli embed backfill repo resolution", () => {
   });
 
   it("resolves the repo from MRPLEX_REPO when no flag is given", () => {
-    const out = run(["--json", "embed", "backfill", "--embed-cmd", `node ${STUB} --stdio`], {
+    const out = run(["--json", "embed", "backfill", "--embedder", `node ${STUB} --stdio`], {
       MRPLEX_REPO: "notes",
     });
     expect(out.stderr).not.toMatch(/required option '-r, --repo/);
@@ -81,7 +81,7 @@ describe("cli embed backfill repo resolution", () => {
   });
 
   it("emits the shared friendly error when no repo source is set", () => {
-    const out = run(["embed", "backfill", "--embed-cmd", `node ${STUB} --stdio`]);
+    const out = run(["embed", "backfill", "--embedder", `node ${STUB} --stdio`]);
     expect(out.status).toBe(1);
     expect(out.stderr).toMatch(/no repo/);
     expect(out.stderr).toMatch(/MRPLEX_REPO/);

@@ -247,9 +247,39 @@ async function resolveLocalPath(
     return { path, verdict: "push", detail: "local creation" };
   }
 
-  // Embedded version exists but the document is no longer live at this path and
-  // isn't known elsewhere → it was remotely deleted. Clean removes locally;
-  // dirty resurrects (push as create). Never discard dirty bytes (§4.9 edge).
+  // An embedded `$version` is present, yet no live doc sits at this path and the
+  // version is not the current of a doc elsewhere. Two very different worlds
+  // collapse here, and only the store can tell them apart:
+  //
+  //   • The version resolves in THIS repo, at THIS path → the document was
+  //     genuinely deleted. Deletes are moves to `:deleted/…` with history
+  //     retained (§3.4), so the historical version still resolves. Clean removes
+  //     locally; dirty resurrects. Never discard dirty bytes (§4.9 edge).
+  //   • The version does NOT resolve → the intrinsics are FOREIGN: this file was
+  //     stamped against a different database (or repo). `docs.get_version`
+  //     throws `version_not_found` for an unknown id AND for a repo mismatch, so
+  //     a fresh store rejects every id another store issued. Treat the file
+  //     exactly like a clean local copy lacking provenance (row 7) and adopt it
+  //     as a local creation. Deleting on the strength of provenance this
+  //     database never issued is the data-loss footgun this branch used to be.
+  if (!(await versionDeletedHere(client, opts.repo, intr.version, path))) {
+    if (!dryRun) {
+      return await pushCreate(
+        client,
+        store,
+        opts.repo,
+        path,
+        "push",
+        "provenance not from this database; adopted as local creation",
+      );
+    }
+    return {
+      path,
+      verdict: "push",
+      detail: "provenance not from this database; adopted as local creation",
+    };
+  }
+
   if (!dirty) {
     if (!dryRun) await store.remove(path);
     return { path, verdict: "delete-local", detail: "remote-deleted, local clean" };
@@ -265,6 +295,32 @@ async function resolveLocalPath(
     );
   }
   return { path, verdict: "resurrect", detail: "remote-deleted, local dirty" };
+}
+
+/**
+ * True when `versionId` genuinely resolves to a version of THIS repo that lived
+ * at `path` — the fingerprint of a real deletion, since history survives the
+ * move to `:deleted/…` (§3.4). False when the id is unknown here or belongs to
+ * another repo/database: `docs.get_version` throws `version_not_found` both for
+ * a malformed/unknown id and for a repo mismatch, which is exactly the signal
+ * that the file's `$version` is foreign. A version that resolves but at a
+ * DIFFERENT path is not this file's deletion either (a cross-store id
+ * collision), so it counts as foreign too — the safe verdict is to keep the
+ * bytes, never to delete.
+ */
+async function versionDeletedHere(
+  client: KernelClient,
+  repo: string,
+  versionId: string,
+  path: string,
+): Promise<boolean> {
+  try {
+    const v = await client.docs.get_version(repo, versionId);
+    return v.path === path;
+  } catch (err) {
+    if (err instanceof KernelError && err.code === "version_not_found") return false;
+    throw err;
+  }
 }
 
 // --- effecting helpers -------------------------------------------------------

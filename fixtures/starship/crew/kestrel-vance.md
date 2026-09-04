@@ -6,8 +6,6 @@ species: human
 status: active
 related:
   - /missions/the-silent-beacon.md
-$version: v5
-$content_hash: 702ce4884807e416e2155092bd48d190e0df13fead04f64fc6d1b35db7f5b4df
 ---
 
 # Captain Kestrel Vance

@@ -7,8 +7,6 @@ status: missing
 reports_to: /crew/aria-okonkwo.md
 related:
   - /encounters/the-hollow-signal.md
-$version: v7
-$content_hash: ff95a19d912a0d371e2a42f7e4e4f2ea8b4b109946bfe535c64f57eccda36831
 ---
 
 # Lieutenant Soren Halloway

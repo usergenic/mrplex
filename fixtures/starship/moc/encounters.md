@@ -1,8 +1,6 @@
 ---
 title: MOC — Encounter Catalog
 type: moc
-$version: v28
-$content_hash: 60ae8ce0321d55f7e128d811bdfd095256532c552e7243e28d9be26c512d12ac
 ---
 
 # Encounter Catalog

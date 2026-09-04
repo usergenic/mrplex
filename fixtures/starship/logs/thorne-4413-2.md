@@ -4,8 +4,6 @@ type: log
 stardate: 4413.2
 author: /crew/dax-thorne.md
 mission: /missions/the-cinder-run.md
-$version: v20
-$content_hash: 21adcef8bbab4d17bdbc9cf43a01f6454fb2f774c10944ceb7a753ed8e6fa134
 ---
 
 # Engineering Log — Thorne, 4413.2

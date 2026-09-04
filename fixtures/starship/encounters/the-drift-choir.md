@@ -5,8 +5,6 @@ classification: intelligence
 threat_level: unknown
 stardate: 4419.0
 mission: /missions/the-drift-choir.md
-$version: v8
-$content_hash: fb36e75a43c96b0a908ae561c96a294bd9bf1a3fb07f83974e97089b35d434ae
 ---
 
 # The Drift Choir

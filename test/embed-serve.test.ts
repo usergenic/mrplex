@@ -116,7 +116,7 @@ describe("serve + embed worker (end-to-end)", () => {
     }
   }, 15000);
 
-  it("--embed-cmd subprocess drives the worker end-to-end and is reaped on close", async () => {
+  it("subprocess (cmd) embedder drives the worker end-to-end and is reaped on close", async () => {
     // Regression coverage for the review's test-gap note: the HTTP hook
     // has an E2E test but the subprocess hook did not. We drive serve
     // with the stub embedder in --stdio mode, verify a REST-driven

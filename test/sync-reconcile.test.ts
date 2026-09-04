@@ -233,6 +233,80 @@ describe("reconcile — row 8 (offline move)", () => {
   // reproducible in a serial test (same shape as the create_conflict downgrade).
 });
 
+describe("reconcile — foreign intrinsics (data-loss regression)", () => {
+  it("a clean file stamped by ANOTHER database is adopted, never delete-local", async () => {
+    // Stamp a file against a separate database, then sync it against the fresh
+    // `notes` db. Its $version/$content_hash are valid *there*, unknown *here* —
+    // the README-quickstart footgun that used to delete every fixture file.
+    const other = await openLocalClient({ database: "sqlite::memory:", context: {} });
+    await other.repos.create("notes");
+    await other.docs.create("notes", "away.md", { body: "made elsewhere\n", frontmatter_raw: "" });
+    const foreignText = renderInjected(await other.docs.get("notes", "away.md"));
+    await other.close();
+
+    // Sanity: the file really is clean (computed hash == embedded hash), which
+    // is the branch that deleted; a dirty file would merely have resurrected.
+    expect(foreignText).toContain("$version:");
+
+    const store = memStore({ "away.md": foreignText });
+    const report = await reconcile(store);
+
+    expect(verdictFor(report, "away.md")).toBe("push");
+    // File survives on disk and its bytes are intact.
+    expect(store.files.has("away.md")).toBe(true);
+    expect(store.files.get("away.md")).toContain("made elsewhere");
+    // It was adopted into THIS database and re-stamped with a local version.
+    const here = await client.docs.get("notes", "away.md");
+    expect(here.body).toBe("made elsewhere\n");
+    expect(store.files.get("away.md")).toContain(`$version: ${here.version_id}`);
+  });
+
+  it("dry-run reports the foreign file as push, deletes nothing", async () => {
+    const other = await openLocalClient({ database: "sqlite::memory:", context: {} });
+    await other.repos.create("notes");
+    await other.docs.create("notes", "away.md", { body: "elsewhere\n", frontmatter_raw: "" });
+    const foreignText = renderInjected(await other.docs.get("notes", "away.md"));
+    await other.close();
+
+    const store = memStore({ "away.md": foreignText });
+    const report = await reconcile(store, true);
+    expect(verdictFor(report, "away.md")).toBe("push");
+    expect(store.files.has("away.md")).toBe(true);
+    await expect(client.docs.get("notes", "away.md")).rejects.toThrow();
+  });
+
+  it("a foreign $version that collides with a superseded local id is still adopted", async () => {
+    // The dangerous case the path check guards: as a fresh sync walks a folder
+    // it mints v1, v2, … so a later foreign file's embedded id can resolve here
+    // — but to a DIFFERENT document. A collision with a *superseded* version
+    // (not a live current, so move-detection misses it) lands in this branch;
+    // resolving-but-at-another-path must NOT read as this file's deletion.
+    const v1 = await client.docs.create("notes", "unrelated.md", {
+      body: "first\n",
+      frontmatter_raw: "",
+    });
+    // Advance unrelated.md so v1 is superseded (its current is now v2).
+    await client.docs.put("notes", v1.version_id, "unrelated.md", {
+      body: "second\n",
+      frontmatter_raw: "",
+    });
+    // Craft a clean file at collide.md whose $version equals the superseded v1.
+    const body = "collision body\n";
+    const withoutHash = `---\n$version: ${v1.version_id}\n---\n${body}`;
+    const hash = contentHashOfFile(withoutHash);
+    const collided = `---\n$version: ${v1.version_id}\n$content_hash: ${hash}\n---\n${body}`;
+
+    const store = memStore({ "collide.md": collided });
+    const report = await reconcile(store);
+
+    expect(verdictFor(report, "collide.md")).toBe("push");
+    expect(store.files.has("collide.md")).toBe(true);
+    // Both documents exist independently; nothing was deleted.
+    expect((await client.docs.get("notes", "collide.md")).body).toBe(body);
+    expect((await client.docs.get("notes", "unrelated.md")).body).toBe("second\n");
+  });
+});
+
 describe("reconcile + feed handoff", () => {
   it("a doc that advances after R is delivered by the feed, not duplicated", async () => {
     const v1 = await client.docs.create("notes", "a.md", { body: "one\n", frontmatter_raw: "" });

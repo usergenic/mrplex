@@ -4,8 +4,6 @@ type: equipment
 status: offline
 deck: 5
 maintainer: /crew/dax-thorne.md
-$version: v15
-$content_hash: 1550e644bb48f3dfeeafc9894af2d6f2f29b9afcb47cbb0c3317935360ba2783
 ---
 
 # Shuttle Corvid

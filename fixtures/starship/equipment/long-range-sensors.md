@@ -4,8 +4,6 @@ type: equipment
 status: operational
 deck: 2
 maintainer: /crew/isolde-marsh.md
-$version: v13
-$content_hash: 33e701e42b319a9052bd07e32bbe4869b555d1121ff17d9364985035c2f11d8e
 ---
 
 # Long-Range Sensor Array

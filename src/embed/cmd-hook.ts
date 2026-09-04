@@ -1,7 +1,7 @@
 /**
- * Subprocess embedding hook (--embed-cmd). Spawns a long-lived process
- * once; writes one JSON line per batch to stdin; reads one JSON line
- * back from stdout (design §5.3, m4-plan §5 decision 1).
+ * Subprocess embedding hook — the command form of `--embedder`. Spawns a
+ * long-lived process once; writes one JSON line per batch to stdin; reads one
+ * JSON line back from stdout (design §5.3, m4-plan §5 decision 1).
  *
  * Stderr passes through to the server log; the hook doesn't parse it.
  *

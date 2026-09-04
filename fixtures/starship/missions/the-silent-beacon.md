@@ -8,8 +8,6 @@ commander: /crew/kestrel-vance.md
 crew:
   - /crew/isolde-marsh.md
   - /crew/dax-thorne.md
-$version: v26
-$content_hash: 26b28f7ac3400c8e46bf7d32237443a89e2086c46deb7eed8931a2717d7c6e74
 ---
 
 # The Silent Beacon

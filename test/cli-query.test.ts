@@ -22,13 +22,25 @@ let storage: Storage;
 let notesRepoId: number;
 
 function run(...args: string[]): { stdout: string; stderr: string; status: number } {
-  const { MRPLEX_EMBEDDER: _ignored, ...parentEnv } = process.env as Record<string, string>;
+  return runWithEnv({}, ...args);
+}
+
+function runWithEnv(
+  extraEnv: Record<string, string>,
+  ...args: string[]
+): { stdout: string; stderr: string; status: number } {
+  const {
+    MRPLEX_EMBEDDER: _ignoredEmbedder,
+    MRPLEX_REPO: _ignoredRepo,
+    ...parentEnv
+  } = process.env as Record<string, string>;
   const res = spawnSync("node", ["--import", "tsx", CLI, "--database", dbUrl, ...args], {
     cwd: REPO_ROOT,
     encoding: "utf8",
     env: {
       ...parentEnv,
       XDG_CONFIG_HOME: workDir,
+      ...extraEnv,
     },
   });
   return { stdout: res.stdout, stderr: res.stderr, status: res.status ?? 1 };
@@ -228,7 +240,7 @@ describe("cli query", () => {
 
   it("--embedder enables semantic search in local mode", async () => {
     const embedCmd = `node ${STUB} --stdio`;
-    const backfill = run("--json", "-r", "notes", "embed", "backfill", "--embed-cmd", embedCmd);
+    const backfill = run("--json", "-r", "notes", "embed", "backfill", "--embedder", embedCmd);
     expect(backfill.status).toBe(0);
 
     const out = run(
@@ -238,11 +250,56 @@ describe("cli query", () => {
       "notes",
       "--semantic",
       "welcome",
-      "--embed-cmd",
+      "--embedder",
       embedCmd,
     );
     expect(out.status).toBe(0);
     const results = JSON.parse(out.stdout) as { $path: string }[];
     expect(results.map((r) => r.$path)).toContain("welcome.md");
+  });
+});
+
+describe("cli query repo scoping", () => {
+  it("unscoped with no default errors instead of searching every repo", () => {
+    const out = run("query", "--text", "welcome");
+    expect(out.status).not.toBe(0);
+    expect(out.stderr).toMatch(/query needs a repo/);
+  });
+
+  it("unscoped falls back to the MRPLEX_REPO default", () => {
+    const out = runWithEnv({ MRPLEX_REPO: "notes" }, "--json", "query", "--text", "welcome");
+    expect(out.status).toBe(0);
+    const results = JSON.parse(out.stdout) as { $path: string }[];
+    expect(results.map((r) => r.$path)).toContain("welcome.md");
+  });
+
+  it("unscoped falls back to the config-file default (config set-repo)", () => {
+    expect(run("config", "set-repo", "notes").status).toBe(0);
+    const out = run("--json", "query", "--text", "welcome");
+    expect(out.status).toBe(0);
+    const results = JSON.parse(out.stdout) as { $path: string }[];
+    expect(results.map((r) => r.$path)).toContain("welcome.md");
+  });
+
+  it("a wildcard MRPLEX_REPO default is refused", () => {
+    const out = runWithEnv({ MRPLEX_REPO: "*" }, "query", "--text", "welcome");
+    expect(out.status).not.toBe(0);
+    expect(out.stderr).toMatch(/passed explicitly with -r/);
+  });
+
+  it("config set-repo refuses a wildcard", () => {
+    const out = run("config", "set-repo", "*");
+    expect(out.status).not.toBe(0);
+    expect(out.stderr).toMatch(/never set as the default/);
+  });
+
+  it("-r '*' typed at the call site searches every repo", () => {
+    const local = run("--json", "query", "-r", "*", "--text", "welcome");
+    expect(local.status).toBe(0);
+    const results = JSON.parse(local.stdout) as { $path: string }[];
+    expect(results.map((r) => r.$path)).toContain("welcome.md");
+
+    const global = run("--json", "--repo", "*", "query", "--text", "welcome");
+    expect(global.status).toBe(0);
   });
 });

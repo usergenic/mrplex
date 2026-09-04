@@ -5,8 +5,6 @@ classification: artifact
 threat_level: none
 stardate: 4411.2
 mission: /missions/the-silent-beacon.md
-$version: v10
-$content_hash: cfba8124e04711e4134b67e8256fbd29329241d5e53d7d803270f165e4cabfbf
 ---
 
 # The Wandering Buoy

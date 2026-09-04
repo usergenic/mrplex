@@ -1,6 +1,4 @@
 ---
-$version: v30
-$content_hash: bc08bdb28445c0cc3547c899ece402842ef762ad5761a85dc5352056748cc342
 ---
 # USS Meridian — Ship's Knowledge Base
 

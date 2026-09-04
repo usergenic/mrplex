@@ -8,8 +8,6 @@ commander: /crew/aria-okonkwo.md
 crew:
   - /crew/soren-halloway.md
   - /crew/quill-vasquez.md
-$version: v25
-$content_hash: 42fb93f01980584ebf4279a19e29967b6c7ad3beb36836b974cf5c7e9b751938
 ---
 
 # The Hollow Signal

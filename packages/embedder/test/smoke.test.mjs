@@ -16,7 +16,9 @@ import { describe, it, before, after } from "node:test";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const EMBEDDER = join(ROOT, "embedder.mjs");
-const TEST_CACHE = mkdtempSync(join(tmpdir(), "mrplex-embedder-test-"));
+// Deliberately not created: the embedder must mkdir -p the cache path itself
+// (v0.1.3 crashed when the parent dirs were missing).
+const TEST_CACHE = join(mkdtempSync(join(tmpdir(), "mrplex-embedder-test-")), "nested", "cache");
 const EMBEDDER_ENV = { ...process.env, MRPLEX_EMBEDDER_CACHE: TEST_CACHE };
 const require = createRequire(import.meta.url);
 

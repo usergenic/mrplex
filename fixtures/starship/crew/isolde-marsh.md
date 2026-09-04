@@ -7,8 +7,6 @@ status: active
 reports_to: /crew/aria-okonkwo.md
 related:
   - /encounters/the-drift-choir.md
-$version: v4
-$content_hash: 6fa8a874558c73e9727854df71d3987db5eee10da1a6e4f224e17d4fdbd887b9
 ---
 
 # Lieutenant Isolde Marsh

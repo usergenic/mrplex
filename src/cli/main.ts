@@ -298,7 +298,50 @@ function resolveRepoSlug(opts: GlobalOpts): string {
     (err as unknown as { code: string }).code = "cli_usage";
     throw err;
   }
+  if (isRepoPattern(value)) {
+    const err = new Error(
+      `repo "${value}" is a pattern — this command addresses exactly one repo; globs only apply to \`query -r\``,
+    );
+    (err as unknown as { code: string }).code = "cli_usage";
+    throw err;
+  }
   return value;
+}
+
+/** True when `slug` is a glob pattern rather than a concrete repo slug. */
+function isRepoPattern(slug: string): boolean {
+  return slug.includes("*") || slug.includes("?");
+}
+
+/**
+ * Repo selector for `query`. An explicit -r typed at the call site (query-local
+ * or global) passes through untouched — wildcards included. Otherwise the
+ * resolved default (MRPLEX_REPO, then config `repo`) must name ONE concrete
+ * repo: a wildcard scope is an explicit per-call act and is never honored from
+ * a persisted default. With no repo at all, error — unscoped query does not
+ * silently search every repo.
+ */
+function resolveQueryRepoSelector(cmd: Command, localRepo: string[] | undefined): string[] {
+  if (localRepo && localRepo.length > 0) return localRepo;
+  const value = cmd.optsWithGlobals<GlobalOpts>().repo ?? loadConfig().repo;
+  if (!value) {
+    const err = new Error(
+      "query needs a repo — pass -r <slug-or-glob> (-r '*' searches every repo), " +
+        "or set a default with MRPLEX_REPO / `mrplex config set-repo <slug>`",
+    );
+    (err as unknown as { code: string }).code = "cli_usage";
+    throw err;
+  }
+  // Commander merges the global -r flag and MRPLEX_REPO into one value; only
+  // the flag ("cli") may carry a wildcard.
+  if (cmd.getOptionValueSourceWithGlobals("repo") !== "cli" && isRepoPattern(value)) {
+    const err = new Error(
+      `default repo "${value}" is a pattern — a wildcard scope must be passed explicitly with -r, never set as a default`,
+    );
+    (err as unknown as { code: string }).code = "cli_usage";
+    throw err;
+  }
+  return [value];
 }
 
 /**
@@ -306,9 +349,9 @@ function resolveRepoSlug(opts: GlobalOpts): string {
  * `server`) is set, otherwise the local in-process client. Enforces the
  * m3-plan decision that --database and --server are mutually exclusive.
  *
- * In local mode we also resolve an embed hook (from --embedder or legacy
- * --embed-url/--embed-cmd, or env/config) — needed for CLI-local semantic
- * enqueue on writes done through the CLI.
+ * In local mode we also resolve an embed hook (from --embedder, MRPLEX_EMBEDDER,
+ * or the CLI config) — needed for CLI-local semantic enqueue on writes done
+ * through the CLI.
  */
 async function openClient(
   opts: GlobalOpts,
@@ -879,6 +922,13 @@ function buildProgram(): Command {
     .command("set-repo <slug>")
     .description("write the default -r/--repo slug to the CLI config")
     .action((slug: string) => {
+      if (isRepoPattern(slug)) {
+        const err = new Error(
+          `config: "${slug}" is a pattern — a wildcard repo scope must be passed per call with -r, never set as the default`,
+        );
+        (err as unknown as { code: string }).code = "cli_usage";
+        reportError(err);
+      }
       const c: CliConfig = { ...loadConfig(), repo: slug };
       saveConfig(c);
       process.stderr.write("config: repo set\n");
@@ -895,10 +945,7 @@ function buildProgram(): Command {
     .command("set-embedder <spec>")
     .description("write the default --embedder to the CLI config (command or http(s):// URL)")
     .action((spec: string) => {
-      const prev = loadConfig();
-      const c: CliConfig = { ...prev, embedder: spec };
-      delete c.embed_url;
-      delete c.embed_cmd;
+      const c: CliConfig = { ...loadConfig(), embedder: spec };
       saveConfig(c);
       process.stderr.write("config: embedder set\n");
     });
@@ -949,15 +996,15 @@ function buildProgram(): Command {
   // -------- policy --------
   const policy = program.command("policy").description("policy-file tooling for the auth shell");
   policy
-    .command("create [file]")
-    .description("write a starter policy.yaml (admin + maintainer)")
+    .command("create <file>")
+    .description("write a starter policy file (admin + maintainer)")
     .option("--principal <id>", "maintainer principal id (MCP day-to-day)", "local")
     .option("--force", "overwrite the file if it already exists", false)
-    .action(function (this: Command, file: string | undefined) {
+    .action(function (this: Command, file: string) {
       const localOpts = this.opts<{ principal: string; force: boolean }>();
       const gopts = this.optsWithGlobals<GlobalOpts>();
       try {
-        const path = file ?? "policy.yaml";
+        const path = file;
         if (existsSync(path) && !localOpts.force) {
           const err = new Error(`policy: ${path} already exists (pass --force to overwrite)`);
           (err as unknown as { code: string }).code = "cli_usage";
@@ -1382,9 +1429,15 @@ function buildProgram(): Command {
         includeSystem: boolean;
       } & EmbedCliOpts>();
       const embedFlags = embedFlagInputsFromCli(localOpts);
+      let repoSelector: string[];
+      try {
+        repoSelector = resolveQueryRepoSelector(this, localOpts.repo);
+      } catch (err) {
+        reportError(err);
+      }
       withClient(this, async (client, opts) => {
         const result = await client.query({
-          repo: localOpts.repo,
+          repo: repoSelector,
           filter: combinePathAndFilter(localOpts.path, localOpts.filter),
           text: localOpts.text,
           semantic: localOpts.semantic,
