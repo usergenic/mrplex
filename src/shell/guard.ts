@@ -238,6 +238,12 @@ export function guardKernel(kernel: Kernel, entitlement: Entitlement, audit?: Au
     graph: (_ctx, spec) =>
       forward("graph", { repo: spec.repo }, () => kernel.graph(readCtx(), spec)),
 
+    // Read-only integrity scrub; scoped to read visibility like query/graph.
+    // The engine drops derived-table orphans that reference unreadable versions
+    // (verify-plan §2.7), so a scoped caller verifies only its slice.
+    verify: (_ctx, spec) =>
+      forward("verify", { repo: spec.repo }, () => kernel.verify(readCtx(), spec)),
+
     history: {
       // Read-only change feed; the engine applies read scope to each ref's
       // endpoints (a ref is delivered only if the caller can see either end).
