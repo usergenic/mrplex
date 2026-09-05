@@ -772,6 +772,79 @@ class PostgresStorage implements Storage {
     });
   }
 
+  // Verify scans (docs/verify-plan.md §4). Read-only, keyset by id. No fts
+  // scans here: Postgres's fts_tsv is a generated column that cannot drift, so
+  // the kernel skips the `fts` family (§2.4) — this adapter deliberately omits
+  // the VerifyFtsScans capability.
+
+  async versions_all(opts: {
+    repo_id?: number;
+    after_id: number;
+    limit: number;
+  }): Promise<VersionRow[]> {
+    return this.withClient(async (c) => {
+      const repoClause = opts.repo_id === undefined ? "" : " and repo_id = $3";
+      const params =
+        opts.repo_id === undefined
+          ? [opts.after_id, opts.limit]
+          : [opts.after_id, opts.limit, opts.repo_id];
+      const res = await c.query<VersionRawRow>(
+        `select id, document_id, repo_id, prev_id, next_id, path,
+                frontmatter_raw, frontmatter, body, author, created_at, content_hash
+         from versions
+         where id > $1${repoClause}
+         order by id asc limit $2`,
+        params,
+      );
+      return res.rows as VersionRow[];
+    });
+  }
+
+  async documents_all(opts: {
+    repo_id?: number;
+    after_id: number;
+    limit: number;
+  }): Promise<DocumentRow[]> {
+    return this.withClient(async (c) => {
+      const repoClause = opts.repo_id === undefined ? "" : " and repo_id = $3";
+      const params =
+        opts.repo_id === undefined
+          ? [opts.after_id, opts.limit]
+          : [opts.after_id, opts.limit, opts.repo_id];
+      const res = await c.query<DocumentRow>(
+        `select id, repo_id from documents
+         where id > $1${repoClause}
+         order by id asc limit $2`,
+        params,
+      );
+      return res.rows as DocumentRow[];
+    });
+  }
+
+  async chunks_all_version_ids(opts: { after_id: number; limit: number }): Promise<number[]> {
+    return this.withClient(async (c) => {
+      const res = await c.query<{ version_id: number }>(
+        `select distinct version_id from chunks
+         where version_id > $1
+         order by version_id asc limit $2`,
+        [opts.after_id, opts.limit],
+      );
+      return res.rows.map((r) => Number(r.version_id));
+    });
+  }
+
+  async backlog_all_version_ids(opts: { after_id: number; limit: number }): Promise<number[]> {
+    return this.withClient(async (c) => {
+      const res = await c.query<{ version_id: number }>(
+        `select version_id from embedding_backlog
+         where version_id > $1
+         order by version_id asc limit $2`,
+        [opts.after_id, opts.limit],
+      );
+      return res.rows.map((r) => Number(r.version_id));
+    });
+  }
+
   async chunks_upsert(
     version_id: number,
     model: string,

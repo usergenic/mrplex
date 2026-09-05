@@ -719,6 +719,106 @@ class SqliteStorage implements Storage {
     });
   }
 
+  // Verify scans (docs/verify-plan.md §4). Read-only, keyset by id.
+
+  async versions_all(opts: {
+    repo_id?: number;
+    after_id: number;
+    limit: number;
+  }): Promise<VersionRow[]> {
+    const repoClause = opts.repo_id === undefined ? "" : " and repo_id = ?";
+    const params =
+      opts.repo_id === undefined
+        ? [opts.after_id, opts.limit]
+        : [opts.after_id, opts.repo_id, opts.limit];
+    const rows = this.db
+      .prepare(
+        `select id, document_id, repo_id, prev_id, next_id, path,
+                frontmatter_raw, frontmatter, body, author, created_at, content_hash
+         from versions
+         where id > ?${repoClause}
+         order by id asc limit ?`,
+      )
+      .all(...params) as VersionRawRow[];
+    return rows.map(hydrateVersion);
+  }
+
+  async documents_all(opts: {
+    repo_id?: number;
+    after_id: number;
+    limit: number;
+  }): Promise<DocumentRow[]> {
+    const repoClause = opts.repo_id === undefined ? "" : " and repo_id = ?";
+    const params =
+      opts.repo_id === undefined
+        ? [opts.after_id, opts.limit]
+        : [opts.after_id, opts.repo_id, opts.limit];
+    return this.db
+      .prepare(
+        `select id, repo_id from documents
+         where id > ?${repoClause}
+         order by id asc limit ?`,
+      )
+      .all(...params) as DocumentRow[];
+  }
+
+  async chunks_all_version_ids(opts: { after_id: number; limit: number }): Promise<number[]> {
+    const rows = this.db
+      .prepare(
+        `select distinct version_id from chunks
+         where version_id > ?
+         order by version_id asc limit ?`,
+      )
+      .all(opts.after_id, opts.limit) as { version_id: number }[];
+    return rows.map((r) => r.version_id);
+  }
+
+  async backlog_all_version_ids(opts: { after_id: number; limit: number }): Promise<number[]> {
+    const rows = this.db
+      .prepare(
+        `select version_id from embedding_backlog
+         where version_id > ?
+         order by version_id asc limit ?`,
+      )
+      .all(opts.after_id, opts.limit) as { version_id: number }[];
+    return rows.map((r) => r.version_id);
+  }
+
+  // fts verify scans (VerifyFtsScans capability, verify-plan §2.4). SQLite-only:
+  // the version↔fts_docs rowid bijection can drift here (trigger-maintained
+  // external-content table), unlike Postgres's generated fts_tsv column.
+  //
+  // Membership is read from the FTS5 shadow table `fts_docs_docsize` (one row
+  // per indexed rowid), NOT by scanning `fts_docs` itself: an external-content
+  // FTS5 table resolves each row's columns by joining back to `versions`, so a
+  // `select rowid from fts_docs` for an orphaned rowid returns nothing (the
+  // content row is gone) — it can't surface the very orphans we're hunting.
+  // The shadow table is the authoritative index-membership set.
+
+  async fts_missing_rowids(opts: { after_id: number; limit: number }): Promise<number[]> {
+    const rows = this.db
+      .prepare(
+        `select v.id as id from versions v
+         left join fts_docs_docsize d on d.id = v.id
+         where v.id > ? and d.id is null
+         order by v.id asc limit ?`,
+      )
+      .all(opts.after_id, opts.limit) as { id: number }[];
+    return rows.map((r) => r.id);
+  }
+
+  async fts_orphan_rowids(opts: { after_id: number; limit: number }): Promise<number[]> {
+    const rows = this.db
+      .prepare(
+        `select d.id as id from fts_docs_docsize d
+         left join versions v on v.id = d.id
+         where d.id > ? and v.id is null
+         order by d.id asc limit ?`,
+      )
+      .all(opts.after_id, opts.limit) as { id: number }[];
+    return rows.map((r) => r.id);
+  }
+
   async chunks_upsert(
     version_id: number,
     model: string,

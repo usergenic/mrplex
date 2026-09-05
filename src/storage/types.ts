@@ -327,6 +327,44 @@ export type Storage = {
     updates: readonly { id: number; content_hash: string }[],
   ): Promise<void>;
 
+  // Verify scans (docs/verify-plan.md §4). Read-only, keyset-paginated by id.
+  // These are the ONE place mrplex walks all versions (including superseded
+  // ones), not just the live set — an integrity scrub reads the whole chain.
+
+  /**
+   * One keyset page of ALL versions (live and superseded) in id order, id >
+   * `after_id`, capped at `limit`, optionally scoped to `repo_id`. The backbone
+   * scan for the `chain` / `hash` / `frontmatter` / `links` check families,
+   * which re-derive from `frontmatter_raw` / `frontmatter` / `body`. Keyset by
+   * id so batches don't re-scan (verify-plan §4, §6).
+   */
+  versions_all(opts: { repo_id?: number; after_id: number; limit: number }): Promise<VersionRow[]>;
+
+  /**
+   * One keyset page of `documents` rows in id order, id > `after_id`, capped at
+   * `limit`, optionally scoped to `repo_id`. Feeds the `chain` family's
+   * per-document walk (via `version_history`) and `chain.orphan_document`
+   * (documents with zero versions). Keyset by id (verify-plan §4).
+   */
+  documents_all(opts: {
+    repo_id?: number;
+    after_id: number;
+    limit: number;
+  }): Promise<DocumentRow[]>;
+
+  /**
+   * Distinct version ids present in the `chunks` table, keyset-paginated by
+   * version id (id > `after_id`, capped at `limit`). The kernel intersects
+   * these against live/all version ids for `chunks.orphan` (verify-plan §2.5).
+   */
+  chunks_all_version_ids(opts: { after_id: number; limit: number }): Promise<number[]>;
+
+  /**
+   * Version ids present in the `embedding_backlog` table, keyset-paginated by
+   * version id. Feeds `chunks.backlog_orphan` (verify-plan §2.5).
+   */
+  backlog_all_version_ids(opts: { after_id: number; limit: number }): Promise<number[]>;
+
   /**
    * All currently-live versions in a repo (i.e. rows where next_id IS NULL).
    * Used by `repos.set_path_config` to produce the advisory PathWarning[]
@@ -503,6 +541,34 @@ export type Storage = {
   backlog_delete(version_id: number): Promise<void>;
   backlog_status(now: string): Promise<BacklogStatus>;
 };
+
+/**
+ * Optional adapter capability for the SQLite-only `fts` verify family
+ * (verify-plan §2.4). SQLite maintains a separate `fts_docs` external-content
+ * table via triggers, so its rowid set can drift from `versions.id` (a trigger
+ * that didn't fire, a stray row). Postgres has no separate structure —
+ * `fts_tsv` is a generated column that cannot drift — so the Postgres adapter
+ * does NOT implement this, and the kernel skips the `fts` family with a note.
+ *
+ * Both methods diff the `versions.id` ↔ `fts_docs` rowid bijection over ALL
+ * versions (not the live set), keyset-paginated by id.
+ */
+export type VerifyFtsScans = {
+  /** Version ids with no matching `fts_docs` rowid (trigger didn't fire). */
+  fts_missing_rowids(opts: { after_id: number; limit: number }): Promise<number[]>;
+  /** `fts_docs` rowids with no matching `versions` row (stray index entry). */
+  fts_orphan_rowids(opts: { after_id: number; limit: number }): Promise<number[]>;
+};
+
+/** Runtime probe: does this storage implement the SQLite-only fts verify scans? */
+export function hasVerifyFtsScans(storage: unknown): storage is VerifyFtsScans {
+  return (
+    typeof storage === "object" &&
+    storage !== null &&
+    typeof (storage as VerifyFtsScans).fts_missing_rowids === "function" &&
+    typeof (storage as VerifyFtsScans).fts_orphan_rowids === "function"
+  );
+}
 
 export type OpenConfig = {
   /** Database url — sqlite:./path.db or postgres://… */

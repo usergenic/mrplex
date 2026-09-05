@@ -69,16 +69,23 @@ Design §3.2 stores frontmatter twice by design: `frontmatter_raw` (byte-verbati
 | `frontmatter.divergence` | error | Re-parsed raw ≠ stored `frontmatter` JSON (deep-equal). `detail: { keys_differing }`. |
 | `frontmatter.system_leak` | error | A `$`-prefixed key is present in stored `frontmatter_raw`/`frontmatter` — `$*` intrinsics must be stripped at write time (`canonicalizeFrontmatter`) and never persisted (sync/history §2.4). A leak corrupts `$content_hash` and re-injection. |
 
-### 2.4 `fts` — full-text index membership
+### 2.4 `fts` — full-text index membership (SQLite-only)
 
-The FTS index (`fts_docs`, external-content mode, trigger-maintained — `migrations/0003_fts_docs.sql`) must cover **exactly the current versions' bodies**: one FTS row per live version, none for superseded/deleted-out-of-namespace versions, none orphaned.
+**This family is SQLite-specific by construction, and the invariant is a bijection with *all* versions, not the live set.** The original plan draft mis-stated both points; the schema is the authority. How FTS actually works in each engine:
 
-| `check` code | Severity | Condition |
+- **SQLite** — `fts_docs` is an FTS5 external-content table maintained by an `AFTER INSERT` trigger on `versions` (`0001_init.sql:89-102`). The store is append-only — versions are never `DELETE`d (a "delete" moves the doc under `:deleted/`) — so the trigger fires once per version insert and `fts_docs` holds **one row per version row, live and superseded alike**. `versions_search` filters `next_id IS NULL` at query time; the index itself is whole-history. The integrity invariant is therefore a **rowid↔version bijection over all versions**: every `versions.id` has an `fts_docs` rowid and vice-versa. A break means a trigger didn't fire (missing) or a stray rowid survived (orphan).
+- **Postgres** — there is no separate FTS structure. `fts_tsv` is a `GENERATED ALWAYS AS (to_tsvector('english', body)) STORED` column on `versions` (`0001_init.sql:52`); the database regenerates it on every write. It cannot be missing, orphaned, or stale relative to its own row. So there is nothing to verify.
+
+Consequently the `fts` family **runs on SQLite and is skipped-with-note on Postgres** (`checks_skipped: { check: "fts", reason: "postgres: fts_tsv is a generated column, structurally consistent by construction" }`). This is the one genuinely engine-specific family; it's justified because it's the only check that catches a broken or absent FTS trigger, and the skip note keeps a clean Postgres report from being mistaken for "fts verified."
+
+| `check` code | Severity | Condition (SQLite) |
 |---|---|---|
-| `fts.missing` | error | A live version has no FTS row. `suggested_fix: "rebuild FTS (reindex)"`. |
-| `fts.orphan` | error | An FTS row references a version that isn't live (or doesn't exist). |
+| `fts.missing` | error | A `versions` row has no matching `fts_docs` rowid — the insert trigger didn't fire. `suggested_fix: "rebuild the fts_docs index"`. |
+| `fts.orphan` | error | An `fts_docs` rowid has no matching `versions` row — a stray index entry. |
 
-`fts.missing` / `fts.orphan` need only id-set membership (which live versions have/lack an FTS row), so they hold at full SQLite/Postgres parity. A body-content freshness check (`fts.stale_body` — "the indexed text matches the live body") is **deliberately not in v1**: SQLite's FTS5 runs in external-content mode and doesn't store the body redundantly (the `versions` table is the content source), so there's no cheap way to compare stored FTS text on SQLite, and a parity-breaking Postgres-only check isn't worth it here. Deferred; additive if a cheap path appears.
+Both are pure id-set membership, so no body text is read — which is also why the dropped `fts.stale_body` (below) was the awkward one. **Implementation note:** the membership set is read from the FTS5 shadow table `fts_docs_docsize` (one row per indexed rowid), not by scanning `fts_docs` directly. An external-content FTS5 table resolves each row's columns by joining back to `versions`, so `select rowid from fts_docs` for an *orphaned* rowid returns nothing (its content row is gone) and can't surface the very orphans we hunt; the shadow table is the authoritative index-membership set.
+
+A body-content freshness check (`fts.stale_body` — "the indexed text matches the live body") is **deliberately not in v1**: SQLite's FTS5 external-content mode doesn't store the body redundantly (the `versions` table is the content source), so there's no cheap way to compare stored FTS text, and Postgres has no separate text to compare against at all. Deferred; additive only if a cheap path appears.
 
 ### 2.5 `chunks` — embedding provenance
 
@@ -135,9 +142,12 @@ export type VerifyReport = {
     by_check: Record<string, number>;      // findings per check code
     by_severity: Record<VerifySeverity, number>;
   };
+  checks_skipped: { check: string; reason: string }[];  // e.g. fts on postgres, chunks.unembedded w/o embedder
   truncated: boolean;         // true if max_findings capped the list (counts stay exact)
 };
 ```
+
+`checks_skipped` names families/checks that did not run and why — so a clean report is never mistaken for full coverage. Two sources feed it: the SQLite-only `fts` family skipped on Postgres (§2.4), and `chunks.unembedded` skipped when no embedder is configured (§2.5).
 
 Design notes:
 - **Findings are data, never exceptions.** `verify` returns a report even when the store is on fire; the only throws are the usual pre-flight ones (`repo_not_found` for a bad `--repo`, `forbidden` for scope). This mirrors `links.repair` returning `{ repaired, skipped }` rather than throwing on a skip.
@@ -161,7 +171,7 @@ export type VerifySpec = {
 
 - **`versions_all(opts: { repo_id?; after_id; limit })`** → full `VersionRow[]` in id order. The backbone scan for `hash`, `frontmatter`, and `links` re-derivation (they need `frontmatter_raw`, `frontmatter`, `body`). This is the one place mrplex walks *all* versions including superseded ones; keyset by id so batches don't re-scan.
 - **`documents_all(opts: { repo_id?; after_id; limit })`** → `{ id, repo_id }[]` for the `chain` family's per-document walk and `chain.orphan_document`. Existing `version_history(document_id)` walks each chain.
-- **`fts_all_refs(opts)`** → `{ version_id, has_row: bool, text_hash? }` sufficient to compute `fts.missing`/`fts.orphan`/`fts.stale_body` by joining against the live set. (SQLite external-content FTS makes stored-text retrieval awkward — if `stale_body` can't be done cheaply, the method returns `text_hash: null` and the check is skipped with a one-line report note, not a silent omission.)
+- **`fts_missing_rowids(opts: { after_id; limit })`** and **`fts_orphan_rowids(opts: { after_id; limit })`** (SQLite adapter only) → the two sides of the `versions.id` ↔ `fts_docs` rowid bijection diff (§2.4), keyset-paginated. `missing` = version ids with no `fts_docs` rowid; `orphan` = `fts_docs` rowids with no version. Not on the `Storage` interface — declared on an optional `VerifyFtsScans` capability the SQLite adapter implements and Postgres does not, so the kernel skips the `fts` family (with a note) when the capability is absent. This keeps the whole-history FTS check off the shared interface where Postgres has nothing to implement.
 - **`chunks_all_version_ids(opts)`** and **`backlog_all_version_ids(opts)`** → the id sets for `chunks.*` orphan/coverage checks; intersect with live-version ids in the kernel.
 - **Reuse existing** `links_by_repo(repo_id)` (already returns every link row ordered by `(source_id, ord)` — tests use it) and `versions_live_by_repo(repo_id)` for the `links` family; `versions_current_by_documents` to resolve `target_id` → current path for `links.misresolved_bound`.
 
