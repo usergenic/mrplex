@@ -39,7 +39,7 @@ import { createKernel } from "../kernel/kernel.js";
 import type { GraphSpec } from "../kernel/wire.js";
 import { extractSystemProperties, split as splitFrontmatter } from "../markdown/frontmatter.js";
 import { backfillContentHashes } from "../markdown/hash-backfill.js";
-import { renderDocGetManyText, renderGraphSummary } from "../mcp/render.js";
+import { renderDocGetManyText, renderGraphSummary, renderVerifyReport } from "../mcp/render.js";
 import { startMcpStdio } from "../mcp/server.js";
 import { startServer } from "../server/serve.js";
 import { fileAuditSink } from "../shell/audit.js";
@@ -1925,6 +1925,77 @@ function buildProgram(): Command {
           await storage.close();
         }
       })();
+    });
+
+  // -------- verify --------
+  // Read-only integrity scrub (docs/verify-plan.md). Top-level maintenance
+  // command like `hash`; works local or remote via the client seam. The repo
+  // is OPTIONAL here (unlike most commands): with a global -r it scans one
+  // repo, without it scans the whole store — required for the whole-store
+  // fts / chunks orphan checks.
+  program
+    .command("verify")
+    .description("read-only integrity scrub over the store (docs/verify-plan.md)")
+    .option(
+      "-c, --check <check>",
+      "check family (chain) or full code (links.set_mismatch); repeatable",
+      (val: string, prev: string[]) => [...prev, val],
+      [] as string[],
+    )
+    .option("--severity <level>", "minimum finding severity to report: error | warn (default warn)")
+    .option("--max-findings <n>", "cap the emitted findings list (counts stay exact)")
+    .option("--ci", "exit non-zero if any finding at/above the severity threshold exists", false)
+    .action(function (this: Command) {
+      const localOpts = this.opts<{
+        check: string[];
+        severity?: string;
+        maxFindings?: string;
+        ci: boolean;
+      }>();
+      const globals = this.optsWithGlobals<GlobalOpts>();
+      // Repo is optional: an explicit -r scopes to one repo; a bare glob is
+      // rejected (verify addresses one repo or the whole store, never a glob).
+      const repo = globals.repo;
+      if (repo !== undefined && isRepoPattern(repo)) {
+        const err = new Error(
+          `repo "${repo}" is a pattern — verify scans one repo (-r <slug>) or the whole store (omit -r)`,
+        );
+        (err as unknown as { code: string }).code = "cli_usage";
+        reportError(err);
+      }
+      const severity =
+        localOpts.severity === "error" || localOpts.severity === "warn"
+          ? localOpts.severity
+          : undefined;
+      if (localOpts.severity !== undefined && severity === undefined) {
+        const err = new Error(`--severity must be "error" or "warn", got "${localOpts.severity}"`);
+        (err as unknown as { code: string }).code = "cli_usage";
+        reportError(err);
+      }
+      const maxFindings =
+        localOpts.maxFindings !== undefined ? Number.parseInt(localOpts.maxFindings, 10) : undefined;
+      if (maxFindings !== undefined && (!Number.isSafeInteger(maxFindings) || maxFindings < 1)) {
+        const err = new Error("--max-findings must be a positive integer");
+        (err as unknown as { code: string }).code = "cli_usage";
+        reportError(err);
+      }
+      withClient(this, async (client, opts) => {
+        const report = await client.verify({
+          ...(repo !== undefined && { repo }),
+          ...(localOpts.check.length > 0 && { checks: localOpts.check }),
+          ...(severity !== undefined && { min_severity: severity }),
+          ...(maxFindings !== undefined && { max_findings: maxFindings }),
+        });
+        emit(report, opts, renderVerifyReport(report));
+        // --ci: fail the process when the report isn't clean at the threshold.
+        // Findings counted are already filtered to min_severity, so any counted
+        // finding is at/above the bar. Exit 1 (validation family — the data
+        // failed validation), leaving 3/4 for the pre-flight forbidden/not-found.
+        if (localOpts.ci) {
+          const total = report.counts.by_severity.error + report.counts.by_severity.warn;
+          if (total > 0) process.exitCode = 1;
+        }
+      }).catch(reportError);
     });
 
   return program;

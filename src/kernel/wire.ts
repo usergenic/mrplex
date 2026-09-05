@@ -169,3 +169,69 @@ export type DocGetManyResult = {
   items: Version[];
   errors: DocGetManyError[];
 };
+
+// -----------------------------------------------------------------------------
+// Verify — read-only integrity scrub (docs/verify-plan.md). Re-derives the
+// FTS / links / hash indexes and checks the version chain, reporting
+// inconsistencies as structured findings rather than throwing.
+// -----------------------------------------------------------------------------
+
+/**
+ * A finding's severity. `error` = a real inconsistency (the store is lying);
+ * `warn` = suspicious but possibly benign (e.g. a legacy row a backfill fixes).
+ * `--ci` fails on `error` by default. (verify-plan §2.)
+ */
+export type VerifySeverity = "error" | "warn";
+
+/**
+ * One inconsistency found by `verify`. `check` is a stable code (e.g.
+ * `chain.prev_next_asymmetry`) clients discriminate on; `detail` carries the
+ * check-specific payload (stored vs. computed, missing/extra edges, …).
+ * `document_id` / `version_id` are opaque encoded strings (§3.3) — internal
+ * integer ids never cross the wire. (verify-plan §3.)
+ */
+export type VerifyFinding = {
+  check: string;
+  severity: VerifySeverity;
+  repo: string; // slug
+  document_id?: string;
+  version_id?: string;
+  path?: string;
+  detail: Record<string, unknown>;
+  /** Human hint at the remedy (e.g. "mrplex hash backfill"); never auto-run. */
+  suggested_fix?: string;
+};
+
+/**
+ * Input to `kernel.verify` (verify-plan §3). `repo` omitted = every repo the
+ * caller can see. `checks` are family prefixes ("chain", "links") or full
+ * codes; omitted = all. `min_severity` filters emitted findings below the bar
+ * (counts stay full); `max_findings` caps the emitted list (counts stay exact,
+ * `truncated` is set).
+ */
+export type VerifySpec = {
+  repo?: string;
+  checks?: string[];
+  min_severity?: VerifySeverity;
+  max_findings?: number;
+};
+
+/**
+ * Result of `kernel.verify` (verify-plan §3). Findings are data, never
+ * exceptions — the report comes back even when the store is corrupt. `counts`
+ * stay exact even when `findings` is capped by `max_findings` (then
+ * `truncated` is true). `checks_skipped` names families that didn't run and
+ * why (e.g. `chunks.unembedded` with no embedder configured) so a clean report
+ * isn't mistaken for full coverage.
+ */
+export type VerifyReport = {
+  findings: VerifyFinding[];
+  counts: {
+    versions_scanned: number;
+    documents_scanned: number;
+    by_check: Record<string, number>;
+    by_severity: Record<VerifySeverity, number>;
+  };
+  checks_skipped: { check: string; reason: string }[];
+  truncated: boolean;
+};

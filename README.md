@@ -158,6 +158,15 @@ Use `--render mermaid` instead to get a diagram you can paste into any Markdown 
 
 Every write appends a new version rather than overwriting — so history is never lost. That's also what makes `--prev` work: it's *optimistic concurrency*. You tell a write which version you started from; if someone else has written in the meantime, yours is rejected and you're handed the current version to reconcile against, instead of silently clobbering their change. Deleting a document moves it aside to `:deleted/…` rather than erasing it, so a delete can be undone with an ordinary write. When you need the record, `docs history` lists a document's versions and `docs diff --from v1 --to v2` shows what changed.
 
+Because the chain *is* the guarantee, `mrplex verify` is the way to confirm it holds. It's a read-only scrub — mrplex's `git fsck` — that re-derives the search, link, and hash indexes and checks the version chain, reporting any inconsistency as a structured finding without ever writing. Reach for it during maintenance, after a bulk import, or whenever you suspect something drifted:
+
+```sh
+$ mrplex verify                    # scan the whole store
+clean — no findings
+scanned 128 versions across 96 documents; 0 error, 0 warn
+$ mrplex verify --check links --ci   # one family; exit non-zero on any finding (CI gate)
+```
+
 ## Connect an agent
 
 The CLI, the MCP server, and the REST API are three doors into the same store. For a database only you touch, the quickest way to give an agent access is MCP over local stdio — for example, in a client's MCP configuration:
@@ -205,6 +214,7 @@ mrplex is built from a few concepts:
 | **Query**      | A CEL filter over frontmatter and `$path` / `$body` / `$updated_at`, combined with full-text and semantic search |
 | **Link graph** | Links from Markdown syntax, wikilinks, and frontmatter paths, tracked by identity so renames don't break them |
 | **Graph walk** | A breadth-first tour of that link graph — *how* documents connect, not just which ones match |
+| **Verify**     | A read-only integrity scrub that re-derives every index and checks the version chain, reporting drift as findings |
 | **Surfaces**   | The CLI, an MCP server, and a REST API, all over the same store                            |
 
 Underneath, mrplex is two layers. The **kernel** is the store itself — documents, versions, queries, the graph — and it is full-trust: it has no notion of users, so whoever holds the database file holds everything. Around it is an optional **access-and-identity shell** that adds keys, OIDC, per-path permissions, and an audit log when you need them. The store runs on SQLite by default, or Postgres with pgvector when you want it; the same test suite runs against both, so behavior matches.
