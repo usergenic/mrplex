@@ -18,12 +18,24 @@
  * check families (WS3) fill in `runChecks` per repo.
  */
 
-import type { RepoRow, Storage } from "../../storage/types.js";
+import {
+  HARDCODED_DEFAULTS as LINK_DEFAULTS,
+  type LinkConfig,
+  effectiveLinkConfig,
+  parseRepoOverride as parseLinkOverride,
+} from "../../links/link-config.js";
+import { type RepoRow, type Storage, hasVerifyFtsScans } from "../../storage/types.js";
 import { type ClaimMatcher, claimsGrantRepo } from "../auth/scope.js";
 import { repoNotFound } from "../errors.js";
 import type { PathConfig } from "../path-config.js";
 import { effectivePathConfig, parseRepoOverride } from "../path-config.js";
 import type { VerifyFinding, VerifyReport, VerifySeverity, VerifySpec } from "../wire.js";
+import { checkChain } from "./chain.js";
+import type { CheckContext } from "./checks.js";
+import { checkChunksStore, checkChunksUnembedded } from "./chunks.js";
+import { checkContent } from "./content.js";
+import { checkFts } from "./fts.js";
+import { checkLinks } from "./links.js";
 
 /** Default cap on emitted findings; `counts` stay exact past it (verify-plan §3). */
 export const DEFAULT_MAX_FINDINGS = 10_000;
@@ -31,6 +43,8 @@ export const DEFAULT_MAX_FINDINGS = 10_000;
 export type VerifyDeps = {
   storage: Storage;
   serverPathConfig: PathConfig;
+  /** Server-level link-extraction config; per-repo overrides layer on top. */
+  serverLinkConfig?: LinkConfig;
   /**
    * Whether an embedder is configured for this store (flag → MRPLEX_EMBEDDER →
    * config). Gates the `chunks.unembedded` check: with no embedder it's skipped
@@ -80,6 +94,9 @@ export class VerifyAccumulator {
   }
 
   skip(check: string, reason: string): void {
+    // Dedupe: a per-repo skip (e.g. chunks.unembedded with no embedder) is
+    // noted once for the whole run, not once per repo.
+    if (this.skipped.some((s) => s.check === check)) return;
     this.skipped.push({ check, reason });
   }
 
@@ -115,17 +132,88 @@ export async function runVerify(
   deps: VerifyDeps,
 ): Promise<VerifyReport> {
   const repos = await resolveRepos(claims, spec.repo, deps);
+  const wholeStore = spec.repo === undefined; // whole-store checks need all repos
 
   const acc = new VerifyAccumulator(
     spec.min_severity ?? "warn",
     spec.max_findings ?? DEFAULT_MAX_FINDINGS,
   );
+  const selected = (check: string): boolean => checkSelected(check, spec.checks);
+  const serverLinkConfig = deps.serverLinkConfig ?? LINK_DEFAULTS;
 
+  // Per-repo families: chain, hash/frontmatter, links, chunks.unembedded.
   for (const repo of repos) {
-    await runChecks(acc, repo, claims, spec, deps);
+    const ctx: CheckContext = {
+      storage: deps.storage,
+      repo,
+      pathConfig: effectivePathConfig(deps.serverPathConfig, parseRepoOverride(repo.path_config)),
+      linkConfig: effectiveLinkConfig(serverLinkConfig, parseLinkOverride(repo.link_config)),
+      claims,
+      acc,
+      selected,
+    };
+    await checkChain(ctx);
+    await checkContent(ctx);
+    await checkLinks(ctx);
+    if (deps.embedderConfigured) {
+      await checkChunksUnembedded(ctx);
+    } else if (selected("chunks.unembedded")) {
+      acc.skip("chunks.unembedded", "no embedder configured");
+    }
+  }
+
+  // Whole-store families (fts, chunks orphan/mixed-dim): not repo-partitioned,
+  // so they run once over the first repo's context — and only in an all-repos
+  // run, since a --repo filter can neither attribute nor bound them (§2.5).
+  if (repos.length > 0) {
+    const anchor = repos[0] as RepoRow;
+    const storeCtx: CheckContext = {
+      storage: deps.storage,
+      repo: anchor,
+      pathConfig: effectivePathConfig(deps.serverPathConfig, parseRepoOverride(anchor.path_config)),
+      linkConfig: effectiveLinkConfig(serverLinkConfig, parseLinkOverride(anchor.link_config)),
+      claims,
+      acc,
+      selected,
+    };
+    await runWholeStoreChecks(storeCtx, wholeStore, deps, acc, selected);
   }
 
   return acc.report();
+}
+
+/**
+ * fts + chunks orphan/mixed-dim families. Skipped-with-note under a `--repo`
+ * filter (can't attribute a gone version to a repo), and the fts family is
+ * further gated on the SQLite-only `VerifyFtsScans` capability (§2.4).
+ */
+async function runWholeStoreChecks(
+  ctx: CheckContext,
+  wholeStore: boolean,
+  deps: VerifyDeps,
+  acc: VerifyAccumulator,
+  selected: (check: string) => boolean,
+): Promise<void> {
+  const ftsSelected = selected("fts.missing") || selected("fts.orphan");
+  const chunkStoreSelected =
+    selected("chunks.orphan") || selected("chunks.backlog_orphan") || selected("chunks.mixed_dim");
+
+  if (!wholeStore) {
+    if (ftsSelected) acc.skip("fts", "whole-store check; omit --repo to run");
+    if (chunkStoreSelected) acc.skip("chunks", "whole-store check; omit --repo to run");
+    return;
+  }
+
+  if (ftsSelected) {
+    if (hasVerifyFtsScans(deps.storage)) {
+      await checkFts(ctx, deps.storage);
+    } else {
+      acc.skip("fts", "postgres: fts_tsv is a generated column, structurally consistent");
+    }
+  }
+  if (chunkStoreSelected) {
+    await checkChunksStore(ctx);
+  }
 }
 
 /**
@@ -155,24 +243,4 @@ async function resolveRepos(
   return rows.filter(
     (r) => !isSystem(r.slug) && (claims === null || claimsGrantRepo(claims, r.slug)),
   );
-}
-
-/**
- * Run the selected check families against one repo, appending findings to
- * `acc`. WS1 scaffold — the six families (WS3) plug in here. `effectiveConfig`
- * is resolved once per repo so sigil-aware checks share it.
- */
-async function runChecks(
-  acc: VerifyAccumulator,
-  repo: RepoRow,
-  _claims: ClaimMatcher[] | null,
-  _spec: VerifySpec,
-  deps: VerifyDeps,
-): Promise<void> {
-  const _effectiveConfig = effectivePathConfig(
-    deps.serverPathConfig,
-    parseRepoOverride(repo.path_config),
-  );
-  // WS3 wires the check families in here; the accumulator + config are the
-  // seam they hang off. Intentionally empty in the WS1 skeleton.
 }

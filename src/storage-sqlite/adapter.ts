@@ -762,6 +762,19 @@ class SqliteStorage implements Storage {
       .all(...params) as DocumentRow[];
   }
 
+  async versions_by_document(document_id: number): Promise<VersionRow[]> {
+    const rows = this.db
+      .prepare(
+        `select id, document_id, repo_id, prev_id, next_id, path,
+                frontmatter_raw, frontmatter, body, author, created_at, content_hash
+         from versions
+         where document_id = ?
+         order by id asc`,
+      )
+      .all(document_id) as VersionRawRow[];
+    return rows.map(hydrateVersion);
+  }
+
   async chunks_all_version_ids(opts: { after_id: number; limit: number }): Promise<number[]> {
     const rows = this.db
       .prepare(
@@ -782,6 +795,61 @@ class SqliteStorage implements Storage {
       )
       .all(opts.after_id, opts.limit) as { version_id: number }[];
     return rows.map((r) => r.version_id);
+  }
+
+  async chunks_orphan_version_ids(opts: { after_id: number; limit: number }): Promise<number[]> {
+    const rows = this.db
+      .prepare(
+        `select distinct c.version_id as version_id from chunks c
+         left join versions v on v.id = c.version_id
+         where c.version_id > ? and v.id is null
+         order by c.version_id asc limit ?`,
+      )
+      .all(opts.after_id, opts.limit) as { version_id: number }[];
+    return rows.map((r) => r.version_id);
+  }
+
+  async backlog_orphan_version_ids(opts: { after_id: number; limit: number }): Promise<number[]> {
+    const rows = this.db
+      .prepare(
+        `select b.version_id as version_id from embedding_backlog b
+         left join versions v on v.id = b.version_id
+         where b.version_id > ? and v.id is null
+         order by b.version_id asc limit ?`,
+      )
+      .all(opts.after_id, opts.limit) as { version_id: number }[];
+    return rows.map((r) => r.version_id);
+  }
+
+  async chunks_dims_by_version(opts: {
+    after_id: number;
+    limit: number;
+  }): Promise<{ version_id: number; dims: number[] }[]> {
+    // One page of DISTINCT versions (id > after_id), then their distinct
+    // non-null embedding sizes. length(blob) is the byte count in SQLite —
+    // proportional to dimension, and only distinctness matters here.
+    const versionIds = this.db
+      .prepare(
+        `select distinct version_id from chunks
+         where version_id > ?
+         order by version_id asc limit ?`,
+      )
+      .all(opts.after_id, opts.limit) as { version_id: number }[];
+    if (versionIds.length === 0) return [];
+    const ph = versionIds.map(() => "?").join(",");
+    const rows = this.db
+      .prepare(
+        `select distinct version_id, length(embedding) as dim from chunks
+         where version_id in (${ph}) and embedding is not null`,
+      )
+      .all(...versionIds.map((r) => r.version_id)) as { version_id: number; dim: number }[];
+    const byVersion = new Map<number, number[]>();
+    for (const { version_id } of versionIds) byVersion.set(version_id, []);
+    for (const r of rows) byVersion.get(r.version_id)?.push(r.dim);
+    return versionIds.map(({ version_id }) => ({
+      version_id,
+      dims: byVersion.get(version_id) ?? [],
+    }));
   }
 
   // fts verify scans (VerifyFtsScans capability, verify-plan §2.4). SQLite-only:

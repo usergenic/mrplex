@@ -343,8 +343,8 @@ export type Storage = {
   /**
    * One keyset page of `documents` rows in id order, id > `after_id`, capped at
    * `limit`, optionally scoped to `repo_id`. Feeds the `chain` family's
-   * per-document walk (via `version_history`) and `chain.orphan_document`
-   * (documents with zero versions). Keyset by id (verify-plan §4).
+   * per-document walk and `chain.orphan_document` (documents with zero
+   * versions). Keyset by id (verify-plan §4).
    */
   documents_all(opts: {
     repo_id?: number;
@@ -353,17 +353,57 @@ export type Storage = {
   }): Promise<DocumentRow[]>;
 
   /**
-   * Distinct version ids present in the `chunks` table, keyset-paginated by
-   * version id (id > `after_id`, capped at `limit`). The kernel intersects
-   * these against live/all version ids for `chunks.orphan` (verify-plan §2.5).
+   * ALL versions of one document, ascending by id, chain-INDEPENDENT (a plain
+   * `where document_id = ?`, not a walk from the current version). The `chain`
+   * verify family needs this: a corrupt chain may have zero or two `next_id IS
+   * NULL` rows, which `version_history`'s recursive-from-current walk can't
+   * traverse. Empty when the document has no versions (verify-plan §2.1).
+   */
+  versions_by_document(document_id: number): Promise<VersionRow[]>;
+
+  /**
+   * Distinct version ids present in the `chunks` table (whether or not the
+   * version still exists / is live), keyset-paginated by version id. The
+   * `chunks.unembedded` check intersects live-version ids against this set to
+   * find live versions lacking chunks (verify-plan §2.5).
    */
   chunks_all_version_ids(opts: { after_id: number; limit: number }): Promise<number[]>;
 
   /**
    * Version ids present in the `embedding_backlog` table, keyset-paginated by
-   * version id. Feeds `chunks.backlog_orphan` (verify-plan §2.5).
+   * version id. With `chunks_all_version_ids`, tells `chunks.unembedded`
+   * which live versions have neither chunks nor a pending backlog entry.
    */
   backlog_all_version_ids(opts: { after_id: number; limit: number }): Promise<number[]>;
+
+  /**
+   * Distinct `chunks.version_id`s that have NO matching `versions` row — true
+   * orphans (an FK violation), keyset-paginated by version id. NOT
+   * merely-superseded versions: the embed worker legitimately leaves chunks on
+   * superseded versions (`worker.ts`), so "orphan" means the version is gone
+   * entirely (verify-plan §2.5). Whole-store (chunks aren't repo-partitioned).
+   */
+  chunks_orphan_version_ids(opts: { after_id: number; limit: number }): Promise<number[]>;
+
+  /**
+   * `embedding_backlog.version_id`s with no matching `versions` row, keyset by
+   * version id. Feeds `chunks.backlog_orphan` (verify-plan §2.5).
+   */
+  backlog_orphan_version_ids(opts: { after_id: number; limit: number }): Promise<number[]>;
+
+  /**
+   * Per-version distinct embedding dimensions across the `chunks` table, for
+   * version ids > `after_id`, capped at `limit` DISTINCT versions. "Dimension"
+   * is engine-defined but internally consistent (SQLite: blob byte length;
+   * Postgres: `vector_dims`) — only DISTINCTNESS matters: a version with more
+   * than one value has mixed-dimension vectors → `chunks.mixed_dim` (§2.5, the
+   * §5.3 "refuse mixed-dim writes" guard was bypassed). Null embeddings are
+   * ignored. Whole-store.
+   */
+  chunks_dims_by_version(opts: {
+    after_id: number;
+    limit: number;
+  }): Promise<{ version_id: number; dims: number[] }[]>;
 
   /**
    * All currently-live versions in a repo (i.e. rows where next_id IS NULL).

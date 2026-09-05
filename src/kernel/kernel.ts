@@ -846,6 +846,7 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
       const deps: VerifyDeps = {
         storage,
         serverPathConfig,
+        serverLinkConfig,
         embedderConfigured: queryEmbed !== undefined,
       };
       return runVerify(claimsFor(ctx), spec, deps);

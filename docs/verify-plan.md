@@ -93,10 +93,14 @@ Chunks + the embedding backlog (§5.3). `verify` checks *structural* consistency
 
 | `check` code | Severity | Condition |
 |---|---|---|
-| `chunks.orphan` | error | A `chunks` row references a non-live or nonexistent version. |
+| `chunks.orphan` | error | A `chunks` row references a **nonexistent** version (an FK violation — not merely a superseded one). |
 | `chunks.backlog_orphan` | error | An `embedding_backlog` row references a nonexistent version. |
 | `chunks.unembedded` | warn | A live version has neither chunk rows nor a backlog entry — it fell out of the embedding pipeline. `suggested_fix: "mrplex embed backfill"`. **Only runs when an embedder is configured** (see below); otherwise skipped entirely, not reported clean. |
 | `chunks.mixed_dim` | error | Chunk rows for one version carry vectors of differing dimensionality (§5.3 "refuse mixed-dim writes" — a finding means that guard was bypassed). |
+
+**"Orphan" means nonexistent, not non-live.** The embedding worker deliberately leaves chunks on *superseded* versions (it reuses their vectors on the next re-embed via `chunks_by_version(prev_id)` and never deletes them — `worker.ts`, `backfill.ts`). A superseded version keeping its chunks is normal, so `chunks.orphan` fires only when the referenced version row does not exist at all — reachable only if a foreign key was disabled. Cheap to check, and the only genuine inconsistency here.
+
+**Global vs. per-repo.** `chunks`, `embedding_backlog`, and `fts_docs` are **not repo-partitioned**. The orphan checks (`chunks.orphan`, `chunks.backlog_orphan`) reference versions that could belong to any repo — or to none, when the version is gone — so they, `chunks.mixed_dim`, and the whole `fts` family are **whole-store checks that run once per verify call and only in an all-repos run**. Under a `--repo` filter they are skipped-with-note (`checks_skipped: { check, reason: "whole-store check; omit --repo to run" }`), since a repo-scoped run can neither attribute nor bound them correctly. The exception is `chunks.unembedded`, which is about a *repo's* live versions lacking embeddings and therefore runs in the per-repo loop.
 
 **Embedder-gated coverage.** `chunks.unembedded` is meaningful only when embedding is actually intended for this store. A corpus that never configured an embedder has *every* live version "unembedded" — that's noise, not a finding. The check therefore runs **only when an embedder is configured**, resolved through the standard precedence (flag → `MRPLEX_EMBEDDER` env → config `embedder` → none; the §"Configuration" resolution the whole CLI already uses). No embedder configured ⇒ `chunks.unembedded` is *skipped* (the report notes it was skipped for lack of an embedder — not silently omitted, not reported clean). The orphan/provenance checks (`chunks.orphan`, `chunks.backlog_orphan`, `chunks.mixed_dim`) are unconditional: stray chunk rows referencing dead versions are a real inconsistency whether or not an embedder is *currently* wired up (they'd be residue from a past one).
 

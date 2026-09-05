@@ -92,9 +92,13 @@ describe("kernel.verify skeleton (WS1)", () => {
     const report = await kernel.verify({}, {});
     expect(report.findings).toEqual([]);
     expect(report.truncated).toBe(false);
-    expect(report.checks_skipped).toEqual([]);
     expect(report.counts.versions_scanned).toBe(0);
     expect(report.counts.documents_scanned).toBe(0);
+    // No embedder configured in this harness, so chunks.unembedded is
+    // skipped-and-noted (once, deduped across repos).
+    expect(report.checks_skipped).toEqual([
+      { check: "chunks.unembedded", reason: "no embedder configured" },
+    ]);
   });
 
   it("throws repo_not_found for an unknown --repo", async () => {
