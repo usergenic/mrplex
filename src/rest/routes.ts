@@ -19,7 +19,7 @@ import { KernelError } from "../kernel/errors.js";
 import type { Kernel } from "../kernel/kernel.js";
 import type { PathConfigOverride } from "../kernel/path-config.js";
 import type { QuerySpec } from "../kernel/query/query.js";
-import type { GraphSpec, QueryHit, Version } from "../kernel/wire.js";
+import type { GraphSpec, QueryHit, VerifySpec, Version } from "../kernel/wire.js";
 import { appendSystemProperty, extractSystemProperties } from "../markdown/frontmatter.js";
 import {
   type ContextForRequest,
@@ -256,6 +256,14 @@ async function dispatch(
     return dispatchQuery(req, res, kernel, query, method, contextForRequest);
   }
 
+  // /verify — whole-store integrity scrub (GET). Repo-less: runs every family
+  // including the whole-store fts/chunks orphan checks (verify-plan §2.5).
+  if (segments[0] === "verify" && segments.length === 1) {
+    if (method !== "GET") return methodNotAllowed(res, method, ["GET"]);
+    const ctx = await contextForRequest(req);
+    return dispatchVerify(res, kernel, ctx, undefined, query);
+  }
+
   // /repos and everything under it (config, docs, versions, history).
   if (segments[0] === "repos") {
     return dispatchRepos(req, res, kernel, storage, segments, query, method, contextForRequest);
@@ -426,6 +434,13 @@ async function dispatchRepos(
     return dispatchGraph(req, res, kernel, ctx, repoSlug, query, method);
   }
 
+  // /repos/{repo}/verify — scoped integrity scrub (GET). Per-repo: the
+  // whole-store fts/chunks orphan checks are skipped-with-note (verify-plan §2.5).
+  if (segments[2] === "verify" && segments.length === 3) {
+    if (method !== "GET") return methodNotAllowed(res, method, ["GET"]);
+    return dispatchVerify(res, kernel, ctx, repoSlug, query);
+  }
+
   notFound(res);
 }
 
@@ -486,6 +501,32 @@ function graphSpecFromQueryString(query: URLSearchParams, repoSlug: string): Gra
   const maxDocuments = readOptionalIntQueryParam(query, "max_documents");
   if (maxDocuments !== undefined) spec.max_documents = maxDocuments;
   return spec;
+}
+
+/**
+ * Verify read surface (docs/verify-plan.md §5). GET only — a scan is a
+ * point-in-time result, not a cacheable resource, so no ETag. `repoSlug`
+ * undefined = whole-store. Query params: `check` (repeatable/comma-joined),
+ * `severity` (min), `max_findings`.
+ */
+async function dispatchVerify(
+  res: ServerResponse,
+  kernel: Kernel,
+  ctx: CallContext,
+  repoSlug: string | undefined,
+  query: URLSearchParams,
+): Promise<void> {
+  const checks = collectListParam(query, "check");
+  const severity = query.get("severity");
+  const maxFindings = readOptionalIntQueryParam(query, "max_findings");
+  const spec: VerifySpec = {
+    ...(repoSlug !== undefined && { repo: repoSlug }),
+    ...(checks.length > 0 && { checks }),
+    ...((severity === "error" || severity === "warn") && { min_severity: severity }),
+    ...(maxFindings !== undefined && { max_findings: maxFindings }),
+  };
+  const report = await kernel.verify(ctx, spec);
+  writeJson(res, 200, report);
 }
 
 /** Flatten repeated and/or comma-joined query params into a string[]. */

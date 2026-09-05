@@ -34,6 +34,8 @@ import type {
   PathWarning,
   QueryHit,
   Repo,
+  VerifyReport,
+  VerifySpec,
   Version,
 } from "../kernel/wire.js";
 import type { LinkConfigOverride } from "../links/link-config.js";
@@ -208,6 +210,8 @@ function buildRemoteClient(client: Client): KernelClient {
     },
     graph: (spec: GraphSpec) =>
       call<GraphResult>("graph", spec as unknown as Record<string, unknown>),
+    verify: (spec: VerifySpec) =>
+      call<VerifyReport>("verify", spec as unknown as Record<string, unknown>),
     history: {
       since: (input) =>
         call<HistorySincePage>("history_since", input as unknown as Record<string, unknown>),

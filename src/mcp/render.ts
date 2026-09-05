@@ -8,7 +8,7 @@
  * humans; the MCP text rendering just has to be *readable*, not pretty.
  */
 
-import type { GraphResult, QueryHit, Repo, Version } from "../kernel/wire.js";
+import type { GraphResult, QueryHit, Repo, VerifyReport, Version } from "../kernel/wire.js";
 
 export function renderJson(x: unknown): string {
   return JSON.stringify(x, null, 2);
@@ -120,5 +120,47 @@ export function renderGraphSummary(result: GraphResult): string {
   if (result.truncated) trailer.push("truncated");
   lines.push(trailer.join(" · "));
 
+  return lines.join("\n");
+}
+
+/**
+ * Text half for `verify` (docs/verify-plan.md §5). A per-finding block grouped
+ * by check code, a summary line, and any skipped-check notes. Shared by the MCP
+ * tool and the CLI's default (non-JSON) output.
+ */
+export function renderVerifyReport(report: VerifyReport): string {
+  const lines: string[] = [];
+  const { versions_scanned, documents_scanned, by_severity } = report.counts;
+
+  if (report.findings.length === 0 && !report.truncated) {
+    lines.push("clean — no findings");
+  } else {
+    // Group findings by check code, preserving first-seen order.
+    const byCheck = new Map<string, typeof report.findings>();
+    for (const f of report.findings) {
+      const list = byCheck.get(f.check);
+      if (list) list.push(f);
+      else byCheck.set(f.check, [f]);
+    }
+    for (const [check, findings] of byCheck) {
+      const sev = findings[0]?.severity ?? "error";
+      lines.push(`${check} [${sev}] — ${findings.length}`);
+      for (const f of findings) {
+        const loc = f.path ?? f.version_id ?? f.document_id ?? "";
+        const fix = f.suggested_fix ? `  (fix: ${f.suggested_fix})` : "";
+        lines.push(`  ${f.repo}${loc ? `/${loc}` : ""}${fix}`);
+      }
+    }
+  }
+
+  const vLabel = `${versions_scanned} version${versions_scanned === 1 ? "" : "s"}`;
+  const dLabel = `${documents_scanned} document${documents_scanned === 1 ? "" : "s"}`;
+  const trunc = report.truncated ? " (findings truncated; counts exact)" : "";
+  lines.push(
+    `scanned ${vLabel} across ${dLabel}; ${by_severity.error} error, ${by_severity.warn} warn${trunc}`,
+  );
+  for (const s of report.checks_skipped) {
+    lines.push(`skipped ${s.check}: ${s.reason}`);
+  }
   return lines.join("\n");
 }
