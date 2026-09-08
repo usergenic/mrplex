@@ -37,9 +37,9 @@ afterEach(async () => {
 });
 
 describe("MCP lifecycle + tools/list", () => {
-  it("lists 24 tools (no user/token tools after noauth; links_* + set_link_config + query_syntax + graph + history_since/index/list + docs_get_many)", async () => {
+  it("lists 25 tools (no user/token tools after noauth; links_* + set_link_config + query_syntax + graph + verify + history_since/index/list + docs_get_many)", async () => {
     const r = await client.listTools();
-    expect(r.tools.length).toBe(24);
+    expect(r.tools.length).toBe(25);
     // Sample the important names.
     const names = new Set(r.tools.map((t) => t.name));
     for (const name of [
@@ -54,6 +54,7 @@ describe("MCP lifecycle + tools/list", () => {
       "query",
       "query_syntax",
       "graph",
+      "verify",
       "history_since",
       "links_backfill",
       "links_stale",
@@ -144,6 +145,25 @@ describe("MCP tools/call round-trip", () => {
       arguments: { repo: "notes", path: "a.md" },
     });
     expect((fetched.structuredContent as { version_id: string }).version_id).toBe("v1");
+  });
+
+  it("verify returns a structured report; clean store has no findings", async () => {
+    await client.callTool({ name: "repos_create", arguments: { repo: "notes" } });
+    await client.callTool({
+      name: "docs_create",
+      arguments: { repo: "notes", path: "a.md", body: "a\n", frontmatter: {} },
+    });
+    const r = await client.callTool({ name: "verify", arguments: {} });
+    expect(r.isError).toBeFalsy();
+    const report = r.structuredContent as {
+      findings: unknown[];
+      counts: { documents_scanned: number };
+      checks_skipped: { check: string }[];
+      truncated: boolean;
+    };
+    expect(report.findings).toEqual([]);
+    expect(report.counts.documents_scanned).toBe(1);
+    expect(report.truncated).toBe(false);
   });
 
   it("docs_get_many returns items and per-path errors; isError is false on partial miss", async () => {

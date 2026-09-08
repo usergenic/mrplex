@@ -100,6 +100,7 @@ function buildClient(
     },
     query: (spec) => kernel.query(ctx, spec),
     graph: (spec) => kernel.graph(ctx, spec),
+    verify: (spec) => kernel.verify(ctx, spec),
     history: {
       since: (input) => kernel.history.since(ctx, input),
       index: (input) => kernel.history.index(ctx, input),

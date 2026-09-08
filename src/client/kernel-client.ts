@@ -30,6 +30,8 @@ import type {
   PathWarning,
   QueryHit,
   Repo,
+  VerifyReport,
+  VerifySpec,
   Version,
 } from "../kernel/wire.js";
 import type { LinkConfigOverride } from "../links/link-config.js";
@@ -87,6 +89,7 @@ export type KernelClient = {
   };
   query(spec: QuerySpec): Promise<QueryHit[]>;
   graph(spec: GraphSpec): Promise<GraphResult>;
+  verify(spec: VerifySpec): Promise<VerifyReport>;
   history: {
     since(input: {
       after_version: string;

@@ -19,7 +19,7 @@ import { KernelError } from "../kernel/errors.js";
 import type { Kernel } from "../kernel/kernel.js";
 import type { PathConfigOverride } from "../kernel/path-config.js";
 import type { QuerySpec } from "../kernel/query/query.js";
-import type { GraphSpec, Version } from "../kernel/wire.js";
+import type { GraphSpec, VerifyReport, VerifySpec, Version } from "../kernel/wire.js";
 import type { LinkConfigOverride } from "../links/link-config.js";
 import { appendSystemProperty, extractSystemProperties } from "../markdown/frontmatter.js";
 import { QUERY_SYNTAX_DOC } from "./query-syntax.js";
@@ -29,6 +29,7 @@ import {
   renderJson,
   renderQueryHitList,
   renderRepoList,
+  renderVerifyReport,
   renderVersion,
   renderVersionList,
 } from "./render.js";
@@ -477,6 +478,67 @@ const GRAPH_LINK_SCHEMA: JsonSchemaProp = {
   required: ["source", "target", "field"],
 };
 
+const VERIFY_FINDING_SCHEMA: JsonSchemaProp = {
+  type: "object",
+  description: "One inconsistency found by verify (docs/verify-plan.md §3).",
+  properties: {
+    check: { type: "string", description: "Stable check code, e.g. `chain.prev_next_asymmetry`." },
+    severity: {
+      type: "string",
+      enum: ["error", "warn"],
+      description: "`error` = a real inconsistency; `warn` = suspicious/legacy.",
+    },
+    repo: { type: "string", description: "Repo slug." },
+    document_id: { type: "string", description: "Opaque document id, when doc-scoped." },
+    version_id: { type: "string", description: "Opaque version id, when version-scoped." },
+    path: { type: "string", description: "Offending version's path, when known + readable." },
+    detail: { type: "object", additionalProperties: true, description: "Check-specific payload." },
+    suggested_fix: { type: "string", description: "Human hint at the remedy; never auto-run." },
+  },
+  required: ["check", "severity", "repo", "detail"],
+};
+
+const VERIFY_RESULT_SCHEMA: JsonSchema = {
+  type: "object",
+  description: "Structured integrity report (docs/verify-plan.md §3).",
+  properties: {
+    findings: {
+      type: "array",
+      items: VERIFY_FINDING_SCHEMA,
+      description: "Inconsistencies found.",
+    },
+    counts: {
+      type: "object",
+      properties: {
+        versions_scanned: { type: "integer" },
+        documents_scanned: { type: "integer" },
+        by_check: { type: "object", additionalProperties: { type: "integer" } },
+        by_severity: {
+          type: "object",
+          properties: { error: { type: "integer" }, warn: { type: "integer" } },
+          required: ["error", "warn"],
+        },
+      },
+      required: ["versions_scanned", "documents_scanned", "by_check", "by_severity"],
+    },
+    checks_skipped: {
+      type: "array",
+      description:
+        "Families/checks that did not run and why (e.g. fts on postgres, chunks.unembedded with no embedder).",
+      items: {
+        type: "object",
+        properties: { check: { type: "string" }, reason: { type: "string" } },
+        required: ["check", "reason"],
+      },
+    },
+    truncated: {
+      type: "boolean",
+      description: "True if max_findings capped the list (counts stay exact).",
+    },
+  },
+  required: ["findings", "counts", "checks_skipped", "truncated"],
+};
+
 const GRAPH_RESULT_SCHEMA: JsonSchema = {
   type: "object",
   description: "A graph neighborhood: documents and the links between them (docs/graph-plan.md).",
@@ -715,7 +777,11 @@ export const TOOL_REGISTRY: ToolEntry[] = [
     outputSchema: DOC_GET_MANY_RESULT_SCHEMA,
     handler: async (kernel, ctx, args) => {
       const raw = args.raw === true;
-      const result = await kernel.docs.get_many(ctx, argStr(args, "repo"), argStrArray(args, "paths"));
+      const result = await kernel.docs.get_many(
+        ctx,
+        argStr(args, "repo"),
+        argStrArray(args, "paths"),
+      );
       const items = result.items.map((v) => withInjectedSystemProps(v, raw));
       const structured = { items, errors: result.errors };
       return { structured, text: renderDocGetManyText(items, result.errors) };
@@ -820,8 +886,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
   },
   {
     name: "docs_diff",
-    description:
-      `Unified diff between two versions of the document at (repo, path). ${EXACT_PATH_DOC} Both versions must belong to that document — otherwise version_not_in_document.`,
+    description: `Unified diff between two versions of the document at (repo, path). ${EXACT_PATH_DOC} Both versions must belong to that document — otherwise version_not_in_document.`,
     inputSchema: {
       type: "object",
       properties: {
@@ -846,8 +911,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
   },
   {
     name: "docs_create",
-    description:
-      `Create a new document at (repo, path). ${EXACT_PATH_DOC} Fails with create_conflict if the path is occupied. Provide exactly one of \`frontmatter\` (JSON map) or \`frontmatter_raw\` (verbatim YAML).`,
+    description: `Create a new document at (repo, path). ${EXACT_PATH_DOC} Fails with create_conflict if the path is occupied. Provide exactly one of \`frontmatter\` (JSON map) or \`frontmatter_raw\` (verbatim YAML).`,
     inputSchema: {
       type: "object",
       properties: {
@@ -1237,6 +1301,69 @@ export const TOOL_REGISTRY: ToolEntry[] = [
         }
         throw err;
       }
+    },
+  },
+  {
+    name: "verify",
+    description:
+      "Read-only integrity scrub — re-derives the FTS / links / hash indexes and checks the " +
+      "version chain, reporting inconsistencies as structured `findings`; never writes. Run it " +
+      "during maintenance or when you suspect corruption (e.g. after a batch of writes). Six check " +
+      "families — `chain` (version-chain structure), `hash` (content-hash fidelity), `frontmatter` " +
+      "(raw↔parsed round-trip), `fts` (SQLite index membership), `chunks` (embedding provenance), " +
+      "`links` (link index vs. re-extraction). `findings` are data, not errors — a clean store " +
+      "returns an empty list. Omit `repo` to scan the whole store (required for the whole-store " +
+      "`fts` / `chunks` orphan checks); pass `repo` to scan one. `checks` selects families " +
+      "(`chain`) or full codes (`links.set_mismatch`). `checks_skipped` names what didn't run and " +
+      "why. O(total versions) — it walks history, so it's heavier than ordinary reads.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: {
+          type: "string",
+          description:
+            "Repo slug to scan; omit for the whole store. Whole-store checks (fts, chunks orphan) " +
+            "run only in an all-repos scan.",
+        },
+        checks: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Family prefixes (`chain`, `links`) or full codes (`hash.mismatch`); omit for all.",
+        },
+        min_severity: {
+          type: "string",
+          enum: ["error", "warn"],
+          description:
+            "Drop findings below this severity from the list (counts stay full). Default warn.",
+        },
+        max_findings: {
+          type: "integer",
+          minimum: 1,
+          description:
+            "Cap the emitted findings list (counts stay exact; sets `truncated`). Default 10000.",
+        },
+        scope: {
+          type: "array",
+          description: "Read-visibility claims (ScopeClaim[]); the X-Mrplex-Scope header wins.",
+          items: { type: "object", additionalProperties: true },
+        },
+      },
+    },
+    outputSchema: VERIFY_RESULT_SCHEMA,
+    handler: async (kernel, ctx, args) => {
+      const order = argStrOpt(args, "min_severity");
+      const spec: VerifySpec = {
+        repo: argStrOpt(args, "repo"),
+        checks: Array.isArray(args.checks) ? (args.checks as string[]) : undefined,
+        min_severity: order === "error" || order === "warn" ? order : undefined,
+        max_findings: argIntOpt(args, "max_findings"),
+      };
+      const report = await kernel.verify(queryCtx(ctx, args), spec);
+      return {
+        structured: report as unknown as Record<string, unknown>,
+        text: renderVerifyReport(report),
+      };
     },
   },
   {

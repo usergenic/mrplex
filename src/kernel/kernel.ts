@@ -66,6 +66,7 @@ import {
   validateRepoOverride,
 } from "./path-config.js";
 import { type QuerySpec, DEFAULT_QUERY_LIMIT, runQuery } from "./query/query.js";
+import { type VerifyDeps, runVerify } from "./verify/verify.js";
 import {
   isPathGlobPattern,
   normalizeExactDocumentPath,
@@ -83,6 +84,8 @@ import type {
   PathWarning,
   QueryHit,
   Repo,
+  VerifyReport,
+  VerifySpec,
   Version,
 } from "./wire.js";
 
@@ -179,6 +182,8 @@ export type Kernel = {
   query(ctx: CallContext, spec: QuerySpec): Promise<QueryHit[]>;
   /** Neighborhood expansion over the links index (docs/graph-plan.md). */
   graph(ctx: CallContext, spec: GraphSpec): Promise<GraphResult>;
+  /** Read-only integrity scrub over the store (docs/verify-plan.md). */
+  verify(ctx: CallContext, spec: VerifySpec): Promise<VerifyReport>;
   /** Change-log read surface keyed by version-log position (sync/history §3). */
   history: {
     /** The global change feed — the longest gap-free run after the cursor. */
@@ -832,6 +837,19 @@ export function createKernel(config: KernelConfig | Storage): Kernel {
           : effectivePathConfig(serverPathConfig, parseRepoOverride(repo.path_config));
       const deps: GraphDeps = { storage, serverPathConfig, pathConfig };
       return runGraph(claimsFor(ctx), spec, deps);
+    },
+
+    async verify(ctx: CallContext, spec: VerifySpec): Promise<VerifyReport> {
+      // A configured query-embed hook is the resolved "embedder configured"
+      // signal — it comes from the same flag→env→config resolution the surfaces
+      // apply. Gates the chunks.unembedded check (verify-plan §2.5).
+      const deps: VerifyDeps = {
+        storage,
+        serverPathConfig,
+        serverLinkConfig,
+        embedderConfigured: queryEmbed !== undefined,
+      };
+      return runVerify(claimsFor(ctx), spec, deps);
     },
 
     history: {

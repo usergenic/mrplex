@@ -665,3 +665,45 @@ describe("REST error mapping", () => {
     expect([201, 400]).toContain(r.status);
   });
 });
+
+describe("REST verify", () => {
+  beforeEach(async () => {
+    await fetch(`${base}/repos`, {
+      method: "POST",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ slug: "notes" }),
+    });
+    await fetch(`${base}/repos/notes/docs/a.md`, {
+      method: "PUT",
+      headers: { ...authHeaders(), "Content-Type": "text/markdown", "If-None-Match": "*" },
+      body: "---\nstatus: draft\n---\nfoo\n",
+    });
+  });
+
+  it("GET /verify returns a clean whole-store report", async () => {
+    const r = await fetch(`${base}/verify`, { headers: authHeaders() });
+    expect(r.status).toBe(200);
+    const report = await readJson<{
+      findings: unknown[];
+      counts: { documents_scanned: number };
+      truncated: boolean;
+    }>(r);
+    expect(report.findings).toEqual([]);
+    expect(report.counts.documents_scanned).toBe(1);
+  });
+
+  it("GET /repos/{repo}/verify scopes to one repo and skips whole-store fts", async () => {
+    const r = await fetch(`${base}/repos/notes/verify?check=fts`, { headers: authHeaders() });
+    expect(r.status).toBe(200);
+    const report = await readJson<{ checks_skipped: { check: string; reason: string }[] }>(r);
+    expect(report.checks_skipped).toContainEqual({
+      check: "fts",
+      reason: "whole-store check; omit --repo to run",
+    });
+  });
+
+  it("verify is GET-only", async () => {
+    const r = await fetch(`${base}/verify`, { method: "POST", headers: authHeaders() });
+    expect(r.status).toBe(405);
+  });
+});
