@@ -268,6 +268,57 @@ describe("MCP $version round-trip", () => {
     const rRaw = (rawResp.structuredContent as { frontmatter_raw: string }).frontmatter_raw;
     expect(rRaw).not.toContain("$version");
   });
+
+  it("docs_put with no prev creates a new document at an empty path", async () => {
+    await client.callTool({ name: "repos_create", arguments: { repo: "notes" } });
+    const put = await client.callTool({
+      name: "docs_put",
+      arguments: {
+        repo: "notes",
+        path: "fresh.md",
+        body: "brand new",
+        frontmatter: { status: "draft" },
+      },
+    });
+    expect(put.isError).toBeFalsy();
+    const v = put.structuredContent as { version_id: string; prev_version_id: string | null };
+    expect(v.version_id).toBe("v1");
+    expect(v.prev_version_id).toBeNull();
+    const got = await client.callTool({
+      name: "docs_get",
+      arguments: { repo: "notes", path: "fresh.md" },
+    });
+    expect((got.structuredContent as { body: string }).body).toBe("brand new");
+  });
+
+  it("docs_put with no prev on an occupied path → create_conflict (no blind overwrite)", async () => {
+    await client.callTool({ name: "repos_create", arguments: { repo: "notes" } });
+    await client.callTool({
+      name: "docs_create",
+      arguments: {
+        repo: "notes",
+        path: "a.md",
+        body: "original",
+        frontmatter: { status: "draft" },
+      },
+    });
+    const put = await client.callTool({
+      name: "docs_put",
+      arguments: { repo: "notes", path: "a.md", body: "clobber" },
+    });
+    expect(put.isError).toBe(true);
+    const content = (put.content as { type: string; text: string }[])[0];
+    expect(content).toBeDefined();
+    const parsed = JSON.parse((content as { text: string }).text);
+    expect(parsed.code).toBe("create_conflict");
+    expect(parsed.data.current_version_id).toBe("v1");
+    // The original body must be untouched.
+    const got = await client.callTool({
+      name: "docs_get",
+      arguments: { repo: "notes", path: "a.md" },
+    });
+    expect((got.structuredContent as { body: string }).body).toBe("original");
+  });
 });
 
 describe("MCP in-band errors", () => {

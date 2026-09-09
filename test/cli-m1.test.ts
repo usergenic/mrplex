@@ -103,6 +103,31 @@ describe("cli — end-to-end write flow", () => {
     expect(history[0]?.version_id).toBe(v5.version_id);
   });
 
+  it("put with no --prev creates a new document at an empty path", () => {
+    expect(run(["repos", "create", "notes"]).status).toBe(0);
+    const put = run(["--json", "docs", "put", "fresh.md", "--from-file", "-"], {
+      stdin: "---\ntitle: Fresh\n---\nborn via put\n",
+    });
+    expect(put.status).toBe(0);
+    const v = JSON.parse(put.stdout) as { version_id: string; body: string; path: string };
+    expect(v.version_id).toBe("v1");
+    expect(v.body).toBe("born via put\n");
+    expect(v.path).toBe("fresh.md");
+  });
+
+  it("put with no --prev on an occupied path → create_conflict (exit 2)", () => {
+    expect(run(["repos", "create", "notes"]).status).toBe(0);
+    expect(
+      run(["docs", "create", "a.md", "--from-file", "-"], { stdin: "---\n---\noriginal\n" }).status,
+    ).toBe(0);
+    const put = run(["docs", "put", "a.md", "--from-file", "-"], { stdin: "---\n---\nclobber\n" });
+    expect(put.status).toBe(2);
+    expect(put.stderr).toContain("create_conflict");
+    // Original must survive.
+    const got = run(["--json", "docs", "get", "a.md"]);
+    expect((JSON.parse(got.stdout) as { body: string }).body).toBe("original\n");
+  });
+
   it("stale_prev exits 2 with current attached", () => {
     expect(run(["repos", "create", "notes"]).status).toBe(0);
     const created = run(["--json", "docs", "create", "x.md", "--from-file", "-"], {
