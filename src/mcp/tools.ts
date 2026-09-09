@@ -945,7 +945,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
   {
     name: "docs_put",
     description:
-      "Update or move a document (optimistic concurrency). `path` may differ from prev's path (= move). Exactly one of `frontmatter` | `frontmatter_raw` if changing frontmatter; both may be omitted to keep prev's. `prev_version_id` may be omitted if `frontmatter_raw` embeds `$version: <id>` from a prior `docs_get`. Conflicts: stale_prev (someone else wrote first — re-read and retry), path_taken (move onto an occupied path).",
+      "Upsert or move a document (optimistic concurrency). With a prev: update/move the existing document — `path` may differ from prev's path (= move). Exactly one of `frontmatter` | `frontmatter_raw` if changing frontmatter; both may be omitted to keep prev's. `prev_version_id` may be omitted if `frontmatter_raw` embeds `$version: <id>` from a prior `docs_get`. With NO prev: create a new document at `path` — but if a document already exists there you get create_conflict (carrying the current version id), so re-read and pass its `prev_version_id` to update it (this guards against blind overwrites). Conflicts: stale_prev (someone else wrote first — re-read and retry), path_taken (move onto an occupied path), create_conflict (no-prev create onto an occupied path).",
     inputSchema: {
       type: "object",
       properties: {
@@ -991,10 +991,22 @@ export const TOOL_REGISTRY: ToolEntry[] = [
         }
       }
       const prev = argStrOpt(args, "prev_version_id") ?? embeddedVersion;
+      // No prev → create-if-absent. Delegating to `create` means an occupied
+      // path raises create_conflict (carrying the current version id) rather
+      // than silently overwriting — the caller must re-read and pass the prev.
       if (prev === undefined) {
-        throw new Error(
-          "prev_version_id is required (either as an argument or as `$version` in frontmatter_raw)",
+        const createInput: { frontmatter?: never; frontmatter_raw?: string; body: string } = {
+          body: input.body ?? "",
+        };
+        if (input.frontmatter !== undefined) createInput.frontmatter = input.frontmatter as never;
+        else createInput.frontmatter_raw = input.frontmatter_raw ?? "";
+        const created = await kernel.docs.create(
+          writeCtx(ctx, args),
+          argStr(args, "repo"),
+          argStr(args, "path"),
+          createInput,
         );
+        return { structured: created, text: renderVersion(created) };
       }
 
       const v = await kernel.docs.put(

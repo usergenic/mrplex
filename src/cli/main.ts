@@ -1306,10 +1306,12 @@ function buildProgram(): Command {
 
   docs
     .command("put <path>")
-    .description("update or move a document — path may differ from prev's path")
+    .description(
+      "upsert or move a document — with --prev: update/move (path may differ from prev's); with no prev: create at <path> (create_conflict if occupied, so re-read and pass --prev to update)",
+    )
     .option(
       "--prev <version-id>",
-      "current version id (from get / history) — optional if the input's frontmatter carries `$version: <id>`",
+      "current version id (from get / history) — optional if the input's frontmatter carries `$version: <id>`; omit entirely to create a new document",
     )
     .option("--from-file <file>", "read the markdown from a file or '-' for stdin")
     .action(function (this: Command, path: string) {
@@ -1334,12 +1336,16 @@ function buildProgram(): Command {
           }
         }
         const prev = localOpts.prev ?? embeddedVersion;
+        // No prev → create-if-absent. Delegating to create means an occupied
+        // path raises create_conflict rather than clobbering — the caller must
+        // re-read and pass --prev (or `$version`) to update the existing doc.
         if (prev === undefined) {
-          const err = new Error(
-            "no prev version — pass --prev, or provide `$version: <id>` in the input frontmatter",
-          );
-          (err as unknown as { code: string }).code = "cli_usage";
-          throw err;
+          const created = await client.docs.create(repo, path, {
+            frontmatter_raw: input.frontmatter_raw ?? "",
+            body: input.body ?? "",
+          });
+          emitVersionWrite(created, opts);
+          return;
         }
         const result = await client.docs.put(repo, prev, path, input);
         emitVersionWrite(result, opts);
