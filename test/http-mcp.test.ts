@@ -37,9 +37,9 @@ afterEach(async () => {
 });
 
 describe("MCP lifecycle + tools/list", () => {
-  it("lists 25 tools (no user/token tools after noauth; links_* + set_link_config + query_syntax + graph + verify + history_since/index/list + docs_get_many)", async () => {
+  it("lists 26 tools (no user/token tools after noauth; links_* + set_link_config + query_syntax + graph + verify + history_since/index/list + docs_get_many + docs_append)", async () => {
     const r = await client.listTools();
-    expect(r.tools.length).toBe(25);
+    expect(r.tools.length).toBe(26);
     // Sample the important names.
     const names = new Set(r.tools.map((t) => t.name));
     for (const name of [
@@ -49,6 +49,7 @@ describe("MCP lifecycle + tools/list", () => {
       "docs_get_many",
       "docs_create",
       "docs_put",
+      "docs_append",
       "docs_delete",
       "docs_diff",
       "query",
@@ -89,9 +90,32 @@ describe("MCP lifecycle + tools/list", () => {
       '["$path"]',
       "docs_get",
       "docs_get_many",
+      // Body-replace semantics + the append affordance (the anti-clobber guidance).
+      "docs_append",
+      "REPLACES",
     ]) {
       expect(instructions).toContain(needle);
     }
+  });
+
+  it("the docs_put description states replace-not-append semantics and points at docs_append", async () => {
+    const r = await client.listTools();
+    const put = r.tools.find((t) => t.name === "docs_put");
+    expect(put?.description).toContain("REPLACES");
+    expect(put?.description).toContain("docs_append");
+    // Omitting body to keep the prior body is the documented no-op-body path.
+    expect(put?.description?.toLowerCase()).toContain("omit");
+  });
+
+  it("the docs_append description teaches append-without-resend and the create-first requirement", async () => {
+    const r = await client.listTools();
+    const append = r.tools.find((t) => t.name === "docs_append");
+    expect(append?.description).toContain("Append");
+    expect(append?.description).toContain("doc_not_found");
+    expect(append?.description).toContain("docs_create");
+    const sepDesc = (append?.inputSchema.properties as Record<string, { description?: string }>)
+      .separator?.description;
+    expect(sepDesc).toContain("blank line");
   });
 
   it("the query tool description teaches the filter language, default $path-only select, and points at query_syntax", async () => {
@@ -201,6 +225,133 @@ describe("MCP tools/call round-trip", () => {
     const items = (r.structuredContent as { items: unknown[] }).items;
     expect(Array.isArray(items)).toBe(true);
     expect(items.length).toBe(1);
+  });
+});
+
+describe("MCP docs_append", () => {
+  async function body(path: string): Promise<string> {
+    const r = await client.callTool({ name: "docs_get", arguments: { repo: "notes", path } });
+    return (r.structuredContent as { body: string }).body;
+  }
+
+  beforeEach(async () => {
+    await client.callTool({ name: "repos_create", arguments: { repo: "notes" } });
+  });
+
+  it("appends after a blank-line separator, preserving the prior body and frontmatter", async () => {
+    await client.callTool({
+      name: "docs_create",
+      arguments: {
+        repo: "notes",
+        path: "j.md",
+        body: "# Journal\n\n## first",
+        frontmatter: { title: "J" },
+      },
+    });
+    const appended = await client.callTool({
+      name: "docs_append",
+      arguments: { repo: "notes", path: "j.md", text: "## second" },
+    });
+    expect(appended.isError).toBeFalsy();
+    // New version, prior body preserved byte-for-byte + blank-line separator.
+    expect(await body("j.md")).toBe("# Journal\n\n## first\n\n## second");
+    // Frontmatter carried forward unchanged.
+    const got = await client.callTool({
+      name: "docs_get",
+      arguments: { repo: "notes", path: "j.md" },
+    });
+    expect((got.structuredContent as { frontmatter: { title: string } }).frontmatter.title).toBe(
+      "J",
+    );
+  });
+
+  it("honors a custom separator and appends directly with an empty one", async () => {
+    await client.callTool({
+      name: "docs_create",
+      arguments: { repo: "notes", path: "log.md", body: "line1", frontmatter: {} },
+    });
+    await client.callTool({
+      name: "docs_append",
+      arguments: { repo: "notes", path: "log.md", text: "line2", separator: "\n" },
+    });
+    await client.callTool({
+      name: "docs_append",
+      arguments: { repo: "notes", path: "log.md", text: "!", separator: "" },
+    });
+    expect(await body("log.md")).toBe("line1\nline2!");
+  });
+
+  it("raises doc_not_found when the document does not exist", async () => {
+    const r = await client.callTool({
+      name: "docs_append",
+      arguments: { repo: "notes", path: "nope.md", text: "x" },
+    });
+    expect(r.isError).toBe(true);
+    const payload = JSON.parse((r.content as { text: string }[])[0].text) as { code: string };
+    expect(payload.code).toBe("doc_not_found");
+  });
+});
+
+describe("MCP body-placeholder guard", () => {
+  beforeEach(async () => {
+    await client.callTool({ name: "repos_create", arguments: { repo: "notes" } });
+  });
+
+  function code(r: Awaited<ReturnType<Client["callTool"]>>): string {
+    return (JSON.parse((r.content as { text: string }[])[0].text) as { code: string }).code;
+  }
+
+  it("refuses a docs_create body that is only an append/keep sentinel", async () => {
+    for (const sentinel of ["{{APPEND}}", "$KEEP", "<<body>>", "$KEEP\n\n## new section"]) {
+      const r = await client.callTool({
+        name: "docs_create",
+        arguments: {
+          repo: "notes",
+          path: `p-${sentinel.length}.md`,
+          body: sentinel,
+          frontmatter: {},
+        },
+      });
+      expect(r.isError).toBe(true);
+      expect(code(r)).toBe("body_placeholder_suspected");
+    }
+  });
+
+  it("refuses a docs_put body that is a lone template token", async () => {
+    await client.callTool({
+      name: "docs_create",
+      arguments: { repo: "notes", path: "d.md", body: "real content", frontmatter: {} },
+    });
+    const got = await client.callTool({
+      name: "docs_get",
+      arguments: { repo: "notes", path: "d.md" },
+    });
+    const prev = (got.structuredContent as { version_id: string }).version_id;
+    const r = await client.callTool({
+      name: "docs_put",
+      arguments: { repo: "notes", path: "d.md", prev_version_id: prev, body: "{{ body }}" },
+    });
+    expect(r.isError).toBe(true);
+    expect(code(r)).toBe("body_placeholder_suspected");
+    // The document is untouched — the guard fired before any write.
+    const after = await client.callTool({
+      name: "docs_get",
+      arguments: { repo: "notes", path: "d.md" },
+    });
+    expect((after.structuredContent as { body: string }).body).toBe("real content");
+  });
+
+  it("allows ordinary bodies that merely contain such tokens mid-text", async () => {
+    const r = await client.callTool({
+      name: "docs_create",
+      arguments: {
+        repo: "notes",
+        path: "ok.md",
+        body: "# Doc\n\nUse `{{APPEND}}` — wait, no, mrplex has no such token.",
+        frontmatter: {},
+      },
+    });
+    expect(r.isError).toBeFalsy();
   });
 });
 

@@ -25,6 +25,12 @@ export type KernelErrorCode =
   // on `code`. M3 added both.
   | "precondition_required" // REST: PUT/DELETE without If-Match / If-None-Match (§m3-plan decision 5)
   | "payload_too_large" // REST: body exceeded MAX_BODY_BYTES
+  // MCP write guard: a docs_create/docs_put/docs_append body whose first
+  // non-empty line is a lone append/keep sentinel or template token
+  // (`$KEEP`, `{{APPEND}}`, …). mrplex has no append/templating — body
+  // replaces wholesale — so this is almost always a caller confusion that
+  // would clobber the doc with a literal token. We refuse and teach instead.
+  | "body_placeholder_suspected"
   // M4 (m4-plan §5 decision 4): semantic query arrived with no hook
   // configured, OR the hook failed at query time. Distinct from
   // filter_invalid (the query is well-formed) and from write-path
@@ -66,6 +72,7 @@ export const KERNEL_ERROR_CODES: ReadonlySet<KernelErrorCode> = new Set<KernelEr
   "forbidden",
   "precondition_required",
   "payload_too_large",
+  "body_placeholder_suspected",
   "semantic_unavailable",
 ]);
 

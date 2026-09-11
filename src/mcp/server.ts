@@ -22,7 +22,6 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import type { CallContext } from "../kernel/context.js";
 import { KernelError } from "../kernel/errors.js";
 import type { Kernel } from "../kernel/kernel.js";
-import { VERSION } from "../version.js";
 import {
   type ContextForRequest,
   type KernelForRequest,
@@ -30,6 +29,7 @@ import {
 } from "../server/headers.js";
 import { httpErrorForThrowable } from "../server/http-error.js";
 import type { Storage } from "../storage/types.js";
+import { VERSION } from "../version.js";
 import { TOOL_REGISTRY, toolByName } from "./tools.js";
 
 export type McpConfig = {
@@ -124,6 +124,7 @@ const SERVER_INSTRUCTIONS = `mrplex is a queryable, versioned store for Markdown
 Conventions:
 - Reads (docs_get / docs_get_version) return frontmatter_raw with server-injected \`$version: <version_id>\` then \`$content_hash: <sha256>\` lines (unless raw: true). Pass that frontmatter_raw back to docs_put unchanged and prev_version_id may be omitted — the embedded $version supplies it. \`$\`-prefixed frontmatter keys are server-owned and are stripped from writes.
 - Writes use optimistic concurrency: docs_put / docs_delete need the previous version id; a \`stale_prev\` error means someone else wrote first — re-read (docs_get) and retry against the new version.
+- docs_put's \`body\` REPLACES the prior body wholesale — there is no append, merge, or templating. mrplex is not a template engine: tokens like \`{{APPEND}}\`, \`$KEEP\`, or \`<<body>>\` in a body are stored literally, not expanded (the only write-interpreted \`$\` key is \`$version\` in frontmatter). To ADD to a document (a journal, a log), call \`docs_append\` with just the new text — the server preserves the existing body and appends. To change only frontmatter, omit \`body\` and the prior body is kept. A body that is just such a sentinel is refused with \`body_placeholder_suspected\`.
 - When writing frontmatter, provide exactly one of \`frontmatter\` (JSON object) or \`frontmatter_raw\` (verbatim YAML).
 - \`query\` searches current documents and returns lean projected hits, not full documents. Default \`select\` is ["$path"] — each hit is only \`{ "$path": "…" }\` (no body, no frontmatter, no version id). Pass \`select\` to project more (\`$body\`, \`$repo\`, \`$version_id\`, \`$content_hash\`, \`$semantic_score\`, frontmatter keys, …). \`semantic\` activates embedding-based retrieval; add \`$semantic_score\` to \`select\` for cosine similarity (1 = identical). Call \`docs_get\` (one path) or \`docs_get_many\` (batch) to recover whole documents. The filter is CEL with \`$\`-prefixed intrinsics ($path, $updated_at, $body, $content_hash) and link-graph predicates ($in, $has, $backlinks(), $links()). Call the \`query_syntax\` tool for the full language reference before writing a non-trivial filter.
 - Tool failures return an in-band error (isError: true) with a JSON object { code, data } in the text content: e.g. filter_invalid (bad query — data.reason explains, data.hint says what to consult), stale_prev (concurrency conflict), doc_not_found, semantic_unavailable (no embedding hook configured). Codes are stable; reasons are prose. Error results carry no structuredContent (tool outputSchema describes success shapes only).`;

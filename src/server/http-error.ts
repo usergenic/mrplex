@@ -69,6 +69,7 @@ export function httpStatusFor(code: KernelErrorCode): number {
     case "frontmatter_invalid":
     case "filter_invalid":
     case "link_config_invalid":
+    case "body_placeholder_suspected":
       return 400;
     case "semantic_unavailable":
       return 503;

@@ -174,6 +174,50 @@ function queryCtx(ctx: CallContext, args: Record<string, unknown>): CallContext 
   return { ...ctx, scope: validateScopeClaims(scope) };
 }
 
+/** Bounded optimistic-retry budget for the server-side append read-modify-write. */
+const APPEND_MAX_ATTEMPTS = 5;
+
+/**
+ * A body-write's first non-empty line consisting of NOTHING but a sentinel-
+ * shaped token: `$KEEP` / `$APPEND` (a `$` + all-caps word), `{{APPEND}}` /
+ * `{{ body }}` (a mustache token), or `<<keep>>`. These are the tokens agents
+ * confabulate when they expect `body` to support an append/keep/merge or
+ * template expansion — mrplex supports none of those, so the token would be
+ * stored literally and clobber the document. The pattern only ever fires on a
+ * *lone* token line; a real Markdown body essentially never opens that way.
+ */
+const PLACEHOLDER_TOKEN = /^(\$[A-Z][A-Z0-9_]*|\{\{\s*[^}]*\}\}|<<[^>]*>>)$/;
+
+/** Return the offending sentinel token if `body`'s first non-empty line is one. */
+function placeholderToken(body: string | undefined): string | null {
+  if (body === undefined) return null;
+  for (const line of body.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0) continue; // skip leading blank lines
+    return PLACEHOLDER_TOKEN.test(trimmed) ? trimmed : null;
+  }
+  return null;
+}
+
+/**
+ * Guard a create/put/append body against the "there must be an append/keep
+ * sentinel" mistake. Throws a teaching `body_placeholder_suspected` error —
+ * pointing at `docs_append`, whole-body rewrite, or omitting `body` — instead
+ * of silently writing the literal token over the document.
+ */
+function assertNotPlaceholderBody(body: string | undefined): void {
+  const token = placeholderToken(body);
+  if (token === null) return;
+  throw new KernelError("body_placeholder_suspected", {
+    detected: token,
+    reason: `body starts with a lone \`${token}\`, which looks like an append/keep sentinel or template token. mrplex has no append, merge, or templating: \`body\` REPLACES the prior body wholesale, and any such token is stored verbatim (clobbering the document).`,
+    hint:
+      "To ADD to a document, call `docs_append` — send only the new text; the server preserves the " +
+      "existing body. To rewrite it, `docs_get` the current body, edit the whole thing, then " +
+      "`docs_put` it back. To change only frontmatter, omit `body` entirely (the prior body is kept).",
+  });
+}
+
 /**
  * Append the injected system properties — `$version` then `$content_hash`, in
  * fixed order (sync/history plan §2.4) — to `frontmatter_raw` unless the caller
@@ -929,6 +973,8 @@ export const TOOL_REGISTRY: ToolEntry[] = [
     },
     outputSchema: VERSION_SCHEMA,
     handler: async (kernel, ctx, args) => {
+      const body = argStr(args, "body");
+      assertNotPlaceholderBody(body);
       const v = await kernel.docs.create(
         writeCtx(ctx, args),
         argStr(args, "repo"),
@@ -936,7 +982,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
         {
           frontmatter: args.frontmatter as never,
           frontmatter_raw: argStrOpt(args, "frontmatter_raw"),
-          body: argStr(args, "body"),
+          body,
         },
       );
       return { structured: v, text: renderVersion(v) };
@@ -945,7 +991,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
   {
     name: "docs_put",
     description:
-      "Upsert or move a document (optimistic concurrency). With a prev: update/move the existing document — `path` may differ from prev's path (= move). Exactly one of `frontmatter` | `frontmatter_raw` if changing frontmatter; both may be omitted to keep prev's. `prev_version_id` may be omitted if `frontmatter_raw` embeds `$version: <id>` from a prior `docs_get`. With NO prev: create a new document at `path` — but if a document already exists there you get create_conflict (carrying the current version id), so re-read and pass its `prev_version_id` to update it (this guards against blind overwrites). Conflicts: stale_prev (someone else wrote first — re-read and retry), path_taken (move onto an occupied path), create_conflict (no-prev create onto an occupied path).",
+      "Upsert or move a document (optimistic concurrency). `body` REPLACES the prior body wholesale — there is no append, merge, or templating, and tokens like `{{APPEND}}` or `$KEEP` are stored literally, not expanded. To ADD to a document (e.g. a journal), use `docs_append`; to change only frontmatter, OMIT `body` entirely and the prior body is kept unchanged. With a prev: update/move the existing document — `path` may differ from prev's path (= move). Exactly one of `frontmatter` | `frontmatter_raw` if changing frontmatter; both may be omitted to keep prev's. `prev_version_id` may be omitted if `frontmatter_raw` embeds `$version: <id>` from a prior `docs_get`. With NO prev: create a new document at `path` — but if a document already exists there you get create_conflict (carrying the current version id), so re-read and pass its `prev_version_id` to update it (this guards against blind overwrites). Conflicts: stale_prev (someone else wrote first — re-read and retry), path_taken (move onto an occupied path), create_conflict (no-prev create onto an occupied path).",
     inputSchema: {
       type: "object",
       properties: {
@@ -979,6 +1025,10 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       if (args.frontmatter !== undefined) input.frontmatter = args.frontmatter;
       if (typeof args.frontmatter_raw === "string") input.frontmatter_raw = args.frontmatter_raw;
       if (typeof args.body === "string") input.body = args.body;
+
+      // Refuse a body that is just an append/keep sentinel — the caller almost
+      // certainly meant to add to the doc, not overwrite it with a literal token.
+      assertNotPlaceholderBody(input.body);
 
       // Peel `$version` (and any other `$*`) out of raw frontmatter first — it
       // supplies the prev_version_id fallback and must never reach storage.
@@ -1017,6 +1067,70 @@ export const TOOL_REGISTRY: ToolEntry[] = [
         input as never,
       );
       return { structured: v, text: renderVersion(v) };
+    },
+  },
+  {
+    name: "docs_append",
+    description:
+      "Append text to the END of an existing document's body — the safe, cheap way to add to a " +
+      "growing document (a journal, a log, a running note) WITHOUT resending, or even reading, its " +
+      "current body. The server reads the current version, appends `separator` (default a blank " +
+      "line) then your `text`, and writes the new version under optimistic concurrency, retrying " +
+      "automatically if a concurrent write intervenes. The prior body is preserved byte-for-byte and " +
+      "frontmatter is carried forward unchanged. Reach for this INSTEAD OF docs_get→concatenate→" +
+      "docs_put, and instead of any (nonexistent) append/keep sentinel or template token in a " +
+      "docs_put body. The document must already exist — a missing path raises doc_not_found (create " +
+      "it with `docs_create` first).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string" },
+        path: { type: "string", description: EXACT_PATH_DOC },
+        text: { type: "string", description: "Text appended to the end of the current body." },
+        separator: {
+          type: "string",
+          description:
+            'Inserted between the existing body and `text` when the body is non-empty. Default "\\n\\n" (a blank line, i.e. a new Markdown paragraph/section). Pass "" to concatenate directly.',
+        },
+        author: {
+          type: "string",
+          description: "Opaque author string. The X-Mrplex-Author header, if present, wins.",
+        },
+      },
+      required: ["repo", "path", "text"],
+    },
+    outputSchema: VERSION_SCHEMA,
+    handler: async (kernel, ctx, args) => {
+      const repo = argStr(args, "repo");
+      const path = argStr(args, "path");
+      const text = argStr(args, "text");
+      const separator = argStrOpt(args, "separator") ?? "\n\n";
+      assertNotPlaceholderBody(text);
+      const wctx = writeCtx(ctx, args);
+      // Server-side read-modify-write with bounded optimistic retry — exactly
+      // the loop a caller would run by hand, done reliably and without shipping
+      // the whole body over the wire. A concurrent write (stale_prev) just means
+      // re-read and re-append; anything else propagates (incl. doc_not_found).
+      let lastErr: unknown;
+      for (let attempt = 0; attempt < APPEND_MAX_ATTEMPTS; attempt++) {
+        const current = await kernel.docs.get(wctx, repo, path);
+        const newBody = current.body.length === 0 ? text : `${current.body}${separator}${text}`;
+        try {
+          const v = await kernel.docs.put(wctx, repo, current.version_id, path, { body: newBody });
+          return { structured: v, text: renderVersion(v) };
+        } catch (err) {
+          if (err instanceof KernelError && err.code === "stale_prev") {
+            lastErr = err;
+            continue;
+          }
+          throw err;
+        }
+      }
+      throw lastErr instanceof KernelError
+        ? lastErr
+        : new KernelError("stale_prev", {
+            reason: `docs_append: concurrency retries exhausted after ${APPEND_MAX_ATTEMPTS} attempts`,
+          });
     },
   },
   {
