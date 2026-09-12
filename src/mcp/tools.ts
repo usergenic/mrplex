@@ -980,7 +980,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
   },
   {
     name: "docs_create",
-    description: `Create a new document at (repo, path). ${EXACT_PATH_DOC} Fails with create_conflict if the path is occupied. Provide exactly one of \`frontmatter\` (JSON map) or \`frontmatter_raw\` (verbatim YAML).`,
+    description: `Create a new document at (repo, path). ${EXACT_PATH_DOC} Fails with create_conflict if the path is occupied (re-read and use \`docs_put\` with its \`prev_version_id\` to update instead). \`body\` is the document content (required; pass "" for an empty body). Provide exactly one of \`frontmatter\` (JSON map) or \`frontmatter_raw\` (verbatim YAML) — one IS required, so for a document with no frontmatter pass \`frontmatter: {}\`. Supplying both, or neither, raises frontmatter_invalid.`,
     inputSchema: {
       type: "object",
       properties: {
@@ -1121,7 +1121,11 @@ export const TOOL_REGISTRY: ToolEntry[] = [
       properties: {
         repo: { type: "string" },
         path: { type: "string", description: EXACT_PATH_DOC },
-        text: { type: "string", description: "Text appended to the end of the current body." },
+        text: {
+          type: "string",
+          description:
+            "Text appended to the end of the current body. Must be non-empty (empty / whitespace-only is refused with empty_append — an empty append would only mint a no-op version).",
+        },
         separator: {
           type: "string",
           description:
