@@ -233,6 +233,10 @@ describe("MCP docs_append", () => {
     const r = await client.callTool({ name: "docs_get", arguments: { repo: "notes", path } });
     return (r.structuredContent as { body: string }).body;
   }
+  function errCode(r: Awaited<ReturnType<Client["callTool"]>>): string {
+    const first = (r.content as { text: string }[])[0];
+    return first ? (JSON.parse(first.text) as { code: string }).code : "";
+  }
 
   beforeEach(async () => {
     await client.callTool({ name: "repos_create", arguments: { repo: "notes" } });
@@ -287,8 +291,139 @@ describe("MCP docs_append", () => {
       arguments: { repo: "notes", path: "nope.md", text: "x" },
     });
     expect(r.isError).toBe(true);
-    const payload = JSON.parse((r.content as { text: string }[])[0].text) as { code: string };
-    expect(payload.code).toBe("doc_not_found");
+    expect(errCode(r)).toBe("doc_not_found");
+  });
+
+  // Regression: a real append must actually change the stored content, not just
+  // mint a new version id. The reported failure was a version bump with an
+  // unchanged content_hash — "pretends it worked" — so assert the hash MOVES.
+  async function hashOf(path: string): Promise<string> {
+    const r = await client.callTool({ name: "docs_get", arguments: { repo: "notes", path } });
+    return (r.structuredContent as { content_hash: string }).content_hash;
+  }
+
+  it("changes content_hash on every append (sequential journal writes)", async () => {
+    const created = await client.callTool({
+      name: "docs_create",
+      arguments: { repo: "notes", path: "h.md", body: "# Journal", frontmatter: { title: "J" } },
+    });
+    const hashes = new Set<string>([
+      (created.structuredContent as { content_hash: string }).content_hash,
+    ]);
+    for (const text of ["## a", "## b", "## c"]) {
+      const appended = await client.callTool({
+        name: "docs_append",
+        arguments: { repo: "notes", path: "h.md", text },
+      });
+      expect(appended.isError).toBeFalsy();
+      // Both the tool's returned version and a fresh read must show a NEW hash.
+      const returned = (appended.structuredContent as { content_hash: string }).content_hash;
+      expect(hashes.has(returned)).toBe(false);
+      expect(await hashOf("h.md")).toBe(returned);
+      hashes.add(returned);
+    }
+    expect(hashes.size).toBe(4);
+  });
+
+  it("refuses an empty text — no no-op version, no silent success", async () => {
+    const created = await client.callTool({
+      name: "docs_create",
+      arguments: { repo: "notes", path: "empty.md", body: "hello", frontmatter: {} },
+    });
+    const before = (created.structuredContent as { version_id: string; content_hash: string })
+      .version_id;
+    // With an empty separator this is the exact reported bug: a byte-identical
+    // content_hash under a fresh version id. It must be rejected, not written.
+    const r = await client.callTool({
+      name: "docs_append",
+      arguments: { repo: "notes", path: "empty.md", text: "", separator: "" },
+    });
+    expect(r.isError).toBe(true);
+    expect(errCode(r)).toBe("empty_append");
+    // And no new version was minted — the current version is still the create.
+    const got = await client.callTool({
+      name: "docs_get",
+      arguments: { repo: "notes", path: "empty.md" },
+    });
+    expect((got.structuredContent as { version_id: string }).version_id).toBe(before);
+  });
+
+  it("refuses a whitespace-only text", async () => {
+    await client.callTool({
+      name: "docs_create",
+      arguments: { repo: "notes", path: "ws.md", body: "hello", frontmatter: {} },
+    });
+    for (const text of ["", "   ", "\n\n", "\t"]) {
+      const r = await client.callTool({
+        name: "docs_append",
+        arguments: { repo: "notes", path: "ws.md", text },
+      });
+      expect(r.isError).toBe(true);
+      expect(errCode(r)).toBe("empty_append");
+    }
+  });
+});
+
+describe("MCP unknown-write-arg guard", () => {
+  beforeEach(async () => {
+    await client.callTool({ name: "repos_create", arguments: { repo: "notes" } });
+  });
+  function errCode(r: Awaited<ReturnType<Client["callTool"]>>): string {
+    const first = (r.content as { text: string }[])[0];
+    return first ? (JSON.parse(first.text) as { code: string }).code : "";
+  }
+
+  // The reported bug: docs_put with a confabulated `body_append` arg. The arg is
+  // not in the schema; the transport doesn't validate, so it would be silently
+  // dropped, the prior body carried forward, and a NEW version minted over
+  // byte-identical content — a phantom success. It must be refused instead.
+  it("refuses docs_put with a bogus body_append arg — no phantom no-op version", async () => {
+    const created = await client.callTool({
+      name: "docs_create",
+      arguments: { repo: "notes", path: "j.md", body: "# Journal\n\n## first", frontmatter: {} },
+    });
+    const v0 = (created.structuredContent as { version_id: string }).version_id;
+    const r = await client.callTool({
+      name: "docs_put",
+      arguments: { repo: "notes", path: "j.md", prev_version_id: v0, body_append: "## second" },
+    });
+    expect(r.isError).toBe(true);
+    expect(errCode(r)).toBe("unknown_arg");
+    // No version was minted and the body is untouched.
+    const got = await client.callTool({
+      name: "docs_get",
+      arguments: { repo: "notes", path: "j.md" },
+    });
+    const after = got.structuredContent as { version_id: string; body: string };
+    expect(after.version_id).toBe(v0);
+    expect(after.body).toBe("# Journal\n\n## first");
+  });
+
+  it("refuses docs_create and docs_append with an unknown/append-shaped arg", async () => {
+    const create = await client.callTool({
+      name: "docs_create",
+      arguments: { repo: "notes", path: "c.md", body: "x", append: "y" },
+    });
+    expect(errCode(create)).toBe("unknown_arg");
+
+    await client.callTool({
+      name: "docs_create",
+      arguments: { repo: "notes", path: "a.md", body: "x", frontmatter: {} },
+    });
+    const append = await client.callTool({
+      name: "docs_append",
+      arguments: { repo: "notes", path: "a.md", body_add: "z" },
+    });
+    expect(errCode(append)).toBe("unknown_arg");
+  });
+
+  it("still accepts the defined optional args (author)", async () => {
+    const r = await client.callTool({
+      name: "docs_create",
+      arguments: { repo: "notes", path: "ok.md", body: "hi", frontmatter: {}, author: "alice" },
+    });
+    expect(r.isError).toBeFalsy();
+    expect((r.structuredContent as { author: string }).author).toBe("alice");
   });
 });
 

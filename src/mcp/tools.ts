@@ -219,6 +219,31 @@ function assertNotPlaceholderBody(body: string | undefined): void {
 }
 
 /**
+ * Reject a write call carrying an argument the tool does not define. The MCP
+ * transport does NOT validate arguments against `inputSchema` (the server hands
+ * `params.arguments` straight to the handler), so an unrecognized key would
+ * otherwise be silently dropped. For a write that is a quiet disaster: a caller
+ * (or an agent) that invents a `body_append` / `append` field on docs_put gets
+ * its text ignored, the prior body carried forward, and a brand-new version id
+ * minted over BYTE-IDENTICAL content — a phantom success. We refuse and teach
+ * instead, steering append-shaped mistakes to `docs_append`.
+ */
+function assertKnownArgs(args: Record<string, unknown>, allowed: readonly string[]): void {
+  for (const key of Object.keys(args)) {
+    if (allowed.includes(key)) continue;
+    const appendish = /append|(^|_)add(_|$)/i.test(key);
+    throw new KernelError("unknown_arg", {
+      arg: key,
+      allowed: [...allowed],
+      reason: `unknown argument \`${key}\`. It has no effect and, on a write, would be silently ignored — minting a new version id over unchanged content (an identical content_hash) that looks like success but changes nothing.`,
+      hint: appendish
+        ? "To ADD to a document's body use `docs_append` (send only the new `text`); `docs_create`/`docs_put` have NO append field — their `body` REPLACES the whole body."
+        : `Allowed arguments: ${allowed.join(", ")}.`,
+    });
+  }
+}
+
+/**
  * Append the injected system properties — `$version` then `$content_hash`, in
  * fixed order (sync/history plan §2.4) — to `frontmatter_raw` unless the caller
  * asked for raw output. Non-destructive — plain text append, no YAML round-trip.
@@ -973,6 +998,7 @@ export const TOOL_REGISTRY: ToolEntry[] = [
     },
     outputSchema: VERSION_SCHEMA,
     handler: async (kernel, ctx, args) => {
+      assertKnownArgs(args, ["repo", "path", "body", "frontmatter", "frontmatter_raw", "author"]);
       const body = argStr(args, "body");
       assertNotPlaceholderBody(body);
       const v = await kernel.docs.create(
@@ -1017,6 +1043,15 @@ export const TOOL_REGISTRY: ToolEntry[] = [
     },
     outputSchema: VERSION_SCHEMA,
     handler: async (kernel, ctx, args) => {
+      assertKnownArgs(args, [
+        "repo",
+        "path",
+        "prev_version_id",
+        "body",
+        "frontmatter",
+        "frontmatter_raw",
+        "author",
+      ]);
       const input: {
         frontmatter?: unknown;
         frontmatter_raw?: string;
@@ -1101,11 +1136,25 @@ export const TOOL_REGISTRY: ToolEntry[] = [
     },
     outputSchema: VERSION_SCHEMA,
     handler: async (kernel, ctx, args) => {
+      assertKnownArgs(args, ["repo", "path", "text", "separator", "author"]);
       const repo = argStr(args, "repo");
       const path = argStr(args, "path");
       const text = argStr(args, "text");
       const separator = argStrOpt(args, "separator") ?? "\n\n";
       assertNotPlaceholderBody(text);
+      // Nothing to append: a naive read-modify-write would still mint a new
+      // version — byte-identical content_hash when the separator is empty —
+      // and report success, so the caller believes an append landed when the
+      // document is unchanged. Refuse loudly instead of writing a no-op.
+      if (text.trim().length === 0) {
+        throw new KernelError("empty_append", {
+          reason:
+            "docs_append `text` is empty (or only whitespace) — there is nothing to append. " +
+            "Appending it would mint a new version with unchanged content (an identical " +
+            "content_hash when separator is empty), which looks like success but changes nothing.",
+          hint: "Pass the actual text to add. To change only frontmatter, use docs_put with body omitted.",
+        });
+      }
       const wctx = writeCtx(ctx, args);
       // Server-side read-modify-write with bounded optimistic retry — exactly
       // the loop a caller would run by hand, done reliably and without shipping

@@ -31,6 +31,18 @@ export type KernelErrorCode =
   // replaces wholesale — so this is almost always a caller confusion that
   // would clobber the doc with a literal token. We refuse and teach instead.
   | "body_placeholder_suspected"
+  // MCP write guard: docs_append called with an empty (or whitespace-only)
+  // `text`. There is nothing to append, but a naive read-modify-write would
+  // still mint a new version — with a byte-identical content_hash when the
+  // separator is empty — so the caller is told "it worked" while the document
+  // is unchanged. We refuse instead of writing a confusing no-op version.
+  | "empty_append"
+  // MCP write guard: a write tool received an argument it does not define
+  // (e.g. a confabulated `body_append` on docs_put). The transport does not
+  // validate args against inputSchema, so an unknown key would otherwise be
+  // silently dropped — minting a new version id over unchanged content. We
+  // refuse and teach (append-shaped keys are pointed at docs_append).
+  | "unknown_arg"
   // M4 (m4-plan §5 decision 4): semantic query arrived with no hook
   // configured, OR the hook failed at query time. Distinct from
   // filter_invalid (the query is well-formed) and from write-path
@@ -73,6 +85,8 @@ export const KERNEL_ERROR_CODES: ReadonlySet<KernelErrorCode> = new Set<KernelEr
   "precondition_required",
   "payload_too_large",
   "body_placeholder_suspected",
+  "empty_append",
+  "unknown_arg",
   "semantic_unavailable",
 ]);
 
